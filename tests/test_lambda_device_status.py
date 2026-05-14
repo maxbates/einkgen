@@ -237,6 +237,78 @@ def test_different_devices_get_separate_keys(s3_bucket, secret):
     assert _get_status_object(s3_bucket, "office")["battery_v"] == 3.9
 
 
+def test_non_dict_json_body_returns_400(s3_bucket, secret):
+    # JSON parses but isn't an object — array, number, string, null all hit
+    # the `isinstance(body, dict)` guard inside the handler.
+    for raw in ("[1, 2, 3]", "123", "\"hello\"", "null"):
+        resp = device_status.handler(_event(raw))
+        assert resp["statusCode"] == 400, raw
+        assert json.loads(resp["body"])["error"] == "bad_request", raw
+    assert _list_status_keys(s3_bucket) == []
+
+
+def test_body_size_cap_returns_413(s3_bucket, secret):
+    # 4 KB cap; pad with a long string field so the body decodes but is too big.
+    huge = json.dumps({"device_id": "x", "noise": "A" * (5 * 1024)})
+    resp = device_status.handler(_event(huge))
+    assert resp["statusCode"] == 413
+    assert json.loads(resp["body"])["error"] == "bad_request"
+    assert _list_status_keys(s3_bucket) == []
+
+
+def test_invalid_device_id_returns_400(s3_bucket, secret):
+    # Slashes / unicode / overly-long ids must be rejected, not silently
+    # rewritten — they'd produce surprising S3 keys.
+    for bad in ("../../evil", "device id with spaces", "x" * 100, "drop\ttab"):
+        resp = device_status.handler(
+            _event(json.dumps({"device_id": bad, "battery_v": 4.0}))
+        )
+        assert resp["statusCode"] == 400, bad
+        assert json.loads(resp["body"])["error"] == "bad_request", bad
+    assert _list_status_keys(s3_bucket) == []
+
+
+def test_record_drops_unknown_fields(s3_bucket, secret):
+    # A token-holder posting extra junk must not get it persisted.
+    body = json.dumps(
+        {
+            "device_id": "kitchen",
+            "battery_v": 3.9,
+            "battery_pct": 80,
+            "noise": "x" * 200,
+            "evil": [1, 2, 3],
+            "huge": 1e100,
+        }
+    )
+    resp = device_status.handler(_event(body))
+    assert resp["statusCode"] == 200
+
+    record = _get_status_object(s3_bucket, "kitchen")
+    assert record["battery_v"] == 3.9
+    assert record["battery_pct"] == 80
+    assert "noise" not in record
+    assert "evil" not in record
+    assert "huge" not in record
+
+
+def test_secrets_manager_failure_returns_401(s3_bucket, secret, monkeypatch):
+    # Simulate SM outage. The handler must fail closed (401, no S3 write) so
+    # an attacker can't distinguish "wrong token" from "auth backend down".
+    device_status._reset_cache()
+
+    class FailingClient:
+        def get_secret_value(self, **_):
+            raise RuntimeError("secretsmanager unreachable")
+
+    monkeypatch.setattr(device_status, "_get_sm_client", lambda: FailingClient())
+    resp = device_status.handler(
+        _event(json.dumps({"device_id": "alpha"}), token="anything")
+    )
+    assert resp["statusCode"] == 401
+    assert json.loads(resp["body"]) == {"error": "unauthorized"}
+    assert _list_status_keys(s3_bucket) == []
+
+
 def test_uppercase_header_name_is_accepted(s3_bucket, secret):
     # Function URLs lowercase headers, but a direct invocation (e.g. local
     # testing) may pass the original casing — make sure we still accept it.

@@ -59,6 +59,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -71,6 +73,29 @@ log = logging.getLogger(__name__)
 DEFAULT_SECRET_NAME = "einkgen/device_status_token"
 DEFAULT_DEVICE_ID = "default"
 
+# Real firmware payload is <200 bytes. 4 KB leaves room for additions while
+# bounding what a token-holder can stuff into status/. Larger bodies are
+# rejected before json.loads so we never serialise junk to S3.
+MAX_BODY_BYTES = 4 * 1024
+
+# Re-fetch the token after this many seconds. Bounds how long a rotated secret
+# stays unreachable to warm Lambda containers (README §10 says rotate on
+# suspicion — without a TTL, leaked tokens keep working on warm containers
+# until they recycle, which can be hours).
+TOKEN_CACHE_TTL_SECONDS = 300
+
+# Explicit body allowlist. Anything not on this list is dropped before we
+# serialise the record to S3 — a token-holder can't stuff arbitrary fields
+# into status/, can't blow up the SPA with `(1e100).toFixed(2)`, etc.
+ALLOWED_BODY_FIELDS: frozenset[str] = frozenset(
+    {"battery_v", "battery_pct", "rssi", "current_hash", "fw_version"}
+)
+
+# device_id flows into an S3 key, so constrain it to a safe charset.
+# Permissive enough for ULIDs, UUIDs, MACs (with or without separators),
+# and human-readable labels like "kitchen".
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
 # Constant headers on every response. CORS is set defensively here so the
 # Lambda is usable in isolation; the real CORS pin lives on the Function URL
 # itself (Track D infra).
@@ -79,10 +104,12 @@ _RESPONSE_HEADERS = {
     "Access-Control-Allow-Origin": "*",
 }
 
-# Module-scope token cache. Lambda reuses warm execution environments across
-# invocations; caching here means ~one Secrets Manager call per cold start
-# instead of one per device wake.
+# Module-scope token cache with a TTL. Lambda reuses warm execution
+# environments across invocations; caching means ~one Secrets Manager call
+# per cold start. The TTL caps how long a rotated secret stays unreachable
+# (see TOKEN_CACHE_TTL_SECONDS comment above).
 _cached_token: str | None = None
+_cached_token_at: float = 0.0
 _sm_client = None
 
 
@@ -95,20 +122,30 @@ def _get_sm_client():
 
 def _reset_cache() -> None:
     """Drop the cached token + Secrets Manager client. Used by tests."""
-    global _cached_token, _sm_client
+    global _cached_token, _cached_token_at, _sm_client
     _cached_token = None
+    _cached_token_at = 0.0
     _sm_client = None
 
 
 def _expected_token() -> str:
-    global _cached_token
-    if _cached_token is not None:
+    global _cached_token, _cached_token_at
+    now = time.monotonic()
+    if _cached_token is not None and (now - _cached_token_at) < TOKEN_CACHE_TTL_SECONDS:
         return _cached_token
     secret_name = os.environ.get("DEVICE_STATUS_SECRET_NAME", DEFAULT_SECRET_NAME)
     resp = _get_sm_client().get_secret_value(SecretId=secret_name)
     # SecretString stored as a raw token — no JSON unwrap. Matches the
-    # convention in README §10 and keeps the Terraform secret resource trivial.
+    # convention in README §10 and keeps the secret resource trivial.
+    # A binary-only secret would lack SecretString; treat that as misconfig
+    # rather than silently caching None.
+    if "SecretString" not in resp:
+        raise RuntimeError(
+            "device_status_token secret has no SecretString; "
+            "use --secret-string (not --secret-binary) when rotating."
+        )
     _cached_token = resp["SecretString"]
+    _cached_token_at = now
     return _cached_token
 
 
@@ -176,6 +213,11 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     if not raw_body:
         return _response(400, {"error": "bad_request", "detail": "empty body"})
 
+    if len(raw_body) > MAX_BODY_BYTES:
+        return _response(
+            413, {"error": "bad_request", "detail": "body too large"}
+        )
+
     try:
         body = json.loads(raw_body)
     except json.JSONDecodeError as exc:
@@ -191,8 +233,18 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     device_id = body.get("device_id")
     if not isinstance(device_id, str) or not device_id:
         device_id = DEFAULT_DEVICE_ID
+    elif not DEVICE_ID_RE.match(device_id):
+        # Stop here rather than silently falling back — a token-holder
+        # supplying junk should see the failure, not have it relabelled.
+        return _response(
+            400, {"error": "bad_request", "detail": "invalid device_id"}
+        )
 
-    record = dict(body)
+    # Build the record from an explicit allowlist so a token-holder can't
+    # stuff extra fields (huge strings, `1e100` numbers, etc.) into status/.
+    record: dict[str, Any] = {
+        k: body[k] for k in ALLOWED_BODY_FIELDS if k in body
+    }
     record["device_id"] = device_id
     record["last_seen"] = _now_iso()
 
