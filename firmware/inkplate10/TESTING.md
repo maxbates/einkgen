@@ -23,7 +23,9 @@ Before starting:
 - `[ntp] synced …`
 - `[manifest] OK …`
 - `[hash] stored="" new="…" changed=1`
-- `[draw] downloading and rendering image`
+- `[draw] downloading and verifying image`
+- `[image] GET …`
+- `[verify] hash OK`
 - `[draw] OK, hash persisted`
 - `[status] OK HTTP 200`
 - `[sleep] deep-sleeping for … seconds`
@@ -115,7 +117,27 @@ Wake the device.
 
 ---
 
-## 8. Battery POST receives 401
+## 8. Hash mismatch (MITM / corrupt download)
+
+**Setup.** Server-side, publish a manifest whose `image_sha256` does NOT
+match the actual `image.bmp` bytes (easiest: hand-edit the manifest JSON in
+S3 to flip a hex character). Wake the device.
+
+**Expected logs.**
+- `[image] GET …`
+- `[verify] hash mismatch: expected=<manifest-claim> got=<real-bytes-sha>`
+- `[draw] failed — leaving previous frame on screen`
+- `[status] OK HTTP 200`  *(reports the prior NVS hash, NOT the bogus one)*
+
+**Expected on panel.** Unchanged — previous frame stays visible. NVS
+`image_sha256` is unchanged. The Device tab on the web app continues to
+show the last verified hash, not the bogus manifest claim.
+
+Restore real manifest before continuing.
+
+---
+
+## 9. Battery POST receives 401
 
 **Setup.** Edit `DEVICE_STATUS_TOKEN` in `secrets.h` to a wrong value,
 reflash, boot.

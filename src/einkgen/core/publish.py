@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
 
 from einkgen.core import s3
 from einkgen.core.manifest import (
@@ -35,16 +36,26 @@ def _cdn_base() -> str:
     return base.rstrip("/")
 
 
+_MISSING_OBJECT_CODES = {"NoSuchKey", "NotFound", "404"}
+
+
 def _read_previous_version() -> int:
-    """Return the previous manifest's version, or 0 if none exists."""
+    """Return the previous manifest's version, or 0 if no manifest exists yet.
+
+    A NoSuchKey is normal on first publish. Any other S3 error is re-raised so
+    we don't silently restart versions at 1 and overwrite history.
+    """
     try:
         body = s3.get_object(CURRENT_MANIFEST_KEY)
-    except Exception:
-        # No previous manifest (NoSuchKey or any read error) — start at 1.
-        return 0
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in _MISSING_OBJECT_CODES:
+            return 0
+        raise
     try:
         prev = Manifest.from_json(body)
-    except Exception:
+    except (ValueError, KeyError):
+        # Malformed manifest — treat as fresh rather than crashing the publish.
         return 0
     return int(prev.version)
 

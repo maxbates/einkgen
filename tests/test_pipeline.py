@@ -117,8 +117,17 @@ def test_image_kind_fetches_from_s3(monkeypatch, s3_bucket):
     p = calls["publish"][0]
     assert p["item_id"] == "01HFTEST0002"
     assert p["original"] == b"real-jpeg-bytes"
-    assert p["source"] == {"kind": "uploaded", "model": None, "prompt": None}
+    # README §7: model/prompt are omitted for image-kind uploads,
+    # not present-with-null.
+    assert p["source"] == {"kind": "uploaded"}
+    assert "model" not in p["source"]
+    assert "prompt" not in p["source"]
     assert p["prompt"] is None
+
+    # Staged source must have been cleaned up after successful publish.
+    assert "Contents" not in s3_bucket.list_objects_v2(
+        Bucket=TEST_BUCKET, Prefix=staged_key
+    )
 
 
 def test_random_kind_uses_random_prompt(monkeypatch):

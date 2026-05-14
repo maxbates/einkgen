@@ -2,8 +2,8 @@
 
 Items live at ``s3://<bucket>/queue/<iso8601>-<ulid>.json``. ULIDs are
 lex-monotonic, so a sorted ``ListObjectsV2`` is FIFO order. The generator
-Lambda runs with reserved concurrency = 1, which is what makes ``pop_head``
-atomic enough — see README §4.
+Lambda runs with reserved concurrency = 1, which is what makes head reads
+race-free — see README §4.
 
 If we ever need multi-producer races, swap the implementation for SQS FIFO
 or DynamoDB without changing this module's public API.
@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import builtins
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-import boto3
 from ulid import ULID
+
+from einkgen.core import s3
 
 QUEUE_PREFIX = "queue/"
 STAGED_PREFIX = "queue/staged/"
@@ -42,25 +42,12 @@ class QueueItem:
         return data
 
 
-def _bucket() -> str:
-    bucket = os.environ.get("EINKGEN_BUCKET")
-    if not bucket:
-        raise RuntimeError("EINKGEN_BUCKET env var is not set")
-    return bucket
-
-
-def _client():
-    # boto3 picks up region/credentials from the environment / AWS_PROFILE.
-    return boto3.client("s3")
-
-
 def _iso_now() -> str:
-    # Filename-safe ISO 8601 (colons replaced with hyphens) but JSON keeps the
-    # canonical form.
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _key_timestamp(ts: str) -> str:
+    # Colons aren't legal in S3 keys for some downstream tools; replace with -.
     return ts.replace(":", "-")
 
 
@@ -103,36 +90,30 @@ def enqueue(
     )
     key = f"{QUEUE_PREFIX}{_key_timestamp(enqueued_at)}-{item_id}.json"
     item._s3_key = key
-    _client().put_object(
-        Bucket=_bucket(),
-        Key=key,
-        Body=json.dumps(item.to_json()).encode("utf-8"),
-        ContentType="application/json",
+    s3.put_object(
+        key,
+        json.dumps(item.to_json()).encode("utf-8"),
+        content_type="application/json",
     )
     return item
 
 
 def _iter_pending_keys() -> list[str]:
     """Return lex-sorted queue object keys, excluding ``queue/staged/``."""
-    client = _client()
     keys: list[str] = []
-    paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=_bucket(), Prefix=QUEUE_PREFIX):
-        for obj in page.get("Contents", []) or []:
-            key = obj["Key"]
-            if key.startswith(STAGED_PREFIX):
-                continue
-            if not key.endswith(".json"):
-                continue
-            keys.append(key)
+    for obj in s3.list_objects(QUEUE_PREFIX):
+        key = obj["Key"]
+        if key.startswith(STAGED_PREFIX):
+            continue
+        if not key.endswith(".json"):
+            continue
+        keys.append(key)
     keys.sort()
     return keys
 
 
 def _read_item(key: str) -> QueueItem:
-    client = _client()
-    obj = client.get_object(Bucket=_bucket(), Key=key)
-    payload = json.loads(obj["Body"].read())
+    payload = json.loads(s3.get_object(key))
     item = QueueItem(
         id=payload["id"],
         enqueued_at=payload["enqueued_at"],
@@ -150,20 +131,41 @@ def list() -> builtins.list[QueueItem]:  # noqa: A001 — name dictated by spec
     return [_read_item(k) for k in _iter_pending_keys()]
 
 
-def pop_head() -> QueueItem | None:
+def peek_head() -> QueueItem | None:
+    """Return the FIFO head without deleting it.
+
+    Pair with ``finalize(item)`` after the item has been processed
+    successfully. If processing raises, the item stays on the queue and
+    Lambda's async-invocation retry will redeliver the S3 event.
+    """
     keys = _iter_pending_keys()
     if not keys:
         return None
-    head_key = keys[0]
-    item = _read_item(head_key)
-    _client().delete_object(Bucket=_bucket(), Key=head_key)
-    return item
+    return _read_item(keys[0])
+
+
+def finalize(item: QueueItem) -> None:
+    """Delete a queue item after it has been processed successfully.
+
+    Safe to call twice (idempotent): a missing key is treated as already
+    finalized. Re-deliveries don't need to special-case this.
+    """
+    if item._s3_key is None:
+        raise ValueError("QueueItem has no S3 key; was it returned by peek_head?")
+    s3.delete_object(item._s3_key)
 
 
 def cancel(item_id: str) -> bool:
+    """Delete a pending item by its id.
+
+    Matches on the trailing ``-<id>.json`` suffix so a stray partial id
+    can't accidentally delete an unrelated item. Returns whether
+    something was deleted.
+    """
+    suffix = f"-{item_id}.json"
     for key in _iter_pending_keys():
-        if item_id in key:
-            _client().delete_object(Bucket=_bucket(), Key=key)
+        if key.endswith(suffix):
+            s3.delete_object(key)
             return True
     return False
 

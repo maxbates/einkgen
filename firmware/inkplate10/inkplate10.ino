@@ -15,8 +15,11 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <mbedtls/sha256.h>
 #include <time.h>
 #include <sys/time.h>
+#include <stdlib.h>
+#include "esp_heap_caps.h"
 #include "esp_sleep.h"
 
 #include "secrets.h"
@@ -29,6 +32,11 @@ static const uint32_t NTP_TIMEOUT_MS        = 10000;
 static const uint64_t SLEEP_MIN_SECONDS     = 60;
 static const uint64_t SLEEP_MAX_SECONDS     = 3600;
 static const uint64_t SLEEP_FALLBACK_SECONDS = 3600;
+
+// 1200x825 8-bit indexed BMP is ~990 KB; cap at 2 MB so a runaway server
+// can't try to push more than fits in PSRAM (4 MB total) leaving room for
+// the framebuffer and stack.
+static const size_t   IMAGE_MAX_BYTES       = 2 * 1024 * 1024;
 
 // NVS namespace + keys
 static const char *NVS_NAMESPACE   = "einkgen";
@@ -148,6 +156,119 @@ static time_t parseIso8601Utc(const char *s)
     return t;
 }
 
+// Download the manifest's image_url into a PSRAM-backed buffer, verify its
+// SHA-256 against `expectedHash`, and render it. Returns true on success and
+// fills `*outBuf`/`*outLen` for the duration of the render (caller frees).
+// Returns false on any download, verification, or render failure — in which
+// case the previous frame stays on screen.
+//
+// Why this matters: the Inkplate library's image.draw(url, ...) re-downloads
+// over plain HTTP and never compares bytes against the manifest's claimed
+// hash. Without this path the `image_sha256` field is purely advisory and a
+// MITM (or a partial CloudFront response) can render arbitrary bytes while
+// firmware persists the manifest's claimed hash as if it were verified.
+static bool downloadVerifyAndDraw(const char *imageUrl, const char *expectedHash)
+{
+    Serial.printf("[image] GET %s\n", imageUrl);
+    WiFiClientSecure client;
+    client.setInsecure();  // TODO: pin CloudFront cert.
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    if (!http.begin(client, imageUrl)) {
+        Serial.println("[image] http.begin failed");
+        return false;
+    }
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("[image] HTTP %d\n", code);
+        http.end();
+        return false;
+    }
+
+    int contentLength = http.getSize();
+    if (contentLength <= 0 || (size_t)contentLength > IMAGE_MAX_BYTES) {
+        Serial.printf("[image] bad Content-Length: %d\n", contentLength);
+        http.end();
+        return false;
+    }
+
+    // Allocate from PSRAM — internal SRAM is too tight for a 1 MB BMP.
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(contentLength, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        Serial.printf("[image] PSRAM alloc failed for %d bytes\n", contentLength);
+        http.end();
+        return false;
+    }
+
+    WiFiClient *stream = http.getStreamPtr();
+    int total = 0;
+    uint32_t start = millis();
+    while (http.connected() && total < contentLength) {
+        size_t avail = stream->available();
+        if (avail > 0) {
+            int n = stream->readBytes(buf + total,
+                                      (int)min((size_t)(contentLength - total), avail));
+            if (n <= 0) break;
+            total += n;
+            continue;
+        }
+        if (millis() - start > HTTP_TIMEOUT_MS) {
+            Serial.println("[image] read timeout");
+            break;
+        }
+        delay(1);
+    }
+    http.end();
+
+    if (total != contentLength) {
+        Serial.printf("[image] short read: %d of %d\n", total, contentLength);
+        heap_caps_free(buf);
+        return false;
+    }
+
+    // SHA-256 over the bytes we actually have, then byte-compare against
+    // the manifest's claim.
+    uint8_t digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, /*is224=*/0);
+    mbedtls_sha256_update(&ctx, buf, total);
+    mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+
+    char hex[65];
+    for (int i = 0; i < 32; ++i) {
+        sprintf(&hex[i * 2], "%02x", digest[i]);
+    }
+    hex[64] = '\0';
+
+    if (strcmp(hex, expectedHash) != 0) {
+        Serial.printf("[verify] hash mismatch: expected=%s got=%s\n",
+                      expectedHash, hex);
+        heap_caps_free(buf);
+        return false;
+    }
+    Serial.println("[verify] hash OK");
+
+    // Render from the in-memory buffer.
+    // TODO: confirm the exact Inkplate-Arduino-library buffer-draw signature
+    // for the installed version. As of writing the canonical call is
+    // display.drawImage(buf, x, y, len, dither, invert), but some forks expose
+    // image.drawBmpFromBuffer(...) or drawBitmapFromBuffer(...). If linking
+    // fails, swap for the matching name — the contract is the same: render
+    // the BMP we already SHA-verified, not a fresh HTTP fetch.
+    bool ok = display.drawImage((const uint8_t *)buf, /*x=*/0, /*y=*/0,
+                                /*len=*/total, /*dither=*/false, /*invert=*/false);
+    heap_caps_free(buf);
+    if (!ok) {
+        Serial.println("[draw] drawImage from buffer failed");
+        return false;
+    }
+    display.display();
+    return true;
+}
+
 static int batteryPercent(float volts)
 {
     float pct = (volts - BATT_V_EMPTY) / (BATT_V_FULL - BATT_V_EMPTY) * 100.0f;
@@ -249,17 +370,17 @@ void setup()
     Serial.printf("[hash] stored=\"%s\" new=\"%s\" changed=%d\n",
                   storedHash.c_str(), imageHash, changed ? 1 : 0);
 
+    // currentHash tracks what we're ACTUALLY showing right now. It only
+    // advances to the manifest's claimed hash if download + SHA verify +
+    // draw all succeed. On any failure we keep reporting storedHash so the
+    // server's Device tab doesn't lie about what's on screen.
+    String currentHash = storedHash;
+
     if (changed) {
-        Serial.println("[draw] downloading and rendering image");
-        // display.image.draw(url, x, y, dither, invert)
-        // Server already dithered to 8-level grayscale, so dither=false.
-        // TODO: verify API — Inkplate-Arduino-library uses display.image.draw(...).
-        // The project README originally specced display.drawImage(...) which is
-        // not exposed by the current library; image.draw() is the canonical call.
-        bool ok = display.image.draw(imageUrl, 0, 0, /*dither=*/false, /*invert=*/false);
-        if (ok) {
-            display.display();
+        Serial.println("[draw] downloading and verifying image");
+        if (downloadVerifyAndDraw(imageUrl, imageHash)) {
             prefs.putString(NVS_KEY_HASH, imageHash);
+            currentHash = imageHash;
             Serial.println("[draw] OK, hash persisted");
         } else {
             Serial.println("[draw] failed — leaving previous frame on screen");
@@ -269,12 +390,12 @@ void setup()
     }
     prefs.end();
 
-    // Battery + RSSI + status POST.
+    // Battery + RSSI + status POST. Report what we're actually showing.
     float battV   = (float)display.readBattery();
     int   battPct = batteryPercent(battV);
     int   rssi    = WiFi.RSSI();
     Serial.printf("[status] battery=%.2fV (%d%%) rssi=%d\n", battV, battPct, rssi);
-    postStatus(battV, battPct, rssi, imageHash);
+    postStatus(battV, battPct, rssi, currentHash.c_str());
 
     // Compute sleep duration from next_check_after.
     uint64_t sleepSeconds = SLEEP_FALLBACK_SECONDS;

@@ -6,10 +6,28 @@ import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import boto3
 import pytest
 
 from einkgen.core import publish
 from einkgen.core.manifest import Manifest, compute_sha256
+
+
+def _cf_only_patch(fake_cf):
+    """Patch publish.boto3.client so ONLY ``cloudfront`` is faked.
+
+    The earlier broad ``return_value=fake_cf`` form replaced every boto3.client
+    call (including the s3 reads we need), which masked real bugs in
+    publish's previous-manifest read path.
+    """
+    real_client = boto3.client
+
+    def select(service, *args, **kwargs):
+        if service == "cloudfront":
+            return fake_cf
+        return real_client(service, *args, **kwargs)
+
+    return patch("einkgen.core.publish.boto3.client", side_effect=select)
 
 
 PROCESSED = b"BMP" + b"\x00" * 100  # stand-in BMP payload
@@ -106,7 +124,7 @@ def test_publish_skips_cf_invalidation_when_env_var_absent(s3_bucket, monkeypatc
     monkeypatch.delenv("EINKGEN_CF_DISTRIBUTION_ID", raising=False)
 
     fake_cf = MagicMock()
-    with patch("einkgen.core.publish.boto3.client", return_value=fake_cf) as p:
+    with _cf_only_patch(fake_cf) as p:
         publish.publish(
             PROCESSED,
             source={"kind": "generated"},
@@ -125,7 +143,7 @@ def test_publish_invalidates_cf_when_env_var_set(s3_bucket, monkeypatch):
     monkeypatch.setenv("EINKGEN_CF_DISTRIBUTION_ID", "E123ABC")
 
     fake_cf = MagicMock()
-    with patch("einkgen.core.publish.boto3.client", return_value=fake_cf):
+    with _cf_only_patch(fake_cf):
         publish.publish(
             PROCESSED,
             source={"kind": "generated"},

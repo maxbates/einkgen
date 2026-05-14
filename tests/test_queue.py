@@ -59,24 +59,46 @@ def test_list_returns_items_in_fifo_order(s3_bucket):
     assert items[2].source == "cron"
 
 
-def test_pop_head_returns_oldest_and_deletes(s3_bucket):
+def test_peek_head_returns_oldest_and_does_not_delete(s3_bucket):
     a = q.enqueue("prompt", prompt="first")
     time.sleep(0.005)
     q.enqueue("prompt", prompt="second")
     time.sleep(0.005)
     q.enqueue("prompt", prompt="third")
 
-    head = q.pop_head()
+    head = q.peek_head()
     assert head is not None
     assert head.id == a.id
 
+    # Peek must not consume — all three items remain on the queue.
+    assert len(q.list()) == 3
+
+
+def test_finalize_deletes_the_item(s3_bucket):
+    a = q.enqueue("prompt", prompt="first")
+    q.enqueue("prompt", prompt="second")
+
+    head = q.peek_head()
+    assert head is not None and head.id == a.id
+    q.finalize(head)
+
     remaining = q.list()
-    assert len(remaining) == 2
-    assert all(it.id != a.id for it in remaining)
+    assert len(remaining) == 1
+    assert remaining[0].id != a.id
 
 
-def test_pop_head_returns_none_on_empty(s3_bucket):
-    assert q.pop_head() is None
+def test_finalize_is_idempotent(s3_bucket):
+    a = q.enqueue("prompt", prompt="first")
+    head = q.peek_head()
+    assert head is not None
+    q.finalize(head)
+    # Second call is a no-op (key is gone); must not raise.
+    q.finalize(head)
+    assert q.empty() is True
+
+
+def test_peek_head_returns_none_on_empty(s3_bucket):
+    assert q.peek_head() is None
 
 
 def test_cancel_deletes_by_id(s3_bucket):
@@ -92,16 +114,32 @@ def test_cancel_deletes_by_id(s3_bucket):
     assert len(remaining_ids) == 2
 
 
+def test_cancel_does_not_match_substrings(s3_bucket):
+    """Guard against the prior substring-match bug.
+
+    Passing a short prefix that happens to appear inside another item's
+    id must NOT delete that other item.
+    """
+    real = q.enqueue("prompt", prompt="real")
+    # ULIDs are 26 chars; the first character is almost always shared
+    # across items enqueued in the same era. Passing a 1-char prefix used
+    # to match every key under queue/.
+    assert q.cancel(real.id[:1]) is False
+    # And the real item is still there.
+    assert any(it.id == real.id for it in q.list())
+
+
 def test_empty(s3_bucket):
     assert q.empty() is True
     item = q.enqueue("prompt", prompt="hi")
     assert q.empty() is False
-    head = q.pop_head()
+    head = q.peek_head()
     assert head is not None and head.id == item.id
+    q.finalize(head)
     assert q.empty() is True
 
 
-def test_pop_head_ignores_staged_objects(s3_bucket):
+def test_peek_head_ignores_staged_objects(s3_bucket):
     # Drop a staged object directly into queue/staged/ — this is what the CLI
     # does before enqueueing an image item.
     s3_bucket.put_object(
@@ -112,7 +150,7 @@ def test_pop_head_ignores_staged_objects(s3_bucket):
 
     assert q.empty() is True
     assert q.list() == []
-    assert q.pop_head() is None
+    assert q.peek_head() is None
 
     # The staged object still exists; it just isn't part of the queue view.
     head = s3_bucket.head_object(Bucket=TEST_BUCKET, Key="queue/staged/abc123-cat.jpg")

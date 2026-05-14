@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import sys
 from pathlib import Path
 
-import boto3
-
 from einkgen.core import queue as queue_core
+from einkgen.core import s3
 
 PROMPT_PREVIEW = 60
 
@@ -79,12 +77,7 @@ def _cmd_image(args: argparse.Namespace) -> int:
     data = path.read_bytes()
     sha8 = hashlib.sha256(data).hexdigest()[:8]
     staged_key = f"{queue_core.STAGED_PREFIX}{sha8}-{path.name}"
-
-    bucket = os.environ.get("EINKGEN_BUCKET")
-    if not bucket:
-        print("EINKGEN_BUCKET env var is not set", file=sys.stderr)
-        return 1
-    boto3.client("s3").put_object(Bucket=bucket, Key=staged_key, Body=data)
+    s3.put_object(staged_key, data)
 
     item = queue_core.enqueue("image", image_s3_key=staged_key)
     print(item.id)
