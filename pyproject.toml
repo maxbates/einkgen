@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "einkgen"
+version = "0.1.0"
+description = "Inkplate 10 e-paper image pipeline (CLI + Lambdas)"
+requires-python = ">=3.11"
+dependencies = [
+    "Pillow>=10",
+    "openai>=1.0",
+    "boto3>=1.34",
+    "python-ulid>=3.0",
+    "typing_extensions>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "moto[s3,cloudfront]>=5.0",
+]
+
+[project.scripts]
+einkgen = "einkgen.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
