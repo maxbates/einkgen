@@ -55,7 +55,10 @@ const CDN_BASE: string =
 
 export function cdnUrl(path: string): string {
   const base = CDN_BASE.replace(/\/+$/, "");
-  const tail = path.replace(/^\/+/, "");
+  // Encode the path so filenames with spaces, #, ?, or unicode don't break
+  // the <img src>. Operator-supplied filenames flow into queue/staged keys
+  // verbatim today; encoding here is the cheap defensive layer.
+  const tail = encodeURI(path.replace(/^\/+/, ""));
   return `${base}/${tail}`;
 }
 

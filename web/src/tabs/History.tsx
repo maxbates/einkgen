@@ -116,8 +116,7 @@ function HistoryTile({
   item: HistoryItem;
   onClick: () => void;
 }) {
-  const sourceLine =
-    item.source.prompt ?? (item.source.kind === "image" ? "uploaded" : item.source.kind);
+  const sourceLine = item.source.prompt ?? item.source.kind;
   return (
     <button className="history-tile" onClick={onClick}>
       <img
@@ -154,8 +153,7 @@ function HistoryDetails({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const sourceLine =
-    item.source.prompt ?? (item.source.kind === "image" ? "uploaded" : item.source.kind);
+  const sourceLine = item.source.prompt ?? item.source.kind;
   return (
     <div
       className="modal-backdrop"
