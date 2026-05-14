@@ -1,0 +1,2 @@
+# device-status only writes JSON to S3 and reads a Secrets Manager secret;
+# both are covered by boto3, which ships in the runtime.
