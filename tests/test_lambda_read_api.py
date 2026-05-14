@@ -186,8 +186,37 @@ def test_history_bad_limit_falls_back_to_default(s3_bucket):
 def test_history_limit_caps_at_500(s3_bucket, monkeypatch):
     # Avoid actually seeding 600 entries; just confirm the parser caps.
     event = _event("GET", "/history", query={"limit": "100000"})
-    limit = read_api._parse_limit(event)
+    limit = read_api._parse_limit(
+        event,
+        default=read_api.DEFAULT_HISTORY_LIMIT,
+        maximum=read_api.MAX_HISTORY_LIMIT,
+    )
     assert limit == read_api.MAX_HISTORY_LIMIT == 500
+
+
+def test_queue_limit_query_truncates(s3_bucket):
+    for _ in range(5):
+        q.enqueue("prompt", prompt="x")
+    resp = read_api.handler(_event("GET", "/queue", query={"limit": "2"}))
+    assert resp["statusCode"] == 200
+    body = _body(resp)
+    assert len(body["items"]) == 2
+
+
+def test_history_drops_entries_with_empty_generated_at(s3_bucket):
+    # A malformed manifest without generated_at must not appear in /history;
+    # otherwise it sorts to the bottom and adds a phantom row.
+    _put_history_manifest(s3_bucket, "id-ok", "2026-05-13T10:00:00Z")
+    # Hand-write a broken manifest (no generated_at key).
+    s3_bucket.put_object(
+        Bucket=TEST_BUCKET,
+        Key="history/id-broken/manifest.json",
+        Body=json.dumps({"image_sha256": "x" * 64}).encode("utf-8"),
+        ContentType="application/json",
+    )
+    resp = read_api.handler(_event("GET", "/history"))
+    body = _body(resp)
+    assert [e["id"] for e in body["items"]] == ["id-ok"]
 
 
 def test_status_404_when_empty(s3_bucket):
