@@ -61,6 +61,10 @@ function stageSource(): boolean {
 // daemon). It copies the staged Python source into the output dir and
 // skips the `pip install` step — so the resulting asset is NOT
 // deploy-ready, only synth-shaped. Real deploys run the Docker path.
+// Sentinel filename — also referenced by each Lambda handler module so a
+// runtime import fails fast if a synth-only asset is somehow deployed.
+const SYNTH_ONLY_SENTINEL = 'SYNTH_ONLY_DO_NOT_DEPLOY';
+
 function makeLocalBundler(requirementsFile: string, sourceStaged: boolean) {
   return {
     tryBundle(outputDir: string): boolean {
@@ -82,6 +86,13 @@ function makeLocalBundler(requirementsFile: string, sourceStaged: boolean) {
           '# synth-only stub; replaced by real bundling on deploy\n',
         );
       }
+      // Belt-and-suspenders: even if EINKGEN_LOCAL_BUNDLE_SYNTH_ONLY=1 ever
+      // leaks into a real `cdk deploy`, the handler refuses to run.
+      fs.writeFileSync(
+        path.join(outputDir, SYNTH_ONLY_SENTINEL),
+        'This asset was produced by the synth-only local bundler. ' +
+          'Re-bundle with Docker before deploying.\n',
+      );
       return true;
     },
   };
@@ -148,7 +159,27 @@ export class EinkgenLambdas extends Construct {
         OPENAI_API_KEY_SECRET_NAME: props.openaiApiKey.secretName,
       },
     });
-    props.bucket.grantReadWrite(this.generator);
+    // README §8 access table — generator writes current/ and history/,
+    // reads + finalizes queue/, and reads + cleans queue/staged/. Avoid
+    // grantReadWrite on the whole bucket: it would also cover web/, firmware/,
+    // status/ — the invariant from README §16 is that the generator never
+    // touches those.
+    this.generator.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+        resources: [
+          `${props.bucket.bucketArn}/current/*`,
+          `${props.bucket.bucketArn}/history/*`,
+          `${props.bucket.bucketArn}/queue/*`,
+        ],
+      }),
+    );
+    this.generator.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:ListBucket'],
+        resources: [props.bucket.bucketArn],
+      }),
+    );
     props.openaiApiKey.grantRead(this.generator);
     this.generator.addToRolePolicy(
       new iam.PolicyStatement({
@@ -158,6 +189,16 @@ export class EinkgenLambdas extends Construct {
         ],
       }),
     );
+
+    // Async-invoke retries reprocess from scratch — each retry runs another
+    // OpenAI generation. README §15 defers a cost cap; this is the cheap
+    // pre-emptive bound. Items lost on transient failure can be re-enqueued
+    // by the operator.
+    new lambda.EventInvokeConfig(this, 'GeneratorInvokeConfig', {
+      function: this.generator,
+      retryAttempts: 0,
+      maxEventAge: Duration.hours(1),
+    });
 
     // S3 ObjectCreated trigger. S3 notification filters support exactly one
     // (prefix, suffix) pair per rule — prefix='queue/' + suffix='.json'
@@ -170,11 +211,18 @@ export class EinkgenLambdas extends Construct {
     );
 
     // EventBridge cron — rate(2 hours). The cron event payload sets
-    // source=aws.events which generator.py uses to branch.
+    // source=aws.events which generator.py uses to branch. retryAttempts=0
+    // on the target matches the Lambda's async-invoke config — see comment
+    // above on cost amplification.
     new events.Rule(this, 'GeneratorCron', {
       ruleName: 'einkgen-generator-2h',
       schedule: events.Schedule.rate(Duration.hours(2)),
-      targets: [new targets.LambdaFunction(this.generator)],
+      targets: [
+        new targets.LambdaFunction(this.generator, {
+          retryAttempts: 0,
+          maxEventAge: Duration.hours(1),
+        }),
+      ],
     });
 
     // ---- read-api -----------------------------------------------------
@@ -195,10 +243,15 @@ export class EinkgenLambdas extends Construct {
 
     // Read API Function URL is its own endpoint (not behind CloudFront), so
     // pinning allowedOrigins to the CF domain is safe: no circular dep.
+    // localhost:5173 is included so `npm run dev` can hit the deployed read-api
+    // without a stub server — the data is public per the threat model anyway.
     this.readApiFunctionUrl = this.readApi.addFunctionUrl({
       authType: lambda.FunctionUrlAuthType.NONE,
       cors: {
-        allowedOrigins: [`https://${props.distribution.distributionDomainName}`],
+        allowedOrigins: [
+          `https://${props.distribution.distributionDomainName}`,
+          'http://localhost:5173',
+        ],
         allowedMethods: [lambda.HttpMethod.GET],
         allowedHeaders: ['*'],
         maxAge: Duration.minutes(10),
@@ -230,14 +283,12 @@ export class EinkgenLambdas extends Construct {
     );
     props.deviceStatusToken.grantRead(this.deviceStatus);
 
+    // Only firmware POSTs here — no browser involvement. Function URLs accept
+    // non-browser requests regardless of CORS, so omit the cors block entirely
+    // rather than wildcard it (which would also enable browser-origin POSTs
+    // from any page that ever exfiltrates the token).
     this.deviceStatusFunctionUrl = this.deviceStatus.addFunctionUrl({
       authType: lambda.FunctionUrlAuthType.NONE,
-      cors: {
-        // Only firmware POSTs here — no browser involvement. Wildcard is fine.
-        allowedOrigins: ['*'],
-        allowedMethods: [lambda.HttpMethod.POST],
-        allowedHeaders: ['*'],
-      },
     });
   }
 }

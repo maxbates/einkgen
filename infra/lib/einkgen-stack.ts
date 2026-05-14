@@ -60,6 +60,12 @@ export class EinkgenStack extends Stack {
     // Web deployment — gated on the includeWebAssets context flag AND on the
     // physical existence of web/dist/. Track C builds this; we skip cleanly
     // when it hasn't run yet.
+    //
+    // Cache strategy: the SPA's index.html references hashed asset filenames
+    // (Vite emits `assets/index-<hash>.js`). The hashed files are immutable
+    // and safe to cache aggressively. index.html itself must NOT be cached
+    // long — otherwise a redeploy can leave clients pointing at deleted asset
+    // hashes for the CloudFront TTL.
     const webDist = path.resolve(__dirname, '..', '..', 'web', 'dist');
     if (includeWebAssets && fs.existsSync(webDist)) {
       new s3deploy.BucketDeployment(this, 'WebDeploy', {
@@ -69,6 +75,26 @@ export class EinkgenStack extends Stack {
         distribution: cdn.distribution,
         distributionPaths: ['/web/*'],
         prune: true,
+        cacheControl: [
+          s3deploy.CacheControl.fromString('public, max-age=31536000, immutable'),
+        ],
+      });
+      // Override for the SPA shell only — must be revalidated every fetch.
+      new s3deploy.BucketDeployment(this, 'WebShellDeploy', {
+        sources: [
+          s3deploy.Source.asset(webDist, {
+            // Only ship index.html in this asset; assets/* came via WebDeploy.
+            exclude: ['**/*', '!index.html'],
+          }),
+        ],
+        destinationBucket: bucket.bucket,
+        destinationKeyPrefix: 'web/',
+        distribution: cdn.distribution,
+        distributionPaths: ['/web/index.html'],
+        prune: false,
+        cacheControl: [
+          s3deploy.CacheControl.fromString('public, max-age=0, must-revalidate'),
+        ],
       });
     }
 

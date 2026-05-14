@@ -14,10 +14,10 @@ export class EinkgenCdn extends Construct {
   constructor(scope: Construct, id: string, props: EinkgenCdnProps) {
     super(scope, id);
 
-    // SPA fallback: rewrite "/web/" (and any "/web/<sub>/" path without a file
-    // extension) to "/web/index.html". The Inkplate device path "/current/..."
-    // is a different behavior, so this function only runs for the default
-    // /web/* behavior.
+    // SPA fallback: rewrite "/" (bare CloudFront domain) and "/web/<sub>/"
+    // paths without a file extension to "/web/index.html". The Inkplate
+    // device path "/current/..." is a different behavior, so this function
+    // only runs for the default behavior.
     const spaRewrite = new cloudfront.Function(this, 'SpaRewriteFn', {
       functionName: `einkgen-spa-rewrite`,
       runtime: cloudfront.FunctionRuntime.JS_2_0,
@@ -25,7 +25,7 @@ export class EinkgenCdn extends Construct {
 function handler(event) {
   var req = event.request;
   var uri = req.uri;
-  if (uri === '/web' || uri === '/web/') {
+  if (uri === '/' || uri === '/web' || uri === '/web/') {
     req.uri = '/web/index.html';
     return req;
   }
@@ -34,6 +34,25 @@ function handler(event) {
     if (last.indexOf('.') === -1) {
       req.uri = '/web/index.html';
     }
+  }
+  return req;
+}
+      `),
+    });
+
+    // history/* gate: only processed.bmp is publicly served via the CDN.
+    // history/<id>/original.png is the raw user upload and history/<id>/
+    // manifest.json is read by the read-api Lambda over IAM (see README §8
+    // access policy). Both must NOT be reachable from the public CDN.
+    const historyFilter = new cloudfront.Function(this, 'HistoryFilterFn', {
+      functionName: `einkgen-history-filter`,
+      runtime: cloudfront.FunctionRuntime.JS_2_0,
+      code: cloudfront.FunctionCode.fromInline(`
+function handler(event) {
+  var req = event.request;
+  var uri = req.uri;
+  if (uri.indexOf('/history/') === 0 && uri.indexOf('/processed.bmp') !== uri.length - '/processed.bmp'.length) {
+    return { statusCode: 403, statusDescription: 'Forbidden' };
   }
   return req;
 }
@@ -100,6 +119,12 @@ function handler(event) {
           origin: s3Origin,
           viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
           cachePolicy: historyCachePolicy,
+          functionAssociations: [
+            {
+              function: historyFilter,
+              eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+            },
+          ],
         },
         'queue/staged/*': {
           origin: s3Origin,

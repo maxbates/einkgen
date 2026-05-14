@@ -25,18 +25,15 @@ export class EinkgenObservability extends Construct {
       { name: 'device-status', fn: props.deviceStatus },
     ];
 
-    // Metric filter per log group on the literal token ERROR. Lambda log
-    // retention is set on the function itself (see lambdas.ts), so here we
-    // only attach a filter to the existing group.
+    // Metric filter per log group on the literal token ERROR. Using
+    // `fn.logGroup` rather than `fromLogGroupName(...)` so CFN tracks the
+    // dependency on the LogRetention custom resource — otherwise the filter
+    // can be created before the log group exists and PutMetricFilter fails
+    // at deploy time.
     const errorMetrics: cloudwatch.IMetric[] = [];
     for (const { name, fn } of fns) {
-      const logGroup = logs.LogGroup.fromLogGroupName(
-        this,
-        `LogGroup-${name}`,
-        `/aws/lambda/${fn.functionName}`,
-      );
       new logs.MetricFilter(this, `ErrorFilter-${name}`, {
-        logGroup,
+        logGroup: fn.logGroup,
         filterPattern: logs.FilterPattern.literal('ERROR'),
         metricNamespace: METRIC_NAMESPACE,
         metricName: 'ErrorLogCount',
