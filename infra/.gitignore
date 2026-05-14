@@ -1,0 +1,12 @@
+node_modules
+dist
+cdk.out
+*.d.ts
+*.js
+!jest.config.js
+!bin/*.js
+*.tsbuildinfo
+.env
+.env.local
+# staged python source — copied in by lib/lambdas.ts at synth time
+lambda/_src/
