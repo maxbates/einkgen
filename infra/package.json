@@ -1,0 +1,27 @@
+{
+  "name": "einkgen-infra",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "einkgen": "bin/einkgen.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "synth": "cdk synth",
+    "synth:no-web": "cdk synth -c includeWebAssets=false",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "aws-cdk": "2.170.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.5.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.170.0",
+    "constructs": "^10.3.0",
+    "source-map-support": "^0.5.21"
+  }
+}

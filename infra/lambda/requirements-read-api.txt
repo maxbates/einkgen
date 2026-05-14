@@ -1,0 +1,3 @@
+# core/queue.py imports `ulid` at module load (QueueItem dataclass), and
+# read_api.py reuses queue helpers. boto3 is in the runtime.
+python-ulid>=3.0,<4.0
