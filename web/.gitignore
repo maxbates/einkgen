@@ -3,5 +3,9 @@ dist
 .env
 .env.local
 .env.*.local
+# Mode-specific env files contain deployment URLs that vary per env — keep
+# them out of source. `.env.example` documents the keys instead.
+.env.development
+.env.production
 *.log
 .DS_Store

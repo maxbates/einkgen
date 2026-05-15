@@ -8,5 +8,8 @@ cdk.out
 *.tsbuildinfo
 .env
 .env.local
+# Deploy-time outputs — deployment state, not source. Different envs produce
+# different values; CFN is the source of truth.
+cdk-outputs.json
 # staged python source — copied in by lib/lambdas.ts at synth time
 lambda/_src/
