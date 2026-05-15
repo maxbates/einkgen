@@ -8,6 +8,7 @@ can center-crop with zero resampling. See README §6.
 from __future__ import annotations
 
 import base64
+import os
 import random
 from typing import Any
 
@@ -42,12 +43,36 @@ MODEL = "gpt-image-1"
 IMAGE_SIZE = "1536x1024"
 
 
+def _resolve_api_key() -> str | None:
+    """Resolve the OpenAI API key from env or Secrets Manager.
+
+    CLI / local dev path: ``OPENAI_API_KEY`` env var (works without AWS perms).
+    Lambda path: ``OPENAI_API_KEY_SECRET_NAME`` env var names a Secrets Manager
+    secret whose ``SecretString`` is the raw key. Falls through to None if
+    neither is set — the OpenAI client will then raise its own error.
+    """
+    direct = os.environ.get("OPENAI_API_KEY")
+    if direct:
+        return direct
+    secret_name = os.environ.get("OPENAI_API_KEY_SECRET_NAME")
+    if not secret_name:
+        return None
+    import boto3  # local import to keep cold-start fast for non-Lambda callers
+
+    sm = boto3.client("secretsmanager")
+    resp = sm.get_secret_value(SecretId=secret_name)
+    return resp.get("SecretString")
+
+
 def _default_client() -> Any:
     """Lazily construct an OpenAI client. Imported lazily so import-time
     failures (e.g. missing OPENAI_API_KEY) don't break unrelated CLI commands."""
     from openai import OpenAI
 
-    return OpenAI()
+    api_key = _resolve_api_key()
+    if api_key is None:
+        return OpenAI()  # let the SDK raise its standard "no key" error
+    return OpenAI(api_key=api_key)
 
 
 def generate(prompt: str, *, client: Any = None) -> bytes:

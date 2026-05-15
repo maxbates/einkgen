@@ -14,16 +14,9 @@ export interface EinkgenStackProps extends StackProps {
   envName: string;
 }
 
-const DEFAULT_PILLOW_LAYER_ARN =
-  'arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p312-Pillow:16';
-
 export class EinkgenStack extends Stack {
   constructor(scope: Construct, id: string, props: EinkgenStackProps) {
     super(scope, id, props);
-
-    const pillowLayerArn =
-      (this.node.tryGetContext('pillowLayerArn') as string | undefined) ??
-      DEFAULT_PILLOW_LAYER_ARN;
 
     const includeWebAssets =
       this.node.tryGetContext('includeWebAssets') !== false &&
@@ -47,7 +40,6 @@ export class EinkgenStack extends Stack {
       cdnBase,
       openaiApiKey: secrets.openaiApiKey,
       deviceStatusToken: secrets.deviceStatusToken,
-      pillowLayerArn,
     });
 
     new EinkgenObservability(this, 'Observability', {
@@ -102,8 +94,8 @@ export class EinkgenStack extends Stack {
     new CfnOutput(this, 'BucketName', { value: bucket.bucket.bucketName });
     new CfnOutput(this, 'CdnDomain', { value: cdn.distribution.distributionDomainName });
     new CfnOutput(this, 'CdnDistributionId', { value: cdn.distribution.distributionId });
-    new CfnOutput(this, 'ReadApiUrl', { value: lambdas.readApiFunctionUrl.url });
-    new CfnOutput(this, 'DeviceStatusUrl', { value: lambdas.deviceStatusFunctionUrl.url });
+    new CfnOutput(this, 'ReadApiUrl', { value: lambdas.readApiUrl });
+    new CfnOutput(this, 'DeviceStatusUrl', { value: lambdas.deviceStatusUrl });
     new CfnOutput(this, 'OpenAiSecretName', { value: secrets.openaiApiKey.secretName });
     new CfnOutput(this, 'DeviceStatusSecretName', {
       value: secrets.deviceStatusToken.secretName,

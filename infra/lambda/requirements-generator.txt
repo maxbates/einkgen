@@ -1,5 +1,6 @@
-# Pillow is provided by the Klayers public layer (see infra/README.md).
-# Only the bits not in the layer or the Python 3.12 runtime go here.
 # boto3 is in the runtime — don't ship it.
+# Pillow bundled directly: Docker bundling uses the Python 3.12 SAM image
+# which is manylinux2014 x86_64, so pip pulls a layer-compatible wheel.
+Pillow>=10
 openai>=1.0,<2.0
 python-ulid>=3.0,<4.0
