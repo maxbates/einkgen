@@ -5,6 +5,38 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.2.0.1] - 2026-05-15
+
+Phase 3 — first real deploy. The system actually runs against AWS now; every bug
+the deploy uncovered is fixed in this version.
+
+### Changed
+- Lambda Function URLs replaced with **API Gateway HTTP API** for `einkgen-read-api`
+  and `einkgen-device-status`. AWS's account-level "block public access for Function URLs"
+  rejects `AuthType: NONE`, so the URLs returned 403 from the auth layer. API Gateway
+  public endpoints are not subject to that block. CORS rules preserved (read-api pinned
+  to CloudFront + localhost; device-status has no CORS, firmware-only).
+- Pillow now bundles into the generator Lambda zip directly. The Klayers public layer
+  ARN baked into `infra/cdk.json` was no longer accessible to this account; bundling
+  Pillow ourselves removes the third-party hosted-layer dependency.
+- Lambda architecture flipped from `x86_64` → `arm64` (Graviton2). Native to Apple
+  Silicon dev machines, avoids `--platform linux/amd64` bundling-quirks, ~20% cheaper.
+
+### Fixed
+- `infra/lib/observability.ts` — `AWS::Logs::MetricFilter` resources can't use
+  `defaultValue + dimensions` together, and literal-token filter patterns can't
+  populate dimensions at all. Switched to per-Lambda metric names
+  (`ErrorLogCount-{generator,read-api,device-status}`) with `defaultValue: 0` restored.
+  `cdk synth` accepted the original combination silently — only the CloudWatch
+  API rejects it.
+- `core/generate.py` — when `OPENAI_API_KEY` env var is unset, fetch the key from
+  Secrets Manager using the `OPENAI_API_KEY_SECRET_NAME` env var the CDK already
+  injects. Phase 1's `_default_client()` only read the env var, so the generator
+  Lambda 500'd on every queue item until this landed. CLI path unchanged.
+- `infra/.gitignore` and `web/.gitignore` — added `cdk-outputs.json` and
+  `.env.production` / `.env.development`. Both are deployment state that varies
+  per environment and shouldn't sit in source.
+
 ## [0.2.0.0] - 2026-05-14
 
 Phase 2 — the system becomes end-to-end deployable. Web SPA, public read-only API,
