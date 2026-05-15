@@ -47,7 +47,7 @@ def process_item(item: QueueItem) -> None:
     source: dict[str, Any] = {
         "kind": "generated" if item.kind != "image" else "uploaded",
     }
-    # README §7 says model/prompt may be omitted for image-kind uploads.
+    # ARCHITECTURE §7 says model/prompt may be omitted for image-kind uploads.
     if item.kind != "image":
         source["model"] = "gpt-image-1"
     if item.prompt is not None:

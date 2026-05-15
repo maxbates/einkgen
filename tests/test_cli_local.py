@@ -21,7 +21,7 @@ SAMPLE_PATH = FIXTURE_DIR / "sample.png"
 
 
 def _make_sample_gradient(path: Path, w: int = 1500, h: int = 1000) -> None:
-    """Programmatic 1500x1000 RGB diagonal gradient. README §6 calls for at
+    """Programmatic 1500x1000 RGB diagonal gradient. ARCHITECTURE §6 calls for at
     least panel-sized input so the convert step exercises center-crop."""
     img = Image.new("RGB", (w, h))
     px = img.load()

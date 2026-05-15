@@ -3,7 +3,7 @@
 Items live at ``s3://<bucket>/queue/<iso8601>-<ulid>.json``. ULIDs are
 lex-monotonic, so a sorted ``ListObjectsV2`` is FIFO order. The generator
 Lambda runs with reserved concurrency = 1, which is what makes head reads
-race-free — see README §4.
+race-free — see ARCHITECTURE §4.
 
 If we ever need multi-producer races, swap the implementation for SQS FIFO
 or DynamoDB without changing this module's public API.
