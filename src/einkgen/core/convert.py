@@ -2,7 +2,7 @@
 
 Takes an arbitrary source image and produces an 8-bit indexed BMP at the
 panel's native resolution (1200x825) with an 8-entry evenly-spaced grayscale
-palette. Per README §6, generated images come in at 1536x1024 so we always
+palette. Per ARCHITECTURE §6, generated images come in at 1536x1024 so we always
 center-crop with zero resampling; uploaded images that are smaller in either
 dimension get scale-fit + white pad.
 """

@@ -11,7 +11,7 @@ Auth
 ----
 Shared secret. The header is validated against the raw ``SecretString`` of an
 AWS Secrets Manager secret (no JSON wrapping). Wrong/missing token → 401 with
-no S3 write — the threat model in README §16 treats unauthenticated POSTs as
+no S3 write — the threat model in ARCHITECTURE §12 treats unauthenticated POSTs as
 S3-cost griefing. Comparison uses ``hmac.compare_digest`` for constant time.
 The fetched token is cached at module scope so warm invocations skip the
 Secrets Manager API call.
@@ -20,7 +20,7 @@ Storage
 -------
 Writes ``status/device-<device_id>.json`` with the body fields plus a
 server-side ``last_seen`` ISO 8601 UTC timestamp. One key per device, latest
-wins — historical retention is deferred (see README §14).
+wins — historical retention is deferred (see PLAN §3).
 
 device_id resolution
 --------------------
@@ -46,7 +46,7 @@ The Lambda execution role needs:
   - ``secretsmanager:GetSecretValue`` on the configured secret's ARN
     (env ``DEVICE_STATUS_SECRET_NAME``, default ``einkgen/device_status_token``).
   - ``s3:PutObject`` on ``arn:aws:s3:::<bucket>/status/*`` only (write-only,
-    scoped to the prefix — see README §8 access policy).
+    scoped to the prefix — see ARCHITECTURE §8 access policy).
 
 No other permissions are required: this Lambda never reads S3, never invokes
 other services, and emits logs via the default CloudWatch Logs role.
@@ -79,7 +79,7 @@ DEFAULT_DEVICE_ID = "default"
 MAX_BODY_BYTES = 4 * 1024
 
 # Re-fetch the token after this many seconds. Bounds how long a rotated secret
-# stays unreachable to warm Lambda containers (README §10 says rotate on
+# stays unreachable to warm Lambda containers (ARCHITECTURE §10 says rotate on
 # suspicion — without a TTL, leaked tokens keep working on warm containers
 # until they recycle, which can be hours).
 TOKEN_CACHE_TTL_SECONDS = 300
@@ -136,7 +136,7 @@ def _expected_token() -> str:
     secret_name = os.environ.get("DEVICE_STATUS_SECRET_NAME", DEFAULT_SECRET_NAME)
     resp = _get_sm_client().get_secret_value(SecretId=secret_name)
     # SecretString stored as a raw token — no JSON unwrap. Matches the
-    # convention in README §10 and keeps the secret resource trivial.
+    # convention in ARCHITECTURE §10 and keeps the secret resource trivial.
     # A binary-only secret would lack SecretString; treat that as misconfig
     # rather than silently caching None.
     if "SecretString" not in resp:

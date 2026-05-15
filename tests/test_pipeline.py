@@ -117,7 +117,7 @@ def test_image_kind_fetches_from_s3(monkeypatch, s3_bucket):
     p = calls["publish"][0]
     assert p["item_id"] == "01HFTEST0002"
     assert p["original"] == b"real-jpeg-bytes"
-    # README §7: model/prompt are omitted for image-kind uploads,
+    # ARCHITECTURE §7: model/prompt are omitted for image-kind uploads,
     # not present-with-null.
     assert p["source"] == {"kind": "uploaded"}
     assert "model" not in p["source"]

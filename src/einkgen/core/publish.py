@@ -86,7 +86,7 @@ def publish(
 ) -> Manifest:
     """Publish a processed frame.
 
-    Steps (see README §7, §8):
+    Steps (see ARCHITECTURE §7, §8):
       1. Hash the BMP.
       2. Write `current/image.bmp`.
       3. Build and write `current/manifest.json` with an incremented version.

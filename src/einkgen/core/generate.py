@@ -2,7 +2,7 @@
 
 The pipeline always requests 1536x1024 from the model — the closest size to
 the panel's 1200x825 (1.5:1 vs ~1.4545:1) — so the downstream `convert()` step
-can center-crop with zero resampling. See README §6.
+can center-crop with zero resampling. See ARCHITECTURE §6.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import os
 import random
 from typing import Any
 
-# Prepended to every user/random subject string. Lifted verbatim from README §6.
+# Prepended to every user/random subject string. Lifted verbatim from ARCHITECTURE §6.
 BASE_PROMPT = (
     "Compose a single image at 1536×1024 (landscape, 3:2). It will be center-cropped\n"
     "to 1200×825 (a 9.7\" e-paper panel) and dithered to 8 grayscale levels. Keep\n"
@@ -21,7 +21,7 @@ BASE_PROMPT = (
     "not survive dithering. No text or watermarks. Subject:"
 )
 
-# The 10 entries from README §6. Each is a complete prompt string (the
+# The 10 entries from ARCHITECTURE §6. Each is a complete prompt string (the
 # descriptive text after the dash, not just the title) so generators can append
 # them to BASE_PROMPT verbatim.
 PROMPT_LIBRARY: list[str] = [

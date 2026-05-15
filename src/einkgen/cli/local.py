@@ -1,6 +1,6 @@
 """`einkgen local {generate, convert, preview}` — dev/debug commands.
 
-Never touches S3. Per README §3, these are pure local helpers for verifying
+Never touches S3. Per ARCHITECTURE §3, these are pure local helpers for verifying
 the model and the image pipeline before publishing.
 """
 
@@ -93,7 +93,7 @@ def _cmd_preview(args: argparse.Namespace) -> int:
     client = _make_client()
     png_bytes = generate_mod.generate(args.prompt, client=client)
     bmp_bytes = convert_mod.convert(png_bytes, dither=args.dither)
-    # README §6: preview writes PNG, not BMP, "so we can eyeball it before pushing".
+    # ARCHITECTURE §6: preview writes PNG, not BMP, "so we can eyeball it before pushing".
     bmp_img = Image.open(io.BytesIO(bmp_bytes))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     bmp_img.save(args.output, format="PNG")

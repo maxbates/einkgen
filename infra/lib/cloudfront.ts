@@ -42,7 +42,7 @@ function handler(event) {
 
     // history/* gate: only processed.bmp is publicly served via the CDN.
     // history/<id>/original.png is the raw user upload and history/<id>/
-    // manifest.json is read by the read-api Lambda over IAM (see README §8
+    // manifest.json is read by the read-api Lambda over IAM (see ARCHITECTURE §8
     // access policy). Both must NOT be reachable from the public CDN.
     const historyFilter = new cloudfront.Function(this, 'HistoryFilterFn', {
       functionName: `einkgen-history-filter`,

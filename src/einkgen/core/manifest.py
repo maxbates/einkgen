@@ -1,6 +1,6 @@
 """Manifest schema and helpers.
 
-See README §7 for the wire format. The manifest lives at
+See ARCHITECTURE §7 for the wire format. The manifest lives at
 `s3://<bucket>/current/manifest.json` and is the only thing the device
 fetches on every wake.
 """
@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-# Default display block — Inkplate 10 (see README §1).
+# Default display block — Inkplate 10 (see ARCHITECTURE §1).
 DEFAULT_DISPLAY: dict[str, int] = {"width": 1200, "height": 825, "levels": 8}
 
 # A tick boundary "exactly now" should round up to the *next* tick. We
@@ -25,7 +25,7 @@ _TICK_EPSILON = timedelta(microseconds=1)
 class Manifest:
     """The JSON document at `current/manifest.json`.
 
-    Field names and order match the example in README §7. `source.model`
+    Field names and order match the example in ARCHITECTURE §7. `source.model`
     and `source.prompt` may be omitted for image-kind uploads.
     """
 

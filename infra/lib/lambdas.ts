@@ -147,7 +147,7 @@ export class EinkgenLambdas extends Construct {
       code: bundlePython('requirements-generator.txt', sourceStaged),
       memorySize: 1024,
       timeout: Duration.minutes(5),
-      // README §4: reserved concurrency = 1 keeps queue drains FIFO-serial.
+      // ARCHITECTURE §4: reserved concurrency = 1 keeps queue drains FIFO-serial.
       reservedConcurrentExecutions: 1,
       logRetention: logs.RetentionDays.TWO_WEEKS,
       environment: {
@@ -157,10 +157,10 @@ export class EinkgenLambdas extends Construct {
         OPENAI_API_KEY_SECRET_NAME: props.openaiApiKey.secretName,
       },
     });
-    // README §8 access table — generator writes current/ and history/,
+    // ARCHITECTURE §8 access table — generator writes current/ and history/,
     // reads + finalizes queue/, and reads + cleans queue/staged/. Avoid
     // grantReadWrite on the whole bucket: it would also cover web/, firmware/,
-    // status/ — the invariant from README §16 is that the generator never
+    // status/ — the invariant from ARCHITECTURE §12 is that the generator never
     // touches those.
     this.generator.addToRolePolicy(
       new iam.PolicyStatement({
@@ -189,7 +189,7 @@ export class EinkgenLambdas extends Construct {
     );
 
     // Async-invoke retries reprocess from scratch — each retry runs another
-    // OpenAI generation. README §15 defers a cost cap; this is the cheap
+    // OpenAI generation. PLAN §3 defers a cost cap; this is the cheap
     // pre-emptive bound. Items lost on transient failure can be re-enqueued
     // by the operator.
     new lambda.EventInvokeConfig(this, 'GeneratorInvokeConfig', {
@@ -273,7 +273,7 @@ export class EinkgenLambdas extends Construct {
       code: bundlePython('requirements-device-status.txt', sourceStaged),
       memorySize: 256,
       timeout: Duration.seconds(10),
-      // README §16: cap blast radius for token-spam attacks.
+      // ARCHITECTURE §12: cap blast radius for token-spam attacks.
       reservedConcurrentExecutions: 5,
       logRetention: logs.RetentionDays.TWO_WEEKS,
       environment: {

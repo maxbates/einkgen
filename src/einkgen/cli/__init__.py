@@ -1,6 +1,6 @@
 """einkgen CLI root dispatcher.
 
-Top-level structure (per README §3): `status`, `history`, `queue …`, `local …`.
+Top-level structure (per ARCHITECTURE §3): `status`, `history`, `queue …`, `local …`.
 """
 
 from __future__ import annotations

@@ -26,14 +26,41 @@ baked into `secrets.h`) and include it.
 
 ## Image pipeline
 
-### Profile and replace pure-Python error-diffusion dither
-**Priority:** P2
+### ~~Profile and replace pure-Python error-diffusion dither~~ (measured, closed)
+**Priority:** P2 → resolved (no action)
 **Source:** Phase 1 pre-landing review
+**Measured:** Phase 3 post-deploy (2026-05-15)
 
-`core/convert.py` does Atkinson and Floyd–Steinberg in pure Python at 1200×825.
-Likely slow inside Lambda (still untimed in production). Once we have a real
-measurement, swap to numpy or `Pillow.Image.convert("P", dither=Image.FLOYDSTEINBERG)`.
-Don't preemptively rewrite.
+Profiled against `history/01KRPJPKZZ0MJ5RRZYXEHRWBWV/original.png` (a real
+1536×1024 OpenAI output) locally and cross-referenced with 7 successful
+CloudWatch invocations on Lambda ARM64 Graviton2 1024 MB.
+
+| Phase | Time | % of total |
+| --- | --- | --- |
+| OpenAI `gpt-image-1` call | ~52–55 s | ~93–95% |
+| `core/convert.py` (load + crop + grayscale + **Atkinson dither** + BMP encode) | ~2–3 s | ~4–5% |
+| `core/publish.py` (S3 puts + CloudFront invalidate) | ~0.5–1 s | ~1–2% |
+| **Total CloudWatch `Duration`** | **48.5–61.8 s** (n=7, mean ~55 s) | 100% |
+
+Local breakdown of `convert()` on an M-series Mac (warm, n=3):
+- PIL load: 29 ms
+- `_fit_to_canvas` (center crop, no resampling): 0.3 ms
+- `_to_grayscale`: 0.5 ms
+- **`_dither_error_diffuse` (Atkinson, pure Python)**: **1106 ms**
+- `_encode_indexed_bmp`: 41 ms
+- Total `convert()`: **1161 ms**
+
+For comparison: Pillow's native `Image.quantize(..., dither=FLOYDSTEINBERG)`
+against the same 8-grey palette ran in **~11 ms** (≈100× faster), but only
+supports Floyd–Steinberg — there is no built-in Atkinson and Atkinson is the
+intentional default for the "crisp Mac look" the project wants (ARCHITECTURE §6).
+A naive numpy port of the same algorithm ran *slower* (~5.5 s) because per-pixel
+numpy ops are dominated by Python overhead — vectorisation isn't trivially
+available for serial error diffusion.
+
+**Decision: leave the pure-Python Atkinson in place.** Dither is 4–5% of total
+runtime; OpenAI is the only thing worth optimising and we can't (it's a network
+call). Revisit only if we drop OpenAI for a local model.
 
 ## Read API
 
@@ -58,7 +85,7 @@ challenge on future releases.
 
 ### Daily OpenAI cost cap
 **Priority:** P3
-**Source:** README §15 + phase 2 adversarial review
+**Source:** PLAN §3 + phase 2 adversarial review
 
 No daily $ cap on OpenAI spend. `retryAttempts: 0` on the generator Lambda + the
 EventBridge target caps retry-amplification. Cost-runaway from a high-volume

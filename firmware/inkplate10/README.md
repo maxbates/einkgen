@@ -4,7 +4,7 @@ The sketch that runs on the device. On every wake it joins Wi-Fi, fetches
 `manifest.json`, redraws the panel only if the image hash changed, reports
 status to the device-status Lambda, then deep-sleeps until the next check.
 
-See the project root [README](../../README.md) for the system overview
+See [ARCHITECTURE.md](../../ARCHITECTURE.md) for the system overview
 (§1 device, §7 manifest, §11 firmware spec).
 
 ## Hardware
@@ -37,7 +37,8 @@ Arduino IDE 2.x.
 1. `cp secrets.h.example secrets.h` and fill in:
    - `WIFI_SSID`, `WIFI_PASS`
    - `MANIFEST_URL` — your CloudFront URL ending in `/current/manifest.json`
-   - `DEVICE_STATUS_URL` — the device-status Lambda Function URL
+   - `DEVICE_STATUS_URL` — the device-status API Gateway endpoint
+     (the `DeviceStatusUrl` value from `infra/cdk-outputs.json`)
    - `DEVICE_STATUS_TOKEN` — the shared secret stored in AWS Secrets Manager
 2. Open `inkplate10.ino` in Arduino IDE.
 3. *Tools → Board → Dasduino Boards →* **Soldered Inkplate10**.
@@ -78,12 +79,13 @@ and reflash the device.
 ## Notes / TODOs left for hardware-test pass
 
 - HTTPS cert verification is currently disabled (`setInsecure()`). For v0 the
-  threat model in the root README (§16) accepts this — the worst case is
-  denial of service. Pin the CloudFront cert before shipping outside a home LAN.
-- `display.image.draw(...)` is the Inkplate-Arduino-library API. The root
-  README originally specced `display.drawImage(...)`; that name isn't exposed
-  by the current library, so the sketch uses `image.draw()`. Confirm on
-  hardware that the call returns true and the panel renders.
+  threat model in [ARCHITECTURE §12](../../ARCHITECTURE.md#12-security--threat-model)
+  accepts this — the worst case is denial of service. Pin the CloudFront cert
+  before shipping outside a home LAN.
+- `display.image.draw(...)` is the Inkplate-Arduino-library API. The original
+  spec called `display.drawImage(...)`; that name isn't exposed by the current
+  library, so the sketch uses `image.draw()`. Confirm on hardware that the
+  call returns true and the panel renders.
 - `display.readBattery()` returns a `double`; we cast to `float` and linearly
   map 3.3→4.2 V to 0→100 %. Calibrate against the actual cell once it's wired.
 - Partition scheme name may vary between Dasduino board package versions.
