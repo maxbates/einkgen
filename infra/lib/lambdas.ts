@@ -11,6 +11,12 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import {
+  HttpApi,
+  HttpMethod,
+  CorsHttpMethod,
+} from 'aws-cdk-lib/aws-apigatewayv2';
+import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 
 export interface EinkgenLambdasProps {
   bucket: s3.Bucket;
@@ -18,7 +24,6 @@ export interface EinkgenLambdasProps {
   cdnBase: string;
   openaiApiKey: secretsmanager.Secret;
   deviceStatusToken: secretsmanager.Secret;
-  pillowLayerArn: string;
 }
 
 // Root of the Python package on disk. Bundling stages a copy under
@@ -125,32 +130,25 @@ export class EinkgenLambdas extends Construct {
   public readonly generator: lambda.Function;
   public readonly readApi: lambda.Function;
   public readonly deviceStatus: lambda.Function;
-  public readonly readApiFunctionUrl: lambda.FunctionUrl;
-  public readonly deviceStatusFunctionUrl: lambda.FunctionUrl;
+  public readonly readApiUrl: string;
+  public readonly deviceStatusUrl: string;
 
   constructor(scope: Construct, id: string, props: EinkgenLambdasProps) {
     super(scope, id);
 
     const sourceStaged = stageSource();
 
-    const pillowLayer = lambda.LayerVersion.fromLayerVersionArn(
-      this,
-      'PillowLayer',
-      props.pillowLayerArn,
-    );
-
     // ---- generator ----------------------------------------------------
     this.generator = new lambda.Function(this, 'Generator', {
       functionName: 'einkgen-generator',
       runtime: lambda.Runtime.PYTHON_3_12,
-      architecture: lambda.Architecture.X86_64,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'einkgen.lambdas.generator.handler',
       code: bundlePython('requirements-generator.txt', sourceStaged),
       memorySize: 1024,
       timeout: Duration.minutes(5),
       // README §4: reserved concurrency = 1 keeps queue drains FIFO-serial.
       reservedConcurrentExecutions: 1,
-      layers: [pillowLayer],
       logRetention: logs.RetentionDays.TWO_WEEKS,
       environment: {
         EINKGEN_BUCKET: props.bucket.bucketName,
@@ -229,7 +227,7 @@ export class EinkgenLambdas extends Construct {
     this.readApi = new lambda.Function(this, 'ReadApi', {
       functionName: 'einkgen-read-api',
       runtime: lambda.Runtime.PYTHON_3_12,
-      architecture: lambda.Architecture.X86_64,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'einkgen.lambdas.read_api.handler',
       code: bundlePython('requirements-read-api.txt', sourceStaged),
       memorySize: 256,
@@ -241,28 +239,36 @@ export class EinkgenLambdas extends Construct {
     });
     props.bucket.grantRead(this.readApi);
 
-    // Read API Function URL is its own endpoint (not behind CloudFront), so
-    // pinning allowedOrigins to the CF domain is safe: no circular dep.
-    // localhost:5173 is included so `npm run dev` can hit the deployed read-api
-    // without a stub server — the data is public per the threat model anyway.
-    this.readApiFunctionUrl = this.readApi.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,
-      cors: {
-        allowedOrigins: [
+    // API Gateway HTTP API in front of read-api. Lambda Function URLs with
+    // AuthType=NONE are blocked by an AWS account-level public-access setting
+    // we can't easily disable; HTTP API public endpoints are not subject to
+    // that block. The route is a catch-all GET — the handler dispatches
+    // /queue, /history, /status internally based on rawPath, same as it did
+    // under the Function URL.
+    const readApiHttp = new HttpApi(this, 'ReadApiHttp', {
+      apiName: 'einkgen-read-api',
+      corsPreflight: {
+        allowOrigins: [
           `https://${props.distribution.distributionDomainName}`,
           'http://localhost:5173',
         ],
-        allowedMethods: [lambda.HttpMethod.GET],
-        allowedHeaders: ['*'],
+        allowMethods: [CorsHttpMethod.GET],
+        allowHeaders: ['*'],
         maxAge: Duration.minutes(10),
       },
     });
+    readApiHttp.addRoutes({
+      path: '/{proxy+}',
+      methods: [HttpMethod.GET],
+      integration: new HttpLambdaIntegration('ReadApiIntegration', this.readApi),
+    });
+    this.readApiUrl = readApiHttp.apiEndpoint;
 
     // ---- device-status ------------------------------------------------
     this.deviceStatus = new lambda.Function(this, 'DeviceStatus', {
       functionName: 'einkgen-device-status',
       runtime: lambda.Runtime.PYTHON_3_12,
-      architecture: lambda.Architecture.X86_64,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'einkgen.lambdas.device_status.handler',
       code: bundlePython('requirements-device-status.txt', sourceStaged),
       memorySize: 256,
@@ -283,12 +289,20 @@ export class EinkgenLambdas extends Construct {
     );
     props.deviceStatusToken.grantRead(this.deviceStatus);
 
-    // Only firmware POSTs here — no browser involvement. Function URLs accept
-    // non-browser requests regardless of CORS, so omit the cors block entirely
-    // rather than wildcard it (which would also enable browser-origin POSTs
-    // from any page that ever exfiltrates the token).
-    this.deviceStatusFunctionUrl = this.deviceStatus.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,
+    // API Gateway HTTP API in front of device-status. No CORS — only firmware
+    // POSTs here. The route is `POST /` because the firmware uses the base
+    // URL (no path suffix) and the handler doesn't dispatch by path.
+    const deviceStatusHttp = new HttpApi(this, 'DeviceStatusHttp', {
+      apiName: 'einkgen-device-status',
     });
+    deviceStatusHttp.addRoutes({
+      path: '/',
+      methods: [HttpMethod.POST],
+      integration: new HttpLambdaIntegration(
+        'DeviceStatusIntegration',
+        this.deviceStatus,
+      ),
+    });
+    this.deviceStatusUrl = deviceStatusHttp.apiEndpoint;
   }
 }
