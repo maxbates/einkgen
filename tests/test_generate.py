@@ -12,6 +12,7 @@ from einkgen.core.generate import (
     BASE_PROMPT,
     IMAGE_SIZE,
     PROMPT_LIBRARY,
+    _resolve_api_key,
     generate,
     random_prompt,
 )
@@ -72,3 +73,17 @@ def test_generate_raises_when_no_b64_payload():
 
     with pytest.raises(RuntimeError, match="b64_json"):
         generate("anything", client=client)
+
+
+def test_resolve_api_key_prefers_env_var(monkeypatch):
+    """CLI / local dev path — OPENAI_API_KEY env var wins, no AWS round-trip."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-direct-value")
+    monkeypatch.setenv("OPENAI_API_KEY_SECRET_NAME", "should-be-ignored")
+    assert _resolve_api_key() == "sk-direct-value"
+
+
+def test_resolve_api_key_returns_none_when_nothing_set(monkeypatch):
+    """Both env vars missing — let OpenAI() raise its own clear error."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY_SECRET_NAME", raising=False)
+    assert _resolve_api_key() is None
