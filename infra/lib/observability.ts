@@ -30,22 +30,25 @@ export class EinkgenObservability extends Construct {
     // dependency on the LogRetention custom resource — otherwise the filter
     // can be created before the log group exists and PutMetricFilter fails
     // at deploy time.
+    // Per-Lambda metric names rather than a shared name + Lambda dimension:
+    // CloudWatch's literal-token filter pattern can't populate dimensions
+    // (the pattern extracts no structured values), and dimensions also
+    // mutually exclude `defaultValue`. Distinct metric names sidesteps both.
     const errorMetrics: cloudwatch.IMetric[] = [];
     for (const { name, fn } of fns) {
+      const metricName = `ErrorLogCount-${name}`;
       new logs.MetricFilter(this, `ErrorFilter-${name}`, {
         logGroup: fn.logGroup,
         filterPattern: logs.FilterPattern.literal('ERROR'),
         metricNamespace: METRIC_NAMESPACE,
-        metricName: 'ErrorLogCount',
+        metricName,
         metricValue: '1',
         defaultValue: 0,
-        dimensions: { Lambda: fn.functionName },
       });
       errorMetrics.push(
         new cloudwatch.Metric({
           namespace: METRIC_NAMESPACE,
-          metricName: 'ErrorLogCount',
-          dimensionsMap: { Lambda: fn.functionName },
+          metricName,
           statistic: cloudwatch.Stats.SUM,
           period: Duration.minutes(5),
           label: name,
