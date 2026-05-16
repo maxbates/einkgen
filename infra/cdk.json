@@ -17,6 +17,8 @@
   "context": {
     "env": "dev",
     "includeWebAssets": false,
+    "einkgenSiteDomain": "einkgen.link",
+    "einkgenInboundDomain": "einkgen.link",
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:checkSecretUsage": true,
     "@aws-cdk/core:target-partitions": ["aws", "aws-cn"],
