@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from einkgen.core import generate as generate_mod
+from einkgen.core import prompt_library as prompt_library_mod
 from einkgen.core.generate import (
     BASE_PROMPT,
     IMAGE_SIZE,
@@ -29,9 +30,12 @@ def test_prompt_library_has_exactly_ten_entries():
     assert all(isinstance(p, str) and p.strip() for p in PROMPT_LIBRARY)
 
 
-def test_random_prompt_returns_library_entry():
+def test_random_prompt_returns_library_entry(s3_bucket):
+    # No prompt_library.txt on S3 → falls back to PROMPT_LIBRARY (= DEFAULTS).
+    prompt_library_mod._reset_cache()
     p = random_prompt()
     assert p in PROMPT_LIBRARY
+    prompt_library_mod._reset_cache()
 
 
 def _fake_client(b64: str) -> MagicMock:
