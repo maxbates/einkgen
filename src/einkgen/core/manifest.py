@@ -66,13 +66,19 @@ def compute_sha256(data: bytes) -> str:
 def compute_next_check_after(
     now: datetime,
     *,
-    tick_interval: timedelta = timedelta(hours=2),
+    tick_interval: timedelta = timedelta(hours=1),
     buffer: timedelta = timedelta(minutes=5),
 ) -> datetime:
     """Return the next tick boundary after `now`, plus `buffer`.
 
     Tick boundaries are anchored at the Unix epoch, so for the default
-    2-hour interval they fall at 00:00, 02:00, 04:00 UTC, ...
+    1-hour interval they fall at 00:00, 01:00, 02:00 UTC, ...
+
+    The default is the firmware's nominal device-poll cadence. Operators
+    can override per-deploy via the ``EINKGEN_POLL_INTERVAL_SECONDS``
+    env var (read by ``publish.publish``) — the firmware's
+    ``SLEEP_MAX_SECONDS`` must be raised in lockstep if the override
+    exceeds 1 hour, or it will silently clamp.
 
     If `now` lies exactly on a tick (or within an epsilon of one), we
     return the *next* tick — never "right now". This keeps the device

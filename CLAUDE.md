@@ -11,7 +11,7 @@ queue → a generator Lambda drains it → S3 + CloudFront serve the manifest +
 BMP to the device. The web app is a public read-only dashboard with three
 tabs (Queue, History, Device).
 
-Live example: <https://d3r4vmga971o51.cloudfront.net/>
+Live example: <https://einkgen.link/>
 
 For full system shape: [ARCHITECTURE.md](ARCHITECTURE.md).
 For deploy walkthrough: [QUICKSTART.md](QUICKSTART.md).
@@ -125,6 +125,7 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "Add an allowed email sender" | `einkgen allowlist add <email>` (writes `config/email_allowlist.txt`). Comparison is case-insensitive. Never hardcode addresses in committed CDK — first-deploy seeding goes through the `einkgenAllowlistSeed` context flag instead. |
 | "Pick me a cheap domain" | `aws route53domains list-prices --region us-east-1` + filter where reg ≤ $10 *and* renew ≤ $10. Then `check-domain-availability` per candidate. Always surface renewal price — domain registration is a recurring cost. Don't autonomously register; have the human `cp register-domain.example.sh register-domain.sh` and fill in their PII (the live `.sh` is gitignored). |
 | "Change the dither algorithm" | `src/einkgen/core/convert.py`. **Read [TODOS.md](TODOS.md) §"Profile and replace pure-Python error-diffusion dither" first** — the current pure-Python Atkinson is the considered choice. Don't replace without re-measuring. |
+| "Change the device poll interval" / "make it check more often" | Edit **both** `SLEEP_MAX_SECONDS` + `SLEEP_FALLBACK_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) **and** redeploy with `-c einkgenPollIntervalSeconds=<n>`. See [QUICKSTART §3.12](QUICKSTART.md#312-optional-device-poll-interval) for the battery-life table. Server-only change is silently clamped by firmware. Don't conflate with the auto-gen `rate(2 hours)` cron — that's the OpenAI-cost knob, separate concern. |
 | "It's broken / debug this" | `AWS_PROFILE=einkgen ./infra/scripts/check-errors.sh 24h` first, then `aws logs tail /aws/lambda/<fn> --follow` |
 | "QA the live SPA" | Use the deployed CloudFront URL and the browse tool (or `/qa-only` if gstack is loaded) |
 | "Cut a release" | Bump `VERSION`, prepend a `CHANGELOG.md` entry, then redeploy as in [QUICKSTART §3.6–§3.7](QUICKSTART.md#36-build-the-web-spa-against-the-deployed-urls) |

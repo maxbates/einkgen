@@ -61,33 +61,33 @@ def test_compute_sha256_known_vector():
 @pytest.mark.parametrize(
     "now, expected",
     [
-        # README example: a 10:32 wall clock rounds to 12:00 + 5m buffer.
-        (_utc(2026, 5, 13, 10, 32, 0), _utc(2026, 5, 13, 12, 5, 0)),
+        # A 10:32 wall clock rounds to 11:00 + 5m buffer (default = 1 h).
+        (_utc(2026, 5, 13, 10, 32, 0), _utc(2026, 5, 13, 11, 5, 0)),
         # Exact tick boundary: never return "now"; jump to the next tick.
-        (_utc(2026, 5, 13, 10, 0, 0), _utc(2026, 5, 13, 12, 5, 0)),
+        (_utc(2026, 5, 13, 10, 0, 0), _utc(2026, 5, 13, 11, 5, 0)),
         # Just before the next tick.
-        (_utc(2026, 5, 13, 11, 59, 59), _utc(2026, 5, 13, 12, 5, 0)),
+        (_utc(2026, 5, 13, 10, 59, 59), _utc(2026, 5, 13, 11, 5, 0)),
         # Crossing midnight.
         (_utc(2026, 5, 13, 23, 30, 0), _utc(2026, 5, 14, 0, 5, 0)),
     ],
 )
-def test_compute_next_check_after_2h_ticks(now, expected):
+def test_compute_next_check_after_1h_ticks(now, expected):
     assert compute_next_check_after(now) == expected
 
 
 def test_compute_next_check_after_naive_datetime_is_treated_as_utc():
     naive = datetime(2026, 5, 13, 10, 32, 0)
-    assert compute_next_check_after(naive) == _utc(2026, 5, 13, 12, 5, 0)
+    assert compute_next_check_after(naive) == _utc(2026, 5, 13, 11, 5, 0)
 
 
 def test_compute_next_check_after_custom_interval():
     now = _utc(2026, 5, 13, 10, 17, 0)
     result = compute_next_check_after(
         now,
-        tick_interval=timedelta(hours=1),
+        tick_interval=timedelta(hours=2),
         buffer=timedelta(minutes=2),
     )
-    assert result == _utc(2026, 5, 13, 11, 2, 0)
+    assert result == _utc(2026, 5, 13, 12, 2, 0)
 
 
 def test_compute_next_check_after_rejects_nonpositive_interval():

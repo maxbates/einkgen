@@ -51,8 +51,10 @@ def test_publish_writes_current_and_history(s3_bucket):
     assert manifest.image_bytes == len(PROCESSED)
     assert manifest.image_url.endswith("/current/image.bmp")
     assert manifest.display == {"width": 1200, "height": 825, "levels": 8}
-    # 14:00 falls exactly on a tick → next check is 16:00 + 5m buffer.
-    assert manifest.next_check_after == "2026-05-13T16:05:00Z"
+    # 14:00 falls exactly on a tick → next check is the *next* 1 h tick
+    # (15:00) + 5m buffer. See compute_next_check_after for the epsilon
+    # behaviour at exact boundaries.
+    assert manifest.next_check_after == "2026-05-13T15:05:00Z"
     assert manifest.generated_at == "2026-05-13T14:00:00Z"
 
     # current/image.bmp + current/manifest.json
@@ -156,6 +158,49 @@ def test_publish_invalidates_cf_when_env_var_set(s3_bucket, monkeypatch):
     assert kwargs["DistributionId"] == "E123ABC"
     paths = kwargs["InvalidationBatch"]["Paths"]["Items"]
     assert set(paths) == {"/current/manifest.json", "/current/image.bmp"}
+
+
+def test_publish_honours_poll_interval_env_var(s3_bucket, monkeypatch):
+    # 900 seconds = 15 minutes. 14:00 UTC → next 15-min tick after the
+    # epsilon is 14:15, plus the default 5m buffer = 14:20.
+    monkeypatch.setenv("EINKGEN_POLL_INTERVAL_SECONDS", "900")
+    m = publish.publish(
+        PROCESSED,
+        source={"kind": "generated"},
+        item_id="id-poll",
+        now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),
+    )
+    assert m.next_check_after == "2026-05-13T14:20:00Z"
+
+
+def test_publish_falls_back_when_poll_interval_env_unparseable(s3_bucket, monkeypatch):
+    # A malformed override silently falls back to the 1 h default rather
+    # than taking the publish path down.
+    monkeypatch.setenv("EINKGEN_POLL_INTERVAL_SECONDS", "not-a-number")
+    m = publish.publish(
+        PROCESSED,
+        source={"kind": "generated"},
+        item_id="id-poll-bad",
+        now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),
+    )
+    assert m.next_check_after == "2026-05-13T15:05:00Z"
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-5"])
+def test_publish_falls_back_when_poll_interval_env_nonpositive(
+    s3_bucket, monkeypatch, bad_value
+):
+    # The ``seconds <= 0`` guard in _poll_interval must also fall back to
+    # the 1 h default — a zero or negative interval would otherwise round
+    # the next-check to "right now" and DoS the device.
+    monkeypatch.setenv("EINKGEN_POLL_INTERVAL_SECONDS", bad_value)
+    m = publish.publish(
+        PROCESSED,
+        source={"kind": "generated"},
+        item_id=f"id-poll-{bad_value.replace('-', 'neg')}",
+        now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),
+    )
+    assert m.next_check_after == "2026-05-13T15:05:00Z"
 
 
 def test_publish_prompt_kwarg_overrides_source(s3_bucket):

@@ -107,11 +107,12 @@ future work.
 | Decision | Choice |
 | --- | --- |
 | Image model (v1) | OpenAI `gpt-image-1` at `1536×1024` |
-| Cron interval | every 2 hours |
+| Auto-gen cron interval | every 2 hours |
+| Device poll interval | 1 hour (configurable via `einkgenPollIntervalSeconds` CDK context; firmware `SLEEP_MAX_SECONDS` must match — QUICKSTART §3.12) |
 | Prompt strategy | 10-entry random library (ARCHITECTURE §6) + a base prompt that specifies the panel and dither constraints |
 | Aspect / resize policy | center-crop only (1536×1024 → 1200×825), no resampling for generated images |
 | Bucket access | `current/*` and `web/*` public via CloudFront; `history/*` public for `processed.bmp` only (viewer-request function); rest accessed only via Lambdas |
-| Device cadence | sleeps `min(next_check_after, 1h)`; manifest hint = next cron tick + 5 min buffer |
+| Device cadence | sleeps `min(next_check_after, SLEEP_MAX_SECONDS)`; manifest hint = next device-poll tick + 5 min buffer |
 | Queue policy | strict FIFO, no coalescing |
 | Queue trigger | S3 ObjectCreated → generator Lambda (concurrency = 1) |
 | Web app | read-only, React + Vite, three tabs (Queue / History / Device) |

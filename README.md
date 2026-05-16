@@ -4,7 +4,7 @@ A small AWS pipeline that generates (or accepts) images, dithers and resizes
 them for an **Inkplate 10** 9.7" e-paper display, and publishes them to S3
 where the device pulls the latest frame on its own schedule.
 
-**Live example:** <https://d3r4vmga971o51.cloudfront.net/> — three read-only
+**Live example:** <https://einkgen.link/> — three read-only
 tabs (Queue, History, Device) over a real dev deployment. History fills in
 every 2 hours from the cron tick.
 

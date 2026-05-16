@@ -80,12 +80,34 @@ export class EinkgenStack extends Stack {
       ? `https://${siteDomain}`
       : `https://${cdn.distribution.distributionDomainName}`;
 
+    // Device-poll cadence override. Default: unset → publish.py uses its
+    // built-in 1 h default, which matches the firmware's SLEEP_MAX_SECONDS
+    // floor. Operators who want a different cadence (e.g. 3 h, 30 min)
+    // pass an integer second count here AND edit
+    // ``firmware/inkplate10/inkplate10.ino`` so SLEEP_MAX_SECONDS matches
+    // — otherwise the firmware silently clamps. See QUICKSTART §3.12.
+    //   cdk deploy -c einkgenPollIntervalSeconds=10800   # 3 hours
+    const pollIntervalCtx = this.node.tryGetContext('einkgenPollIntervalSeconds');
+    const pollIntervalSeconds =
+      pollIntervalCtx !== undefined && pollIntervalCtx !== null && `${pollIntervalCtx}`.trim()
+        ? `${pollIntervalCtx}`.trim()
+        : undefined;
+    if (pollIntervalSeconds !== undefined) {
+      const parsed = Number(pollIntervalSeconds);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error(
+          `einkgenPollIntervalSeconds must be a positive integer (got ${pollIntervalSeconds})`,
+        );
+      }
+    }
+
     const lambdas = new EinkgenLambdas(this, 'Lambdas', {
       bucket: bucket.bucket,
       distribution: cdn.distribution,
       cdnBase,
       openaiApiKey: secrets.openaiApiKey,
       deviceStatusToken: secrets.deviceStatusToken,
+      pollIntervalSeconds,
     });
 
     new EinkgenObservability(this, 'Observability', {
@@ -130,6 +152,7 @@ export class EinkgenStack extends Stack {
           : undefined,
         code: bundlePython('requirements-inbound-email.txt', sourceStaged),
         seedAllowlist,
+        pollIntervalSeconds,
       });
     }
 
