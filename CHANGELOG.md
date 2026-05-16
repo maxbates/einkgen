@@ -5,6 +5,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.0.2] - 2026-05-16
+
+### Fixed
+- **Uploaded images are now scale-fit to the panel, not center-cropped.**
+  Previously, any upload larger than 1200×825 in both dimensions was passed
+  through `_fit_to_canvas`'s center-crop branch — so a 4032×3024 phone photo
+  ended up as the middle 1200×825 slice with most of the image discarded.
+  `convert()` now takes an `is_generated` flag: `True` (set by the generator
+  paths in `core/pipeline.py` and `cli local preview`) keeps the zero-resampling
+  center-crop for `gpt-image-2`'s 1536×1024 outputs; `False` (the default and
+  what every upload now hits) scale-fits while preserving aspect, then pads
+  with white. See ARCHITECTURE §6 step 2 for the updated wording.
+
 ## [0.4.0.1] - 2026-05-16
 
 ### Fixed

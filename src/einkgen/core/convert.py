@@ -2,9 +2,11 @@
 
 Takes an arbitrary source image and produces an 8-bit indexed BMP at the
 panel's native resolution (1200x825) with an 8-entry evenly-spaced grayscale
-palette. Per ARCHITECTURE §6, generated images come in at 1536x1024 so we always
-center-crop with zero resampling; uploaded images that are smaller in either
-dimension get scale-fit + white pad.
+palette. Per ARCHITECTURE §6, generated images come in at 1536x1024 composed
+with a centered 1200x825 safe area, so they center-crop with zero resampling
+(`is_generated=True`). Uploads are arbitrary size and may be much larger than
+the panel, so the default path scale-fits + pads with white — center-cropping a
+4032x3024 phone photo would otherwise discard most of the image.
 """
 
 from __future__ import annotations
@@ -33,20 +35,24 @@ def _load(src: ImageInput) -> Image.Image:
     return src
 
 
-def _fit_to_canvas(img: Image.Image) -> Image.Image:
+def _fit_to_canvas(img: Image.Image, *, is_generated: bool = False) -> Image.Image:
     """Get the image to exactly PANEL_WIDTH x PANEL_HEIGHT.
 
-    - If both dims are >= panel: center-crop (pixel-exact, no resampling).
-    - Otherwise: scale-fit (preserve aspect) + white pad to the canvas.
+    - is_generated=True and both dims >= panel: center-crop (pixel-exact, no
+      resampling). Used for `gpt-image-2` 1536x1024 outputs which are composed
+      with a centered 1200x825 safe area.
+    - Otherwise: scale-fit (preserve aspect) + white pad to the canvas. The
+      default — uploads can be arbitrary size, and scale-fit preserves the
+      whole image instead of discarding most of it.
     """
     w, h = img.size
-    if w >= PANEL_WIDTH and h >= PANEL_HEIGHT:
+    if is_generated and w >= PANEL_WIDTH and h >= PANEL_HEIGHT:
         left = (w - PANEL_WIDTH) // 2
         top = (h - PANEL_HEIGHT) // 2
         return img.crop((left, top, left + PANEL_WIDTH, top + PANEL_HEIGHT))
 
-    # Source is smaller in at least one dimension. Scale to fit while preserving
-    # aspect ratio, then pad with white to fill the canvas.
+    # Scale to fit (downsample or upsample) while preserving aspect ratio, then
+    # pad with white to fill the canvas.
     scale = min(PANEL_WIDTH / w, PANEL_HEIGHT / h)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
@@ -229,14 +235,24 @@ def _encode_indexed_bmp(dithered_gray: Image.Image) -> bytes:
 # ---------- Public API ---------------------------------------------------------
 
 
-def convert(src_image: ImageInput, dither: str = "atkinson") -> bytes:
+def convert(
+    src_image: ImageInput,
+    dither: str = "atkinson",
+    *,
+    is_generated: bool = False,
+) -> bytes:
     """Run the full Inkplate image pipeline on `src_image`.
 
     Returns 8-bit indexed BMP bytes at PANEL_WIDTH x PANEL_HEIGHT with an
     8-entry grayscale palette.
+
+    Set ``is_generated=True`` when the source came from `gpt-image-2` at
+    1536x1024 (composed with a centered 1200x825 safe area) so the fit step can
+    center-crop with zero resampling. The default — scale-fit + white pad — is
+    correct for arbitrary uploads.
     """
     img = _load(src_image)
-    fitted = _fit_to_canvas(img)
+    fitted = _fit_to_canvas(img, is_generated=is_generated)
     gray = _to_grayscale(fitted)
     dithered = dither_to_levels(gray, levels=len(PALETTE_LEVELS), algorithm=dither)
     return _encode_indexed_bmp(dithered)

@@ -65,8 +65,9 @@ def _parse_bmp_header(data: bytes) -> dict:
     }
 
 
-def test_large_image_center_crops_no_resampling(tiny_panel):
-    # 2x panel area — should center-crop, no scaling.
+def test_large_upload_scales_to_fit(tiny_panel):
+    # Source larger than panel in both dims — default (upload) path scale-fits
+    # instead of center-cropping, so the whole image survives.
     src = _make_gradient(100, 80)
     bmp = convert(src, dither="atkinson")
     header = _parse_bmp_header(bmp)
@@ -74,17 +75,34 @@ def test_large_image_center_crops_no_resampling(tiny_panel):
     assert header["width"] == 60
     assert header["height"] == 40
 
-    # Round-trip the BMP and check the palette.
     img = Image.open(io.BytesIO(bmp))
     assert img.mode == "P"
     grayscale = img.convert("L")
     unique = set(grayscale.getdata())
-    # All pixels must come from the 8-level palette.
     assert unique.issubset(set(PALETTE_LEVELS))
-    # Center-cropping a 100x80 gradient drops the extreme edges (0 and 255), so
-    # we don't see every palette level — but a gradient across the middle band
-    # should still produce a healthy mix.
+    # Scale-fit preserves the full horizontal gradient (0..255), so we see the
+    # darkest and brightest palette levels in addition to a healthy mix.
+    assert PALETTE_LEVELS[0] in unique, "expected darkest level from gradient origin"
+    assert PALETTE_LEVELS[-1] in unique, "expected brightest level from gradient end"
     assert len(unique) >= 6, f"expected at least 6 levels, got {sorted(unique)}"
+
+
+def test_generated_image_center_crops_no_resampling(tiny_panel):
+    # is_generated=True: source was composed for a centered safe area at panel
+    # size, so we center-crop with zero resampling and the leftmost column
+    # carries the gradient value at x=20 (not the gradient origin x=0).
+    src = _make_gradient(100, 80)
+    bmp = convert(src, dither="atkinson", is_generated=True)
+    header = _parse_bmp_header(bmp)
+    assert header["bpp"] == 8
+    assert header["width"] == 60
+    assert header["height"] == 40
+
+    img = Image.open(io.BytesIO(bmp))
+    grayscale = img.convert("L")
+    unique = set(grayscale.getdata())
+    assert unique.issubset(set(PALETTE_LEVELS))
+    assert len(unique) >= 4, f"expected variety, got {sorted(unique)}"
 
 
 def test_small_image_scales_and_pads(tiny_panel):

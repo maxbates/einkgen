@@ -54,12 +54,15 @@ def process_item(item: QueueItem) -> None:
     else:
         raise ValueError(f"unknown kind: {item.kind!r}")
 
-    processed_bmp = convert_mod.convert(original_png)
-
     # "uploaded" means the published frame is the user's bytes (passed through
     # B&W only). When an image is restyled via the image model, it's a generated
     # frame — record it as such so history shows the model that touched it.
     image_was_generated = item.kind != "image" or bool(item.prompt)
+
+    # Generated images are 1536x1024 with a centered 1200x825 safe area, so
+    # they center-crop without resampling. Raw uploads can be any size — let
+    # convert() scale-fit them so we don't discard most of a phone photo.
+    processed_bmp = convert_mod.convert(original_png, is_generated=image_was_generated)
     source: dict[str, Any] = {
         "kind": "generated" if image_was_generated else "uploaded",
     }
