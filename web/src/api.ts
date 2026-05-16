@@ -87,6 +87,37 @@ export async function getHistory(
   return fetchJson<HistoryResponse>(`/history?limit=${limit}`, signal);
 }
 
+// Current manifest — what the device is currently being told to draw.
+// Served directly from CloudFront (public, 60s cache) without going through
+// the read-api Lambda. See ARCHITECTURE §7.
+export interface CurrentManifest {
+  version: number;
+  generated_at: string;
+  image_url: string;
+  image_sha256: string;
+  image_bytes: number;
+  next_check_after: string;
+  source: HistorySource & { replayed_from?: string };
+}
+
+export async function getCurrentManifest(
+  signal?: AbortSignal,
+): Promise<CurrentManifest | null> {
+  // Cache-bust so the eye indicator updates immediately after a "Show this"
+  // click — CloudFront caches /current/manifest.json for up to 60s and we
+  // already invalidate on publish, but a recently-rendered tab can still
+  // have the stale body in the browser's HTTP cache.
+  const url = cdnUrl(`current/manifest.json?ts=${Date.now()}`);
+  const res = await fetch(url, { signal, cache: "no-store" });
+  if (res.status === 404 || res.status === 403) return null;
+  if (!res.ok) {
+    throw new Error(
+      `GET current/manifest.json failed: ${res.status} ${res.statusText}`,
+    );
+  }
+  return (await res.json()) as CurrentManifest;
+}
+
 export async function getStatus(signal?: AbortSignal): Promise<StatusResult> {
   const res = await fetch(apiUrl("/status"), { signal });
   if (res.status === 404) {
@@ -228,6 +259,28 @@ export async function adminResetPrompts(): Promise<AdminPromptsResponse> {
     throw new Error(`Reset failed: ${res.status} ${detail}`);
   }
   return (await res.json()) as AdminPromptsResponse;
+}
+
+export interface AdminShowResponse {
+  version: number;
+  image_sha256: string;
+  history_id: string;
+}
+
+export async function adminShowHistory(
+  historyId: string,
+): Promise<AdminShowResponse> {
+  const res = await adminFetch("/admin/show", {
+    method: "POST",
+    body: JSON.stringify({ history_id: historyId }),
+  });
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (res.status === 404) throw new Error("That history item no longer exists.");
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Show failed: ${res.status} ${detail}`);
+  }
+  return (await res.json()) as AdminShowResponse;
 }
 
 export async function adminEnqueueImage(

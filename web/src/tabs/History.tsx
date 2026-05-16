@@ -1,5 +1,13 @@
 import { useEffect, useState } from "react";
-import { cdnUrl, getHistory, type HistoryItem } from "../api";
+import {
+  adminMe,
+  adminShowHistory,
+  cdnUrl,
+  getCurrentManifest,
+  getHistory,
+  type CurrentManifest,
+  type HistoryItem,
+} from "../api";
 import {
   formatRelative,
   formatTimestamp,
@@ -16,19 +24,27 @@ type State =
 export function History() {
   const [state, setState] = useState<State>({ status: "loading" });
   const [selected, setSelected] = useState<HistoryItem | null>(null);
+  const [current, setCurrent] = useState<CurrentManifest | null>(null);
+  const [authed, setAuthed] = useState(false);
 
   useEffect(() => {
     const ctrl = new AbortController();
     setState({ status: "loading" });
-    getHistory(PAGE_SIZE, ctrl.signal)
-      .then((res) =>
+    Promise.all([
+      getHistory(PAGE_SIZE, ctrl.signal),
+      getCurrentManifest(ctrl.signal).catch(() => null),
+      adminMe(ctrl.signal).catch(() => ({ kind: "unauthenticated" as const })),
+    ])
+      .then(([hist, cur, me]) => {
         setState({
           status: "ok",
-          items: res.items,
+          items: hist.items,
           limit: PAGE_SIZE,
           loadingMore: false,
-        }),
-      )
+        });
+        setCurrent(cur);
+        setAuthed(me.kind === "ok");
+      })
       .catch((err) => {
         if (ctrl.signal.aborted) return;
         setState({
@@ -60,6 +76,15 @@ export function History() {
       );
   }
 
+  async function refreshCurrent() {
+    try {
+      const cur = await getCurrentManifest();
+      setCurrent(cur);
+    } catch {
+      // Non-fatal — the indicator just won't update this tick.
+    }
+  }
+
   if (state.status === "loading") {
     return <p className="muted">Loading history…</p>;
   }
@@ -75,6 +100,7 @@ export function History() {
     return <p className="muted">No frames published yet.</p>;
   }
   const fullyLoaded = state.items.length < state.limit;
+  const currentId = currentlyShowingId(current, state.items);
   return (
     <>
       <div className="history-grid">
@@ -82,6 +108,7 @@ export function History() {
           <HistoryTile
             key={item.id}
             item={item}
+            isCurrent={item.id === currentId}
             onClick={() => setSelected(item)}
           />
         ))}
@@ -102,6 +129,9 @@ export function History() {
       {selected ? (
         <HistoryDetails
           item={selected}
+          isCurrent={selected.id === currentId}
+          authed={authed}
+          onShown={refreshCurrent}
           onClose={() => setSelected(null)}
         />
       ) : null}
@@ -109,22 +139,56 @@ export function History() {
   );
 }
 
+/**
+ * Match the current manifest back to a history tile. Prefer the explicit
+ * ``source.replayed_from`` marker (set by /admin/show) so we never get fooled
+ * by two history items sharing a sha256; fall back to the sha256 match for
+ * everything else (cron, queue prompt, admin queue, email).
+ */
+function currentlyShowingId(
+  current: CurrentManifest | null,
+  items: HistoryItem[],
+): string | null {
+  if (!current) return null;
+  const replayedFrom = current.source.replayed_from;
+  if (replayedFrom) return replayedFrom;
+  const match = items.find((i) => i.image_sha256 === current.image_sha256);
+  return match ? match.id : null;
+}
+
 function HistoryTile({
   item,
+  isCurrent,
   onClick,
 }: {
   item: HistoryItem;
+  isCurrent: boolean;
   onClick: () => void;
 }) {
   const sourceLine = item.source.prompt ?? item.source.kind;
   return (
-    <button className="history-tile" onClick={onClick}>
-      <img
-        className="history-img"
-        src={cdnUrl(`history/${item.id}/processed.bmp`)}
-        alt={sourceLine}
-        loading="lazy"
-      />
+    <button
+      className={`history-tile ${isCurrent ? "history-tile-current" : ""}`}
+      onClick={onClick}
+    >
+      <div className="history-img-wrap">
+        <img
+          className="history-img"
+          src={cdnUrl(`history/${item.id}/processed.bmp`)}
+          alt={sourceLine}
+          loading="lazy"
+        />
+        {isCurrent ? (
+          <span
+            className="history-now-badge"
+            title="Currently shown on the device"
+            aria-label="Currently shown on the device"
+          >
+            <EyeIcon />
+            <span>Now showing</span>
+          </span>
+        ) : null}
+      </div>
       <div className="history-meta">
         <p className="history-source">{sourceLine}</p>
         <p
@@ -138,13 +202,27 @@ function HistoryTile({
   );
 }
 
+type ShowState =
+  | { kind: "idle" }
+  | { kind: "sending" }
+  | { kind: "ok" }
+  | { kind: "error"; message: string };
+
 function HistoryDetails({
   item,
+  isCurrent,
+  authed,
+  onShown,
   onClose,
 }: {
   item: HistoryItem;
+  isCurrent: boolean;
+  authed: boolean;
+  onShown: () => void;
   onClose: () => void;
 }) {
+  const [showState, setShowState] = useState<ShowState>({ kind: "idle" });
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") onClose();
@@ -152,6 +230,20 @@ function HistoryDetails({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  async function pushToDevice() {
+    setShowState({ kind: "sending" });
+    try {
+      await adminShowHistory(item.id);
+      setShowState({ kind: "ok" });
+      onShown();
+    } catch (err) {
+      setShowState({
+        kind: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   const sourceLine = item.source.prompt ?? item.source.kind;
   return (
@@ -190,7 +282,53 @@ function HistoryDetails({
           <dt>ID</dt>
           <dd className="mono">{item.id}</dd>
         </dl>
+        {authed ? (
+          <div className="modal-actions">
+            {isCurrent ? (
+              <p className="muted small">
+                <EyeIcon /> This is what the device is currently showing.
+              </p>
+            ) : (
+              <button
+                type="button"
+                className="button"
+                onClick={pushToDevice}
+                disabled={showState.kind === "sending"}
+              >
+                {showState.kind === "sending" ? "Sending…" : "Show this now"}
+              </button>
+            )}
+            {showState.kind === "ok" && !isCurrent ? (
+              <p className="admin-success">
+                Set as current. The device will pick it up on its next wake.
+              </p>
+            ) : null}
+            {showState.kind === "error" ? (
+              <p className="admin-inline-error">{showState.message}</p>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </div>
+  );
+}
+
+function EyeIcon() {
+  return (
+    <svg
+      className="eye-icon"
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
   );
 }

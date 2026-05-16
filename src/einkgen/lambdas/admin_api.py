@@ -11,6 +11,7 @@ Routes (all under the ``/admin`` prefix, behind a single HTTP API):
 - ``GET  /admin/prompts``       → 200 ``{"prompts": [...], "is_default": bool}``
 - ``PUT  /admin/prompts``       → ``{"prompts": [...]}``    → 200 ``{"prompts": [...]}``
 - ``POST /admin/prompts/reset`` → 200 ``{"prompts": [...]}`` (writes DEFAULTS)
+- ``POST /admin/show``          → ``{"history_id": "..."}`` → 200 ``{"version":...}``
 
 Auth
 ----
@@ -53,7 +54,7 @@ from typing import Any
 
 import boto3
 
-from einkgen.core import admin_cookie, prompt_library, queue
+from einkgen.core import admin_cookie, prompt_library, publish, queue
 from einkgen.core import s3 as s3mod
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,12 @@ MAX_LIBRARY_ENTRIES = 200             # ample headroom over the seed 10
 
 # Same charset cap the CLI uses when staging a local image.
 SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+# History ids are ULIDs (26-char Crockford base32). We accept anything that
+# matches the ULID-shaped alphabet to avoid a tight format coupling, but
+# refuse path separators / slashes / dots so the id can never escape the
+# ``history/<id>/manifest.json`` key the publish helper constructs.
+HISTORY_ID_RE = re.compile(r"^[A-Z0-9]{8,32}$")
 
 _BASE_HEADERS = {
     "Content-Type": "application/json",
@@ -365,6 +372,37 @@ def _handle_queue_image(event: dict[str, Any]) -> dict[str, Any]:
     return _response(200, {"id": item.id, "kind": item.kind})
 
 
+def _handle_show(event: dict[str, Any]) -> dict[str, Any]:
+    """Re-publish an existing history item as the current frame.
+
+    No copy, no regenerate — just point the manifest at the history bmp.
+    See ``einkgen.core.publish.set_current_from_history``.
+    """
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    body, err = _parse_json_body(event)
+    if err is not None:
+        return err
+    assert body is not None
+    history_id = body.get("history_id")
+    if not isinstance(history_id, str) or not HISTORY_ID_RE.match(history_id):
+        return _response(
+            400, {"error": "bad_request", "detail": "missing or malformed history_id"}
+        )
+    try:
+        manifest = publish.set_current_from_history(history_id)
+    except publish.HistoryItemNotFound:
+        return _response(404, {"error": "not_found", "detail": "no such history item"})
+    return _response(
+        200,
+        {
+            "version": manifest.version,
+            "image_sha256": manifest.image_sha256,
+            "history_id": history_id,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # /admin/prompts — operator-editable random-pick library
 # ---------------------------------------------------------------------------
@@ -453,6 +491,7 @@ _ROUTES: dict[tuple[str, str], Any] = {
     ("GET", "/admin/prompts"): _handle_prompts_get,
     ("PUT", "/admin/prompts"): _handle_prompts_put,
     ("POST", "/admin/prompts/reset"): _handle_prompts_reset,
+    ("POST", "/admin/show"): _handle_show,
 }
 
 

@@ -371,6 +371,8 @@ export class EinkgenLambdas extends Construct {
       logRetention: logs.RetentionDays.TWO_WEEKS,
       environment: {
         EINKGEN_BUCKET: props.bucket.bucketName,
+        EINKGEN_CDN_BASE: props.cdnBase,
+        EINKGEN_CF_DISTRIBUTION_ID: props.distribution.distributionId,
         ADMIN_PASSWORD_SECRET_NAME: props.adminPassword.secretName,
         ADMIN_COOKIE_KEY_SECRET_NAME: props.adminCookieSigningKey.secretName,
       },
@@ -403,6 +405,34 @@ export class EinkgenLambdas extends Construct {
             's3:prefix': ['config/*'],
           },
         },
+      }),
+    );
+    // /admin/show re-publishes an existing history frame as current — it
+    // reads history/<id>/manifest.json and writes current/manifest.json.
+    // No new path can be created by the operator: the history id must
+    // already exist (or the route 404s), and the bytes are not copied.
+    // Per ARCHITECTURE §12, the manifest-tampering mitigation is "only the
+    // generator writes current/*". The admin Lambda is operator-trusted
+    // (password + HMAC cookie) and already inside that trust boundary, so
+    // adding it as a second writer doesn't expand the threat surface.
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject'],
+        resources: [`${props.bucket.bucketArn}/history/*`],
+      }),
+    );
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:PutObject'],
+        resources: [`${props.bucket.bucketArn}/current/*`],
+      }),
+    );
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['cloudfront:CreateInvalidation'],
+        resources: [
+          `arn:aws:cloudfront::${props.bucket.stack.account}:distribution/${props.distribution.distributionId}`,
+        ],
       }),
     );
     props.adminPassword.grantRead(this.adminApi);

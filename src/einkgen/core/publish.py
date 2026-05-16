@@ -27,6 +27,14 @@ CURRENT_MANIFEST_KEY = "current/manifest.json"
 CURRENT_IMAGE_KEY = "current/image.bmp"
 
 
+class HistoryItemNotFound(Exception):
+    """Raised when ``set_current_from_history`` can't find ``history/<id>/manifest.json``."""
+
+    def __init__(self, history_id: str):
+        super().__init__(f"history item not found: {history_id!r}")
+        self.history_id = history_id
+
+
 def _cdn_base() -> str:
     base = os.environ.get("EINKGEN_CDN_BASE")
     if not base:
@@ -170,4 +178,67 @@ def publish(
 
     _invalidate_cloudfront([f"/{CURRENT_MANIFEST_KEY}", f"/{CURRENT_IMAGE_KEY}"])
 
+    return manifest
+
+
+def set_current_from_history(
+    history_id: str,
+    *,
+    now: datetime | None = None,
+) -> Manifest:
+    """Re-publish an existing history frame as the current one.
+
+    The history bytes are not copied or regenerated — we just write a new
+    ``current/manifest.json`` whose ``image_url`` points at the existing
+    ``history/<id>/processed.bmp`` and whose ``image_sha256`` / ``image_bytes``
+    are carried over verbatim. The device, on its next poll, sees a new
+    manifest version + a new (to-it) sha256 and downloads from the history
+    URL. The next normal generation overwrites the manifest back to
+    ``current/image.bmp``.
+
+    ``source.replayed_from`` is set to ``history_id`` so the SPA can mark the
+    tile as currently-showing even if two history items happen to share a
+    sha256.
+
+    Raises ``HistoryItemNotFound`` if no manifest exists at
+    ``history/<history_id>/manifest.json``.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    history_manifest_key = f"history/{history_id}/manifest.json"
+    try:
+        body = s3.get_object(history_manifest_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in _MISSING_OBJECT_CODES:
+            raise HistoryItemNotFound(history_id) from exc
+        raise
+    history_manifest = Manifest.from_json(body)
+
+    previous_version = _read_previous_version()
+    next_check = compute_next_check_after(now, tick_interval=_poll_interval())
+
+    source = dict(history_manifest.source)
+    source["replayed_from"] = history_id
+
+    manifest = Manifest(
+        version=previous_version + 1,
+        generated_at=iso_utc(now),
+        image_url=f"{_cdn_base()}/history/{history_id}/processed.bmp",
+        image_sha256=history_manifest.image_sha256,
+        image_bytes=history_manifest.image_bytes,
+        display=dict(DEFAULT_DISPLAY),
+        next_check_after=iso_utc(next_check),
+        source=source,
+    )
+    manifest_bytes = manifest.to_json().encode("utf-8")
+    s3.put_object(
+        CURRENT_MANIFEST_KEY,
+        manifest_bytes,
+        content_type="application/json",
+    )
+    # image_url changed; only the manifest needs CF invalidation. The
+    # `history/<id>/processed.bmp` it now points at is already CDN-cached.
+    _invalidate_cloudfront([f"/{CURRENT_MANIFEST_KEY}"])
     return manifest

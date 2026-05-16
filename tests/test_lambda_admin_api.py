@@ -8,7 +8,9 @@ import json
 import boto3
 import pytest
 
-from einkgen.core import admin_cookie, prompt_library, queue
+from datetime import datetime, timezone
+
+from einkgen.core import admin_cookie, prompt_library, publish, queue
 from einkgen.lambdas import admin_api
 
 TEST_PASSWORD = "photos-for-anyone"
@@ -480,6 +482,105 @@ def test_post_prompts_reset_restores_defaults(secrets, s3_bucket):
     assert body["prompts"] == list(prompt_library.DEFAULTS)
     assert body["is_default"] is True
     assert prompt_library.load(force=True) == prompt_library.DEFAULTS
+
+
+# ---------------------------------------------------------------------------
+# /admin/show
+# ---------------------------------------------------------------------------
+
+
+def _seed_history(item_id: str = "01HISTORYAA") -> None:
+    publish.publish(
+        b"BMP" + b"\x00" * 100,
+        source={"kind": "generated", "model": "gpt-image-2", "prompt": "seeded"},
+        item_id=item_id,
+        now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_show_requires_session(secrets, s3_bucket):
+    _seed_history()
+    resp = admin_api.handler(
+        _event("POST", "/admin/show", body={"history_id": "01HISTORYAA"})
+    )
+    assert resp["statusCode"] == 401
+
+
+def test_show_happy_path_rewrites_manifest(secrets, s3_bucket):
+    _seed_history("01HISTORYAA")
+    # Generate a second history item so current/* points elsewhere.
+    publish.publish(
+        b"BMP" + b"\x00" * 50 + b"X",
+        source={"kind": "generated", "prompt": "newer"},
+        item_id="01HISTORYBB",
+        now=datetime(2026, 5, 13, 15, 0, 0, tzinfo=timezone.utc),
+    )
+
+    login = _login()
+    token = _session_cookie_value(login)
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/show",
+            body={"history_id": "01HISTORYAA"},
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["history_id"] == "01HISTORYAA"
+    assert body["version"] == 3
+
+    # And the new current/manifest.json points at the older history bmp.
+    live = s3_bucket.get_object(
+        Bucket="einkgen-test", Key="current/manifest.json"
+    )["Body"].read()
+    data = json.loads(live)
+    assert data["image_url"].endswith("/history/01HISTORYAA/processed.bmp")
+    assert data["source"]["replayed_from"] == "01HISTORYAA"
+
+
+def test_show_missing_id_returns_404(secrets, s3_bucket):
+    login = _login()
+    token = _session_cookie_value(login)
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/show",
+            body={"history_id": "01NOSUCHITEM"},
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    assert resp["statusCode"] == 404
+
+
+def test_show_rejects_malformed_id(secrets, s3_bucket):
+    login = _login()
+    token = _session_cookie_value(login)
+    # Path-escape attempt — id must match the ULID-shaped alphabet.
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/show",
+            body={"history_id": "../../etc/passwd"},
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    assert resp["statusCode"] == 400
+
+
+def test_show_missing_field_returns_400(secrets, s3_bucket):
+    login = _login()
+    token = _session_cookie_value(login)
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/show",
+            body={},
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    assert resp["statusCode"] == 400
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,28 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.1.0] - 2026-05-16
+
+### Added
+- **"Show this now" — re-display any past frame on the device without
+  re-generating.** A new `POST /admin/show` admin route takes a
+  `{"history_id": "..."}` and writes a fresh `current/manifest.json`
+  whose `image_url` points back at `history/<id>/processed.bmp` (no
+  byte copy, no OpenAI call, no queue item). The device picks it up
+  on its next poll. The History tab now shows a small "Now showing"
+  eye badge on whichever tile is currently being drawn, and the
+  details modal exposes a **Show this now** button for logged-in
+  operators. Implemented in
+  [`set_current_from_history`](src/einkgen/core/publish.py) +
+  [`_handle_show`](src/einkgen/lambdas/admin_api.py); the manifest
+  carries `source.replayed_from = <id>` so the SPA can resolve the
+  current tile unambiguously even when two history items share a
+  SHA-256. **Permission change:** the admin Lambda now also has
+  `s3:GetObject` on `history/*`, `s3:GetObject`+`s3:PutObject` on
+  `current/*`, and `cloudfront:CreateInvalidation` for the
+  distribution — see the comment in [infra/lib/lambdas.ts](infra/lib/lambdas.ts)
+  for why this stays within the existing operator-trust boundary.
+
 ## [0.4.0.6] - 2026-05-16
 
 ### Added
