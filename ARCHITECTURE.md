@@ -74,13 +74,18 @@ All writes go through the queue (see §4). The queue is the only contract — ad
 Top-level structure: `status`, `history`, `queue …`, `local …`.
 
 ```
-einkgen status                    # latest device status (battery, RSSI, last hash)
-einkgen history                   # list recent published frames
+einkgen status                                    # latest device status (battery, RSSI, last hash)
+einkgen history                                   # list recent published frames
 
-einkgen queue ls                  # list pending items
-einkgen queue rm <id>             # delete a pending item
-einkgen queue prompt "<text>"     # enqueue a prompt
-einkgen queue image  <path>       # enqueue an image (uploaded to queue/staged/)
+einkgen queue ls                                  # list pending items
+einkgen queue rm <id>                             # delete a pending item
+einkgen queue prompt "<text>"                     # enqueue a prompt
+einkgen queue image  <path>                       # enqueue an image (B&W passthrough)
+einkgen queue image  <path> --prompt "<text>"     # restyle an image via gpt-image-1 edit
+
+einkgen allowlist ls                              # list emails permitted to submit via email
+einkgen allowlist add <email>                     # permit a sender
+einkgen allowlist rm  <email>                     # revoke a sender
 
 einkgen local generate "<text>" [<out.png>]   # call the model, save raw PNG
 einkgen local convert  <in> <out.bmp>         # crop + grayscale + dither + encode
@@ -99,9 +104,25 @@ einkgen local preview  "<text>"               # generate + convert, save preview
 
 Public, AWS-hosted SPA. Three tabs: **Queue**, **History**, **Device**. No buttons, no forms, no writes anywhere. See §5.
 
-### Future input channels (deferred)
+### Inbound email (opt-in submission channel)
 
-Texting and email are out of scope for v1 because they all need authentication — we don't want a leaked URL to let strangers burn OpenAI spend. The queue API in `core/queue.py` is the seam: any future channel becomes a small Lambda that authenticates the sender and calls `queue.enqueue(...)`.
+You can submit to the queue by emailing a configured address. Three modes:
+
+- **Text only** — subject (or first line of body, if subject is empty) becomes the prompt. Kind = `prompt`.
+- **Image attached** — the image becomes the input frame, converted to B&W and published as-is. Kind = `image`.
+- **Image + text** — image is fed to `gpt-image-1`'s edit endpoint with the prompt as a restyle hint, then dithered and published. Kind = `image` with a prompt set.
+
+**Cost protection.** A plain-text allowlist at `s3://<bucket>/config/email_allowlist.txt` lists every address permitted to submit. Senders not on the list get a friendly rejection email and **nothing is enqueued**; the reply never names other allowed addresses. Manage with `einkgen allowlist {ls,add,rm}` or edit the file directly. CDK seeds the initial allowlist on first deploy — see [QUICKSTART.md](QUICKSTART.md#email-submission-channel-optional).
+
+**Sender authentication.** The inbound Lambda only trusts the `From:` address when SES's `Authentication-Results` header shows `spf=pass` or `dkim=pass` aligned with the From domain. Forged senders are dropped silently (no reply, since the From: can't be trusted). This is what makes the allowlist meaningful.
+
+### SMS — explicitly skipped
+
+AWS End User Messaging is the only AWS-native inbound-SMS path and isn't free: it requires a phone number (~$1–2/mo) and US 10DLC registration. Phone mail apps have native share-sheet support for "send image with caption to address X," so the inbound-email path covers the same UX without an extra service or recurring cost.
+
+### Adding more channels
+
+The queue API in `core/queue.py` is the seam: any future channel becomes a small Lambda that authenticates the sender and calls `queue.enqueue(...)`. Inbound email is the first such channel; a token-protected web form, an iOS Shortcut endpoint, or a Tailscale-only service could all follow the same pattern.
 
 ---
 
@@ -121,14 +142,18 @@ If we ever outgrow the S3-prefix queue (multi-producer races, very high write ra
 {
   "id": "01HF7Z…",
   "enqueued_at": "2026-05-13T14:05:12Z",
-  "source": "cli" | "cron" | "<future-channel>",
+  "source": "cli" | "cron" | "email" | "<future-channel>",
   "kind": "prompt" | "image" | "random",
   "prompt": "a foggy cliff at dawn",
   "image_s3_key": "queue/staged/abc123.jpg"
 }
 ```
 
-Exactly one of `prompt` / `image_s3_key` is set, depending on `kind`. Future channels (text, email) populate the same shape.
+Field constraints by kind:
+
+- **`prompt`** — `prompt` required, `image_s3_key` forbidden.
+- **`image`** — `image_s3_key` required; `prompt` optional. With no prompt the upload is converted to B&W and published. With a prompt, the upload is fed to `gpt-image-1`'s edit endpoint, restyled per the prompt, then dithered and published.
+- **`random`** — both forbidden; the generator picks from the prompt library and patches `prompt` in-place before publishing.
 
 ### Generator loop
 
@@ -141,6 +166,7 @@ on invoke (S3 event or 2h cron):
   if item is None: return
   match item.kind:
     "prompt": img = model.generate(BASE_PROMPT + item.prompt)
+    "image" if item.prompt: img = model.edit(item.image, BASE_PROMPT + item.prompt)
     "image":  img = s3.fetch(item.image_s3_key)
     "random": img = model.generate(BASE_PROMPT + random_choice(PROMPT_LIBRARY))
   processed = convert(img)
@@ -262,6 +288,10 @@ s3://einkgen-<env>/
 ├── queue/
 │   ├── 2026-05-13T14-05-12Z-01HF7Z….json   # pending items, lex-sortable
 │   └── staged/abc123.jpg                    # media attached to image-kind items
+├── inbound/
+│   └── <ses-message-id>     # raw RFC 5322 messages from SES, deleted after processing
+├── config/
+│   └── email_allowlist.txt  # plain-text sender allowlist for inbound email
 ├── history/
 │   └── 01HF7Z…/                # one folder per item id
 │       ├── manifest.json       # has prompt, source, hash, timestamps
@@ -283,6 +313,8 @@ Access policy:
 | `history/*` | public via CloudFront, but a viewer-request function gates the prefix to `processed.bmp` only — raw `original.png` uploads aren't reachable through the CDN | generator Lambda |
 | `web/*` | public via CloudFront (the SPA) | the `BucketDeployment` construct on each `cdk deploy` |
 | `queue/*`, `status/*`, `firmware/*` | read-api Lambda (IAM) | generator + device-status + CLI (IAM) |
+| `inbound/*` | inbound-email Lambda only | SES (via receipt rule action), inbound-email Lambda (delete after processing) |
+| `config/email_allowlist.txt` | inbound-email Lambda + CLI | CLI (`einkgen allowlist`), CDK seed on first deploy |
 
 Browsers render 8-bit indexed BMP natively, so the History tab can `<img>` `processed.bmp` directly — no separate preview PNG needed.
 
@@ -301,6 +333,7 @@ Three Lambdas, one bucket, one CloudFront distribution, two API Gateway HTTP API
   Reserved concurrency = **1** (serial drain). Async retries = **0** on both the function and the EventBridge target (caps OpenAI cost-amplification from transient failures). Reads `OPENAI_API_KEY` from Secrets Manager. ARM64 Graviton2, 1024 MB. Pillow is bundled into the function zip (no third-party Lambda layer).
 - **Lambda `einkgen-read-api`** — public API Gateway HTTP API with CORS pinned to the CloudFront origin (plus `http://localhost:5173` for dev). Read-only IAM on the bucket. Routes: `GET /queue`, `GET /history`, `GET /status`. The web app's only backend.
 - **Lambda `einkgen-device-status`** — API Gateway HTTP API with **no CORS** (firmware-only). Accepts `POST /` with an `X-Device-Token` header (validated against Secrets Manager). Writes `status/device-<id>.json`. Write-only IAM on the `status/` prefix. Reserved concurrency caps blast radius from abuse.
+- **Lambda `einkgen-inbound-email`** *(opt-in, gated by the `einkgenInboundDomain` CDK context flag)*. S3 ObjectCreated on `inbound/*` triggers it; SES's receipt rule for the configured domain writes raw RFC 5322 messages there. Parses MIME, checks SES `Authentication-Results` for SPF/DKIM pass aligned with the From: domain, validates the sender against `config/email_allowlist.txt`, stages any image attachment under `queue/staged/`, calls `queue.enqueue(source="email")`, and sends a confirmation or rejection reply via SES. Scoped IAM: read+delete `inbound/*`, read `config/email_allowlist.txt`, write `queue/*`, `ses:SendEmail` constrained to the configured reply-From address. Reserved concurrency = 5.
 - **Secrets Manager** — `einkgen/openai_api_key`, `einkgen/device_status_token`. Lambdas get scoped read.
 - **EventBridge rule** — `rate(2 hours)` → `einkgen-generator` (cron entrypoint).
 - **CloudWatch Logs** — 14-day retention per Lambda. One `MetricFilter` per Lambda emits an `ErrorLogCount-{name}` metric on the literal token `ERROR`. A CloudWatch dashboard (`einkgen-<env>`) plots invocations, errors, and duration p50/p99.

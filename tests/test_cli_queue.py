@@ -107,6 +107,19 @@ def test_image_uploads_staged_and_enqueues(s3_bucket, tmp_path, capsys):
     assert staged["Body"].read() == src.read_bytes()
 
 
+def test_image_with_prompt_records_restyle_hint(s3_bucket, tmp_path, capsys):
+    src = tmp_path / "skyline.jpg"
+    src.write_bytes(b"\xff\xd8\xff" + b"fake-jpeg-bytes" * 8)
+
+    rc = main(["queue", "image", str(src), "--prompt", "render as a woodcut"])
+    assert rc == 0
+    items = queue_core.list()
+    assert len(items) == 1
+    assert items[0].kind == "image"
+    assert items[0].prompt == "render as a woodcut"
+    assert items[0].image_s3_key.startswith("queue/staged/")
+
+
 def test_image_missing_path_exits_nonzero(s3_bucket, tmp_path, capsys):
     missing = tmp_path / "nope.jpg"
     rc = main(["queue", "image", str(missing)])

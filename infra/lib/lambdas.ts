@@ -103,7 +103,11 @@ function makeLocalBundler(requirementsFile: string, sourceStaged: boolean) {
   };
 }
 
-function bundlePython(requirementsFile: string, sourceStaged: boolean): lambda.AssetCode {
+export function stagePythonSource(): boolean {
+  return stageSource();
+}
+
+export function bundlePython(requirementsFile: string, sourceStaged: boolean): lambda.AssetCode {
   const assetRoot = path.join(__dirname, '..', 'lambda');
   // If source isn't staged (synth smoke test), we still need a bundling
   // command that won't crash. The "cp" line is gated with a test.
@@ -245,13 +249,20 @@ export class EinkgenLambdas extends Construct {
     // that block. The route is a catch-all GET — the handler dispatches
     // /queue, /history, /status internally based on rawPath, same as it did
     // under the Function URL.
+    // CORS allowOrigins:
+    //  - props.cdnBase is the operator-facing URL (custom site domain when
+    //    configured, the *.cloudfront.net default otherwise).
+    //  - The *.cloudfront.net default is always included so direct testing
+    //    via the CDN URL keeps working after a custom domain is wired up.
+    //  - localhost:5173 for `vite dev`.
+    const cloudfrontDefaultOrigin = `https://${props.distribution.distributionDomainName}`;
+    const corsOrigins = Array.from(
+      new Set([props.cdnBase, cloudfrontDefaultOrigin, 'http://localhost:5173']),
+    );
     const readApiHttp = new HttpApi(this, 'ReadApiHttp', {
       apiName: 'einkgen-read-api',
       corsPreflight: {
-        allowOrigins: [
-          `https://${props.distribution.distributionDomainName}`,
-          'http://localhost:5173',
-        ],
+        allowOrigins: corsOrigins,
         allowMethods: [CorsHttpMethod.GET],
         allowHeaders: ['*'],
         maxAge: Duration.minutes(10),

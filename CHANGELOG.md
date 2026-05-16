@@ -5,6 +5,51 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.0.0] - 2026-05-15
+
+Email submission channel. The queue gains a new write path: send a prompt, an
+image, or both to a configured email address. SMS is explicitly skipped — no
+free AWS-native inbound option exists, and email covers the same share-sheet UX
+on phones.
+
+### Added
+- **Inbound-email Lambda** (`einkgen-inbound-email`). SES receives mail at
+  `*@<inboundDomain>`, drops the raw message into `s3://<bucket>/inbound/`, the
+  Lambda parses MIME, checks the allowlist, stages any image attachment to
+  `queue/staged/`, and calls `queue.enqueue(source="email")`. Replies with a
+  queued-confirmation on success.
+- **Sender allowlist** at `s3://<bucket>/config/email_allowlist.txt` — plain text,
+  one address per line, `#` comments allowed. Managed by `einkgen allowlist
+  {ls,add,rm}` or edited directly. Senders not on the list receive a friendly
+  rejection email that does not name allowed addresses.
+- **SES sender authentication.** Inbound messages are only trusted when
+  `Authentication-Results` shows SPF or DKIM pass aligned with the From: domain.
+  Unauthenticated messages are dropped silently (no reply, to avoid being a
+  backscatter cannon for forged From: headers).
+- **Image + prompt restyling.** `kind="image"` now accepts an optional prompt;
+  if set, the upload is sent through `gpt-image-1`'s edit endpoint with the
+  prompt as a restyle hint, otherwise it's a B&W passthrough as before. The
+  CLI exposes this via `einkgen queue image <path> --prompt "<text>"`.
+- **CDK construct `EinkgenInboundEmail`** gated behind a context flag
+  (`einkgenInboundDomain`). The stack deploys clean without the flag; setting
+  it provisions the SES EmailIdentity, receipt rule set, S3 trigger, Lambda,
+  scoped IAM, **and the Route 53 DKIM CNAMEs + MX record** (when the hosted
+  zone exists, which both setup paths in QUICKSTART §3.10.1 create). The
+  only manual steps post-deploy are activating the receipt rule set (one
+  active set per account; CDK doesn't clobber) and requesting SES production
+  access for reply delivery.
+- **Domain setup helper.** [infra/scripts/register-domain.example.sh](infra/scripts/register-domain.example.sh)
+  is a Route 53 registration template (operator copies to
+  `register-domain.sh` and fills ICANN-required contact info; the live
+  copy is gitignored so PII never lands in the repo). QUICKSTART §3.11.1
+  documents both this path and the alternative of delegating an existing
+  externally-registered domain to Route 53. CLAUDE.md walks future agents
+  through name research (`list-prices` filtered by sustainable renewal,
+  then `check-domain-availability`).
+- Docs: ARCHITECTURE §3 covers the email submission flow; QUICKSTART §3.10
+  walks through the full setup; CLAUDE.md teaches agents how to handle the
+  domain question; the SMS rationale is in ARCHITECTURE.
+
 ## [0.2.0.1] - 2026-05-15
 
 Phase 3 — first real deploy. The system actually runs against AWS now; every bug

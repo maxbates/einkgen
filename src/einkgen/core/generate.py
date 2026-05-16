@@ -91,6 +91,45 @@ def generate(prompt: str, *, client: Any = None) -> bytes:
         size=IMAGE_SIZE,
         n=1,
     )
+    return _decode_first(response)
+
+
+def generate_from_image(
+    prompt: str,
+    image_bytes: bytes,
+    *,
+    image_filename: str = "input.png",
+    client: Any = None,
+) -> bytes:
+    """Restyle an input image per `prompt` via gpt-image-1's edit endpoint.
+
+    Used when an email arrives with both an attachment and a body/subject —
+    the attachment is the reference, the prompt steers the regeneration. The
+    output is sized to ``IMAGE_SIZE`` so the downstream center-crop runs with
+    no resampling, same as text-to-image.
+    """
+    if client is None:
+        client = _default_client()
+    full_prompt = f"{BASE_PROMPT} {prompt}".strip()
+    # The SDK expects a file-like object; an in-memory BytesIO works and
+    # avoids a temp file. The filename hint helps the SDK set MIME correctly
+    # — extension matters more than the actual bytes.
+    import io
+
+    buf = io.BytesIO(image_bytes)
+    buf.name = image_filename
+    response = client.images.edit(
+        model=MODEL,
+        image=buf,
+        prompt=full_prompt,
+        size=IMAGE_SIZE,
+        n=1,
+    )
+    return _decode_first(response)
+
+
+def _decode_first(response: Any) -> bytes:
+    """Extract base64 PNG bytes from an OpenAI images response."""
     datum = response.data[0]
     # `gpt-image-1` returns base64 in `b64_json` by default. Some wrappers/mocks
     # expose `url` instead; we don't fetch URLs here — callers/tests should

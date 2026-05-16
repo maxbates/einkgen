@@ -20,6 +20,7 @@ from tests.conftest import TEST_BUCKET
 def _install_fake_modules(monkeypatch: pytest.MonkeyPatch):
     calls: dict[str, list] = {
         "generate": [],
+        "generate_from_image": [],
         "random_prompt": [],
         "convert": [],
         "publish": [],
@@ -28,6 +29,12 @@ def _install_fake_modules(monkeypatch: pytest.MonkeyPatch):
     def fake_generate(prompt):
         calls["generate"].append(prompt)
         return b"fake-png-bytes-for-" + (prompt or "").encode()
+
+    def fake_generate_from_image(prompt, image_bytes, *, image_filename="input.png"):
+        calls["generate_from_image"].append(
+            {"prompt": prompt, "image": image_bytes, "filename": image_filename}
+        )
+        return b"restyled-png-from-" + (prompt or "").encode()
 
     def fake_random_prompt():
         calls["random_prompt"].append(True)
@@ -50,6 +57,7 @@ def _install_fake_modules(monkeypatch: pytest.MonkeyPatch):
 
     generate_mod = types.SimpleNamespace(
         generate=fake_generate,
+        generate_from_image=fake_generate_from_image,
         random_prompt=fake_random_prompt,
         BASE_PROMPT="",
         PROMPT_LIBRARY=[],
@@ -128,6 +136,43 @@ def test_image_kind_fetches_from_s3(monkeypatch, s3_bucket):
     assert "Contents" not in s3_bucket.list_objects_v2(
         Bucket=TEST_BUCKET, Prefix=staged_key
     )
+
+
+def test_image_kind_with_prompt_calls_generate_from_image(monkeypatch, s3_bucket):
+    """image + prompt: restyle upload via gpt-image-1 edit, then convert."""
+    calls = _install_fake_modules(monkeypatch)
+
+    staged_key = "queue/staged/abc12345-skyline.jpg"
+    s3_bucket.put_object(Bucket=TEST_BUCKET, Key=staged_key, Body=b"real-jpeg-bytes")
+
+    item = QueueItem(
+        id="01HFTEST0006",
+        enqueued_at="2026-05-13T14:00:00Z",
+        source="email",
+        kind="image",
+        image_s3_key=staged_key,
+        prompt="render as a woodcut",
+    )
+
+    pipeline.process_item(item)
+
+    # generate (text-to-image) not called; edit endpoint was.
+    assert calls["generate"] == []
+    assert len(calls["generate_from_image"]) == 1
+    edit_call = calls["generate_from_image"][0]
+    assert edit_call["prompt"] == "render as a woodcut"
+    assert edit_call["image"] == b"real-jpeg-bytes"
+    assert edit_call["filename"] == "abc12345-skyline.jpg"
+
+    # Convert sees the restyled bytes, not the original upload.
+    assert calls["convert"] == [b"restyled-png-from-render as a woodcut"]
+    p = calls["publish"][0]
+    # Restyled image is a generated frame — record the model + prompt.
+    assert p["source"] == {
+        "kind": "generated",
+        "model": "gpt-image-1",
+        "prompt": "render as a woodcut",
+    }
 
 
 def test_random_kind_uses_random_prompt(monkeypatch):

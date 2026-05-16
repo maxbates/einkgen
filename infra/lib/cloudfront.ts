@@ -3,9 +3,26 @@ import { Duration } from 'aws-cdk-lib';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as targets from 'aws-cdk-lib/aws-route53-targets';
 
 export interface EinkgenCdnProps {
   bucket: s3.Bucket;
+  /**
+   * Optional custom domain to host the site at, e.g. ``einkgen.link``.
+   * Requires ``hostedZone``. When set, an ACM cert is issued (DNS-validated
+   * against the zone), added as the distribution's alternate domain name,
+   * and ALIAS records for the apex (A + AAAA) point at the distribution.
+   * If unset, the site stays at the default ``*.cloudfront.net`` URL.
+   */
+  siteDomain?: string;
+  /**
+   * Route 53 hosted zone for ``siteDomain``. Used for cert validation and
+   * to create the alias records. Required when ``siteDomain`` is set.
+   * Typically the same zone we delegate to for inbound email.
+   */
+  hostedZone?: route53.IHostedZone;
 }
 
 export class EinkgenCdn extends Construct {
@@ -95,9 +112,31 @@ function handler(event) {
       enableAcceptEncodingBrotli: true,
     });
 
+    // Optional custom-domain wiring. We create the cert + alias records
+    // inside the construct so the stack only needs to pass one flag pair.
+    // ACM certs for CloudFront MUST be in us-east-1; this stack already
+    // deploys there, so a plain ``acm.Certificate`` works.
+    let certificate: acm.ICertificate | undefined;
+    const domainNames: string[] = [];
+    if (props.siteDomain && props.hostedZone) {
+      certificate = new acm.Certificate(this, 'SiteCertificate', {
+        domainName: props.siteDomain,
+        // SAN so ``www.<domain>`` and arbitrary other subdomains work too
+        // without an extra cert later. DNS-validated against our hosted zone.
+        subjectAlternativeNames: [`*.${props.siteDomain}`],
+        validation: acm.CertificateValidation.fromDns(props.hostedZone),
+      });
+      domainNames.push(props.siteDomain);
+    } else if (props.siteDomain || props.hostedZone) {
+      throw new Error(
+        'EinkgenCdn: siteDomain and hostedZone must be provided together',
+      );
+    }
+
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
       comment: 'einkgen — single distribution fronting the bucket',
       defaultRootObject: '',
+      ...(domainNames.length > 0 ? { domainNames, certificate } : {}),
       defaultBehavior: {
         origin: s3Origin,
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -135,5 +174,25 @@ function handler(event) {
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
     });
+
+    // ALIAS records pointing the apex (and ``www``) at the distribution.
+    // Apex must use ALIAS rather than CNAME because RFC 1034 forbids
+    // CNAME-at-apex; Route 53's alias is the AWS-specific solution that
+    // resolves to the distribution's IPs at query time.
+    if (props.siteDomain && props.hostedZone) {
+      const aliasTarget = route53.RecordTarget.fromAlias(
+        new targets.CloudFrontTarget(this.distribution),
+      );
+      new route53.ARecord(this, 'SiteAliasA', {
+        zone: props.hostedZone,
+        recordName: props.siteDomain,
+        target: aliasTarget,
+      });
+      new route53.AaaaRecord(this, 'SiteAliasAAAA', {
+        zone: props.hostedZone,
+        recordName: props.siteDomain,
+        target: aliasTarget,
+      });
+    }
   }
 }

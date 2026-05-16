@@ -215,6 +215,11 @@ VITE_READ_API_URL=${READ_API_URL}
 VITE_CDN_BASE=https://${CDN_DOMAIN}
 EOF
 
+# If you enabled inbound email in §3.11, add the domain so the Queue tab
+# shows the "email anything @<domain>" submission hint. Match this to the
+# `einkgenInboundDomain` flag you deploy with.
+# echo "VITE_INBOUND_EMAIL_DOMAIN=einkgen.link" >> web/.env.production
+
 ( cd web && npm run build )
 ```
 
@@ -279,6 +284,232 @@ AWS_PROFILE=einkgen AWS_REGION=us-east-1 \
 When the run completes, refresh the SPA's History tab. The new tile
 appears at the top.
 
+### 3.10. (Optional) Custom domain for the site
+
+By default the SPA is served from `https://<id>.cloudfront.net/`. If you
+own (or want to register) a domain — same one you'd use for inbound email
+in §3.11 — CDK can host the SPA at `https://<yourdomain>/` instead. Same
+two paths as §3.11.1 to get a Route 53 hosted zone (register a new
+domain, or delegate an existing one), then deploy with:
+
+```sh
+( cd infra && AWS_PROFILE=einkgen AWS_REGION=us-east-1 npx cdk deploy \
+    --outputs-file cdk-outputs.json \
+    --require-approval never \
+    -c env=dev -c includeWebAssets=true \
+    -c einkgenSiteDomain=<yourdomain> )
+```
+
+The deploy:
+
+- Issues an ACM certificate for `<yourdomain>` with a `*.<yourdomain>`
+  SAN (DNS-validated against the Route 53 zone you control — no manual
+  CNAME copy/paste).
+- Adds `<yourdomain>` as an alternate domain name on the CloudFront
+  distribution.
+- Creates apex A + AAAA alias records pointing at the distribution
+  (apex CNAME isn't valid per RFC 1034; Route 53's alias is the AWS
+  primitive that resolves to CloudFront's IPs at query time).
+- Switches the manifest `image_url` baked into future generations to
+  use the custom domain (purely cosmetic — device firmware fetches from
+  whatever URL it was flashed with).
+
+ACM cert validation + CloudFront distribution propagation: 5–30 min.
+`cdk deploy` will block on cert validation, then return; CloudFront's
+own propagation continues in the background but `https://<yourdomain>/`
+typically resolves within a few minutes of deploy completion.
+
+If you want both the site **and** inbound email on the same domain
+(the simplest setup), set both flags together — CDK reuses the same
+hosted zone:
+
+```sh
+... -c einkgenSiteDomain=einkgen.link \
+    -c einkgenInboundDomain=einkgen.link
+```
+
+The two flags can't currently point at *different* domains in the same
+stack (assertion in [infra/lib/einkgen-stack.ts](infra/lib/einkgen-stack.ts)
+will fail synth) — split that out when you actually need it.
+
+### 3.11. (Optional) Email submission channel
+
+The base stack is read-only-public; submitting requires the operator's
+laptop CLI. To accept submissions via email instead — text, an image, or
+both — turn on the inbound-email path. It costs ~$5/year for a domain
+plus per-email fractions of a cent.
+
+This step is **opt-in**. Skip it if email submission isn't a goal.
+
+#### 3.11.1. Pick or attach a domain
+
+SES inbound needs a domain you control DNS for. `*.cloudfront.net` is
+AWS-owned and not usable. Two paths:
+
+**Path A — register a new domain via Route 53.** Cheapest sustainable
+option is a `.link` ($5/yr) or `.click` ($3/yr). Use the helper script:
+
+```sh
+# Copy the template (live script is gitignored — it holds your address + phone)
+cp infra/scripts/register-domain.example.sh infra/scripts/register-domain.sh
+
+# Edit DOMAIN= at the top and the eight REPLACE_WITH_* lines (first/last
+# name, street, city, state, zip, phone, email) — ICANN requires real
+# registrant contact info; WHOIS-masked by default.
+$EDITOR infra/scripts/register-domain.sh
+
+# Run it
+./infra/scripts/register-domain.sh
+```
+
+The script:
+
+1. Confirms the name is available (`route53domains check-domain-availability`).
+2. Submits `route53domains register-domain` with privacy protection on
+   all three contacts (admin / registrant / tech).
+3. Prints the operation ID for status tracking.
+
+Track completion (5–30 min typical):
+
+```sh
+aws route53domains get-operation-detail --operation-id <op-id> \
+  --region us-east-1 --profile einkgen
+```
+
+When status is `SUCCESSFUL`, AWS auto-creates a Route 53 hosted zone for
+the domain. Continue to §3.11.2.
+
+For an **agent** doing the picking: enumerate cheap+sustainable TLDs with
+`aws route53domains list-prices --region us-east-1 --output json`
+(filter where `RegistrationPrice.Price` ≤ `$10` *and*
+`RenewalPrice.Price` ≤ `$10` so first-year promos don't trick you).
+Check availability for candidate names with
+`aws route53domains check-domain-availability --domain-name <name>`.
+Surface the top 3–5 picks with their renewal price *before* committing
+to a registration — domain registration is a recurring cost decision.
+
+**Path B — attach an existing domain you already own.** If you have a
+domain registered at Namecheap, GoDaddy, Cloudflare, etc., you don't
+need to transfer it. You just delegate its DNS to Route 53:
+
+1. Create a hosted zone in Route 53:
+   ```sh
+   AWS_PROFILE=einkgen aws route53 create-hosted-zone \
+     --name <yourdomain.com> \
+     --caller-reference "einkgen-$(date +%s)" \
+     --region us-east-1
+   ```
+2. The response includes a `NameServers` list (four `ns-*.awsdns-*` names).
+3. At your registrar's DNS panel, replace the existing name-server records
+   with those four. Propagation: ~5–30 min.
+4. Verify resolution:
+   ```sh
+   dig +short NS <yourdomain.com>
+   ```
+   Should return all four AWS name servers. Once it does, continue.
+
+You can use the apex (e.g. `yourdomain.com`) or a subdomain
+(e.g. `submit.yourdomain.com`). Subdomain is recommended if the apex
+already receives mail — Route 53 will own MX for whatever zone you
+configure, and SES inbound conflicts with any pre-existing mail server
+for the same name.
+
+If you go subdomain: create the subdomain's hosted zone (same command,
+with `--name submit.yourdomain.com`), then at the parent zone (wherever
+that lives) add NS records for `submit` pointing to the new zone's
+nameservers. Skip the registrar step.
+
+#### 3.11.2. Deploy SES inbound with CDK
+
+CDK reads the domain from a context flag and wires up the SES
+EmailIdentity, receipt rule set, S3 trigger, and Lambda only when set:
+
+```sh
+( cd infra && AWS_PROFILE=einkgen AWS_REGION=us-east-1 npx cdk deploy \
+    --outputs-file cdk-outputs.json \
+    --require-approval never \
+    -c env=dev -c includeWebAssets=true \
+    -c einkgenInboundDomain=<yourdomain> \
+    -c einkgenProjectUrl=https://github.com/<you>/einkgen )
+```
+
+The deploy:
+
+- Looks up the Route 53 hosted zone for the domain (created in §3.11.1).
+  If the zone doesn't exist yet, synth fails fast with a clear error.
+- Creates the SES `EmailIdentity` and publishes the three DKIM CNAMEs
+  into the zone automatically.
+- Creates the MX record pointing at `inbound-smtp.<region>.amazonaws.com`.
+- Creates the `einkgen-inbound` receipt rule set with one catch-all rule.
+- Wires the inbound Lambda to S3 ObjectCreated on `inbound/*`.
+- Optionally seeds `config/email_allowlist.txt` with the addresses passed
+  via the `einkgenAllowlistSeed` context flag (comma-separated). The seed
+  is **never** hardcoded in committed CDK code — pass it on the CLI so the
+  list doesn't leak into the repo:
+  ```sh
+  ... -c einkgenAllowlistSeed=you@gmail.com,partner@gmail.com
+  ```
+  The seed runs **once** per construct creation; subsequent `cdk deploy`
+  runs don't touch the file, so `einkgen allowlist add/rm` edits are
+  preserved. If you skip the flag, the allowlist starts empty and you
+  manage it entirely via the CLI.
+
+After the deploy, two finishing steps remain (CDK can't do them):
+
+1. **Activate the receipt rule set.** Only one rule set per account can
+   be active at a time, so CDK doesn't flip it for you:
+   ```sh
+   AWS_PROFILE=einkgen aws ses set-active-receipt-rule-set \
+     --rule-set-name einkgen-inbound --region us-east-1
+   ```
+   Verify:
+   ```sh
+   AWS_PROFILE=einkgen aws ses describe-active-receipt-rule-set --region us-east-1
+   ```
+
+2. **Request SES production access.** Without it, the account is in
+   sandbox and SES will refuse to send confirmation/rejection replies to
+   any address not pre-verified. Submit the form at
+   [SES Console → Account Dashboard → Request production access](https://us-east-1.console.aws.amazon.com/ses/home?region=us-east-1#/account).
+   Approval is typically <24h. Until then, *inbound enqueue still works*
+   — only the auto-replies are blocked.
+
+#### 3.11.3. Test the inbound flow
+
+Send a test email from an allowlisted sender to any address
+`@<yourdomain>`:
+
+- **Text only** → goes in as `kind=prompt`. Subject becomes the prompt
+  (or first non-empty line of body if subject is empty).
+- **Image attached, no text** → `kind=image`. The image is converted to
+  B&W and published as-is.
+- **Image + subject** → `kind=image` with a prompt. Image is fed to
+  gpt-image-1's edit endpoint with the prompt as a restyle hint.
+
+Watch the Lambda log:
+
+```sh
+AWS_PROFILE=einkgen aws logs tail /aws/lambda/einkgen-inbound-email --follow
+```
+
+Then list the queue to confirm enqueue:
+
+```sh
+EINKGEN_BUCKET=einkgen-dev AWS_PROFILE=einkgen einkgen queue ls
+```
+
+#### 3.11.4. Managing the allowlist later
+
+```sh
+EINKGEN_BUCKET=einkgen-dev AWS_PROFILE=einkgen einkgen allowlist ls
+EINKGEN_BUCKET=einkgen-dev AWS_PROFILE=einkgen einkgen allowlist add other@example.com
+EINKGEN_BUCKET=einkgen-dev AWS_PROFILE=einkgen einkgen allowlist rm  other@example.com
+```
+
+Senders not on the list receive a friendly rejection email that never
+names other allowed addresses; nothing is enqueued. Email matching is
+case-insensitive on both sides.
+
 ---
 
 ## Part 4 — Day-2 ops
@@ -287,9 +518,13 @@ appears at the top.
 | --- | --- |
 | Enqueue a prompt | `einkgen queue prompt "<text>"` |
 | Enqueue an image | `einkgen queue image <path>` |
+| Restyle an image | `einkgen queue image <path> --prompt "<text>"` |
 | List the queue | `einkgen queue ls` |
 | Cancel an item | `einkgen queue rm <id>` |
+| List email allowlist | `einkgen allowlist ls` |
+| Add/remove sender | `einkgen allowlist add\|rm <email>` |
 | Tail generator logs | `aws logs tail /aws/lambda/einkgen-generator --follow` |
+| Tail inbound-email logs | `aws logs tail /aws/lambda/einkgen-inbound-email --follow` |
 | 24h ERROR sweep | `AWS_PROFILE=einkgen ./infra/scripts/check-errors.sh` |
 | Rotate device token | `aws secretsmanager put-secret-value …` + reflash `secrets.h` |
 | Deploy a code change | re-run §3.6 (web) and/or §3.7 (deploy) |

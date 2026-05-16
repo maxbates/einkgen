@@ -14,6 +14,7 @@ from einkgen.core.generate import (
     PROMPT_LIBRARY,
     _resolve_api_key,
     generate,
+    generate_from_image,
     random_prompt,
 )
 
@@ -73,6 +74,38 @@ def test_generate_raises_when_no_b64_payload():
 
     with pytest.raises(RuntimeError, match="b64_json"):
         generate("anything", client=client)
+
+
+def test_generate_from_image_calls_edit_endpoint_with_prepended_base_prompt():
+    fake_png = b"\x89PNG\r\n\x1a\nrestyled"
+    b64 = base64.b64encode(fake_png).decode()
+    client = MagicMock()
+    response = MagicMock()
+    datum = MagicMock()
+    datum.b64_json = b64
+    response.data = [datum]
+    client.images.edit.return_value = response
+
+    out = generate_from_image(
+        "as a charcoal sketch",
+        b"original-image-bytes",
+        image_filename="photo.jpg",
+        client=client,
+    )
+
+    assert out == fake_png
+    client.images.edit.assert_called_once()
+    kwargs = client.images.edit.call_args.kwargs
+    assert kwargs["model"] == "gpt-image-1"
+    assert kwargs["size"] == IMAGE_SIZE
+    assert kwargs["n"] == 1
+    assert kwargs["prompt"].startswith(BASE_PROMPT)
+    assert kwargs["prompt"].endswith("as a charcoal sketch")
+    # Image arg should be a BytesIO carrying the original bytes + filename hint.
+    image_arg = kwargs["image"]
+    assert image_arg.name == "photo.jpg"
+    image_arg.seek(0)
+    assert image_arg.read() == b"original-image-bytes"
 
 
 def test_resolve_api_key_prefers_env_var(monkeypatch):
