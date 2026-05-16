@@ -1,7 +1,7 @@
 import { Construct } from 'constructs';
 import * as path from 'path';
 import * as fs from 'fs';
-import { Duration } from 'aws-cdk-lib';
+import { AssetHashType, Duration } from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
@@ -124,6 +124,14 @@ export function bundlePython(requirementsFile: string, sourceStaged: boolean): l
     ? 'cp -r /asset-input/_src/einkgen /asset-output/einkgen'
     : 'mkdir -p /asset-output/einkgen && echo "stub" > /asset-output/einkgen/__init__.py';
   return lambda.Code.fromAsset(assetRoot, {
+    // Force OUTPUT-content hashing. The default for bundled assets is source-
+    // based, which means the synth-only local bundler and the real Docker
+    // bundler produce IDENTICAL asset hashes despite their outputs differing
+    // by 30 MB of pip-installed deps. cdk-assets then dedups on the hash and
+    // refuses to overwrite a previously-uploaded stub zip — Lambdas end up
+    // pointing at the stub even after a clean redeploy. Hashing the output
+    // keeps the two paths distinct.
+    assetHashType: AssetHashType.OUTPUT,
     bundling: {
       image: lambda.Runtime.PYTHON_3_12.bundlingImage,
       command: [
