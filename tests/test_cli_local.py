@@ -98,10 +98,11 @@ def test_generate_subcommand_writes_png(tmp_path, monkeypatch):
     assert rc == 0
     assert out_path.read_bytes() == fake_png
     client.images.generate.assert_called_once()
-    # Sanity-check it really hit gpt-image-1 with 1536x1024.
+    # Sanity-check it really hit gpt-image-2 with 1536x1024.
     kwargs = client.images.generate.call_args.kwargs
     assert kwargs["size"] == "1536x1024"
-    assert kwargs["model"] == "gpt-image-1"
+    assert kwargs["model"] == "gpt-image-2"
+    assert kwargs["quality"] == "medium"
 
 
 def test_preview_subcommand_writes_png(tmp_path, monkeypatch, tiny_panel):

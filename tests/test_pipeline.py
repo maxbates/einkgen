@@ -61,6 +61,7 @@ def _install_fake_modules(monkeypatch: pytest.MonkeyPatch):
         random_prompt=fake_random_prompt,
         BASE_PROMPT="",
         PROMPT_LIBRARY=[],
+        MODEL="gpt-image-2",
     )
     convert_mod = types.SimpleNamespace(convert=fake_convert)
     publish_mod = types.SimpleNamespace(publish=fake_publish)
@@ -94,7 +95,7 @@ def test_prompt_kind_runs_generate_convert_publish(monkeypatch):
     assert p["prompt"] == "a foggy cliff at dawn"
     assert p["source"] == {
         "kind": "generated",
-        "model": "gpt-image-1",
+        "model": "gpt-image-2",
         "prompt": "a foggy cliff at dawn",
     }
     assert p["processed_bmp"].startswith(b"fake-bmp-")
@@ -139,7 +140,7 @@ def test_image_kind_fetches_from_s3(monkeypatch, s3_bucket):
 
 
 def test_image_kind_with_prompt_calls_generate_from_image(monkeypatch, s3_bucket):
-    """image + prompt: restyle upload via gpt-image-1 edit, then convert."""
+    """image + prompt: restyle upload via gpt-image-2 edit, then convert."""
     calls = _install_fake_modules(monkeypatch)
 
     staged_key = "queue/staged/abc12345-skyline.jpg"
@@ -170,7 +171,7 @@ def test_image_kind_with_prompt_calls_generate_from_image(monkeypatch, s3_bucket
     # Restyled image is a generated frame — record the model + prompt.
     assert p["source"] == {
         "kind": "generated",
-        "model": "gpt-image-1",
+        "model": "gpt-image-2",
         "prompt": "render as a woodcut",
     }
 
@@ -196,7 +197,7 @@ def test_random_kind_uses_random_prompt(monkeypatch):
     assert p["prompt"] == chosen
     assert p["source"] == {
         "kind": "generated",
-        "model": "gpt-image-1",
+        "model": "gpt-image-2",
         "prompt": chosen,
     }
 

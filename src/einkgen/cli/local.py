@@ -36,7 +36,7 @@ def register(parser: argparse.ArgumentParser) -> None:
 
     p_generate = sub.add_parser(
         "generate",
-        help="Call gpt-image-1 with BASE_PROMPT + your text, save raw PNG.",
+        help="Call gpt-image-2 with BASE_PROMPT + your text, save raw PNG.",
     )
     p_generate.add_argument("prompt", type=str, help="Subject text (BASE_PROMPT is prepended)")
     p_generate.add_argument(

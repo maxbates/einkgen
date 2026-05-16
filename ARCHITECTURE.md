@@ -81,7 +81,7 @@ einkgen queue ls                                  # list pending items
 einkgen queue rm <id>                             # delete a pending item
 einkgen queue prompt "<text>"                     # enqueue a prompt
 einkgen queue image  <path>                       # enqueue an image (B&W passthrough)
-einkgen queue image  <path> --prompt "<text>"     # restyle an image via gpt-image-1 edit
+einkgen queue image  <path> --prompt "<text>"     # restyle an image via gpt-image-2 edit
 
 einkgen allowlist ls                              # list emails permitted to submit via email
 einkgen allowlist add <email>                     # permit a sender
@@ -110,7 +110,7 @@ You can submit to the queue by emailing a configured address. Three modes:
 
 - **Text only** — subject and first body line both contribute. When both carry text they are concatenated (subject, blank line, body); either alone is used as-is. Kind = `prompt`.
 - **Image attached** — the image becomes the input frame, converted to B&W and published as-is. Kind = `image`.
-- **Image + text** — image is fed to `gpt-image-1`'s edit endpoint with the prompt (same subject/body concatenation rule) as a restyle hint, then dithered and published. Kind = `image` with a prompt set.
+- **Image + text** — image is fed to `gpt-image-2`'s edit endpoint with the prompt (same subject/body concatenation rule) as a restyle hint, then dithered and published. Kind = `image` with a prompt set.
 
 **Cost protection.** A plain-text allowlist at `s3://<bucket>/config/email_allowlist.txt` lists every address permitted to submit. Senders not on the list get a friendly rejection email and **nothing is enqueued**; the reply never names other allowed addresses. Manage with `einkgen allowlist {ls,add,rm}` or edit the file directly. CDK seeds the initial allowlist on first deploy — see [QUICKSTART.md](QUICKSTART.md#email-submission-channel-optional).
 
@@ -152,7 +152,7 @@ If we ever outgrow the S3-prefix queue (multi-producer races, very high write ra
 Field constraints by kind:
 
 - **`prompt`** — `prompt` required, `image_s3_key` forbidden.
-- **`image`** — `image_s3_key` required; `prompt` optional. With no prompt the upload is converted to B&W and published. With a prompt, the upload is fed to `gpt-image-1`'s edit endpoint, restyled per the prompt, then dithered and published.
+- **`image`** — `image_s3_key` required; `prompt` optional. With no prompt the upload is converted to B&W and published. With a prompt, the upload is fed to `gpt-image-2`'s edit endpoint, restyled per the prompt, then dithered and published.
 - **`random`** — both forbidden; the generator picks from the prompt library and patches `prompt` in-place before publishing.
 
 ### Generator loop
@@ -210,11 +210,11 @@ When we add a text/email channel, that channel becomes its **own** Lambda with i
 
 Server-side dithering (not on-device) so previews match what the panel actually shows and we can tune algorithms per content.
 
-The display is **1200 × 825 px**, aspect **~1.4545 : 1**. The closest OpenAI `gpt-image-1` size is **1536 × 1024** (1.5 : 1), which exceeds the panel in both dimensions — so we crop to the exact resolution with **zero resampling**. 1:1 pixel mapping, no anti-aliasing.
+The display is **1200 × 825 px**, aspect **~1.4545 : 1**. The closest OpenAI `gpt-image-2` size is **1536 × 1024** (1.5 : 1), which exceeds the panel in both dimensions — so we crop to the exact resolution with **zero resampling**. 1:1 pixel mapping, no anti-aliasing.
 
 Steps:
 1. **Generate (or load)** the source image.
-   - For generated images: request `1536 × 1024` from `gpt-image-1` with the base prompt (below).
+   - For generated images: request `1536 × 1024` from `gpt-image-2` with the base prompt (below).
    - For uploads: take whatever the user provides.
 2. **Fit to canvas (no resampling when possible).**
    - Source ≥1200×825 in both dims: **center-crop** to exactly 1200×825 (pixel-exact, no AA). Default.
@@ -270,7 +270,7 @@ Used when cron fires with an empty queue. Ten entries: a mix of constrained styl
   "image_bytes": 990123,
   "display": { "width": 1200, "height": 825, "levels": 8 },
   "next_check_after": "2026-05-13T16:05:00Z",
-  "source": { "kind": "generated", "model": "gpt-image-1", "prompt": "…" }
+  "source": { "kind": "generated", "model": "gpt-image-2", "prompt": "…" }
 }
 ```
 
@@ -349,7 +349,7 @@ Everything is in a single CDK stack under [infra/](infra/).
 | `.env` (gitignored) | Local CLI: `OPENAI_API_KEY`, `AWS_PROFILE`, `EINKGEN_BUCKET`, `EINKGEN_CDN_BASE` |
 | AWS Secrets Manager | `einkgen/openai_api_key`, `einkgen/device_status_token` — Lambdas only |
 | `firmware/inkplate10/secrets.h` (gitignored) | Wi-Fi SSID/password and `DEVICE_STATUS_TOKEN` baked into the sketch |
-| `config.toml` | Non-secret defaults: model (`gpt-image-1`), model size (`1536x1024`), fit mode (`cover`), dither (`atkinson`), tick interval (`2h`), device sleep cap (`1h`), next-check buffer (`5m`) |
+| `config.toml` | Non-secret defaults: model (`gpt-image-2`), model size (`1536x1024`), fit mode (`cover`), dither (`atkinson`), tick interval (`2h`), device sleep cap (`1h`), next-check buffer (`5m`) |
 
 Config resolution order: CLI flag → env var → `config.toml` → built-in defaults.
 
