@@ -5,7 +5,8 @@ from S3 (SES's S3 action writes the email there) and hands the bytes to
 :func:`parse_message`, which returns:
 
   - the verified sender (after SES Authentication-Results check)
-  - the prompt text, if any
+  - the prompt text, if any (subject and first body line are concatenated
+    with a blank line between them when both carry content)
   - the first image attachment, if any
 
 A submission with an image attachment maps to ``kind="image"`` (optionally
@@ -80,7 +81,13 @@ def parse_message(raw: bytes) -> ParsedEmail:
     body_text = _first_text_part(msg)
     body_prompt = _first_meaningful_line(body_text) if body_text else ""
 
-    prompt = subject or body_prompt
+    # When both subject and body carry prompt-like text, concatenate them so
+    # the user can put a short subject ("watercolor") and elaborate in the
+    # body ("of a mountain at dawn") — phone mail clients make subject-only
+    # awkward. Blank line separator keeps the two thoughts distinct for the
+    # model.
+    parts = [p for p in (subject, body_prompt) if p]
+    prompt = "\n\n".join(parts) if parts else None
     prompt = prompt[:MAX_PROMPT_CHARS] if prompt else None
 
     image_bytes, image_filename = _first_image_attachment(msg)

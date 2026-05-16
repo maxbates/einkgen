@@ -24,6 +24,13 @@ re-fetches every time you click into it.
   re-clicking it while it's already active — forces the Device component to
   remount and fetch fresh status, instead of showing whatever loaded the
   first time the tab was opened.
+### Changed
+- **Email submissions can now combine subject and body as the prompt.** Previously
+  the body was used only as a fallback when the subject was empty; now whenever
+  both carry text they are concatenated (subject first, blank line, then the first
+  meaningful body line) so a phone user can type a short subject ("watercolor")
+  and elaborate in the body ("of a mountain at dawn"). Existing subject-only,
+  body-only, and image + prompt restyle paths are unchanged.
 
 ## [0.3.0.0] - 2026-05-15
 

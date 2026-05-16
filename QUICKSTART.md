@@ -479,12 +479,14 @@ After the deploy, two finishing steps remain (CDK can't do them):
 Send a test email from an allowlisted sender to any address
 `@<yourdomain>`:
 
-- **Text only** → goes in as `kind=prompt`. Subject becomes the prompt
-  (or first non-empty line of body if subject is empty).
+- **Text only** → goes in as `kind=prompt`. Subject and the first
+  non-empty body line both contribute: when both carry text they are
+  concatenated (subject, blank line, body); either alone is used as-is.
 - **Image attached, no text** → `kind=image`. The image is converted to
   B&W and published as-is.
-- **Image + subject** → `kind=image` with a prompt. Image is fed to
-  gpt-image-1's edit endpoint with the prompt as a restyle hint.
+- **Image + subject and/or body** → `kind=image` with a prompt. The image
+  is fed to gpt-image-1's edit endpoint with the prompt (same subject/body
+  concatenation rule) as a restyle hint.
 
 Watch the Lambda log:
 

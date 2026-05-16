@@ -40,7 +40,7 @@ def _make_email(
 
 
 def test_text_only_email_yields_prompt_kind():
-    raw = _make_email(subject="Mountains at sunset", body="(no body)")
+    raw = _make_email(subject="Mountains at sunset", body="")
     parsed = email_parse.parse_message(raw)
     assert parsed.sender == "me@example.com"
     assert parsed.prompt == "Mountains at sunset"
@@ -83,6 +83,15 @@ def test_subject_re_and_fwd_prefixes_are_stripped():
 def test_body_used_when_subject_is_empty():
     raw = _make_email(subject="", body="A foggy cliff at dawn\n\nMore text")
     assert email_parse.parse_message(raw).prompt == "A foggy cliff at dawn"
+
+
+def test_subject_and_body_are_concatenated_when_both_present():
+    raw = _make_email(
+        subject="watercolor",
+        body="of a mountain at dawn\n\nignored second line",
+    )
+    parsed = email_parse.parse_message(raw)
+    assert parsed.prompt == "watercolor\n\nof a mountain at dawn"
 
 
 def test_signature_lines_are_not_used_as_prompt():
