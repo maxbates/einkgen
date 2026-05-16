@@ -115,6 +115,8 @@ infra/                          AWS CDK stack (TypeScript)
 ├── lib/secrets.ts              openai_api_key + device_status_token + admin_password + admin_cookie_signing_key
 ├── lib/observability.ts        log retention + ERROR metric filters + dashboard
 ├── lambda/                     per-Lambda requirements.txt + staged Python src
+├── scripts/deploy.sh           **canonical redeploy** — rebuild SPA against live URLs, cdk deploy, verify
+├── scripts/verify-deploy.sh    **post-deploy smoke test** — curl-only end-to-end checks, exits non-zero on any fail
 ├── scripts/check-errors.sh     24h ERROR sweep across all Lambdas
 ├── scripts/register-domain.example.sh  Route 53 domain registration template (copy to .sh, fill PII)
 └── README.md                   CDK-internal reference
@@ -129,7 +131,8 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | User says... | Do this |
 | --- | --- |
 | "Deploy this" / "Set this up" / "Get it running" | [QUICKSTART.md](QUICKSTART.md), follow Part 3 |
-| "Redeploy" / "Push the latest code" / "Roll out my change" | `( cd infra && AWS_PROFILE=einkgen npx cdk deploy --require-approval never )`. The canonical site + inbound domain (`einkgen.link`) live in [infra/cdk.json](infra/cdk.json) `context` so a **bare** `cdk deploy` keeps all live wiring intact. Add `-c includeWebAssets=true` only when you just rebuilt `web/dist` and want CloudFront to pick it up. **Do not** override `einkgenSiteDomain` / `einkgenInboundDomain` to empty unless you actually want to tear down the custom domain or inbound email — see Hard rule on context-stripping below. |
+| "Redeploy" / "Push the latest code" / "Roll out my change" | **Prefer `AWS_PROFILE=einkgen ./infra/scripts/deploy.sh`** — it pulls the live API URLs from CloudFormation, rebuilds the SPA against them, fails fast if the bundle still has `localhost:` in it, runs `cdk deploy` (no overrides), and then runs `verify-deploy.sh`. Use `--no-web` for infra-only redeploys. The bare `( cd infra && AWS_PROFILE=einkgen npx cdk deploy --require-approval never )` still works for infra-only iteration, but does NOT rebuild the SPA — if you forget the rebuild step on a fresh worktree (no `web/.env.production`), the deployed bundle bakes in `localhost:3001` and every tab in the dashboard says "Loading…" forever. The canonical site + inbound domain (`einkgen.link`) live in [infra/cdk.json](infra/cdk.json) `context`. **Do not** override `einkgenSiteDomain` / `einkgenInboundDomain` to empty unless you actually want to tear down the custom domain or inbound email — see Hard rule on context-stripping below. |
+| "Verify the deploy" / "Smoke test" / "Did it actually ship" | `AWS_PROFILE=einkgen ./infra/scripts/verify-deploy.sh` — reads live stack outputs from CFN, then exercises read-api, admin-api (direct + via CloudFront), `/current/manifest.json` + `/current/image.bmp`, the SPA shell, and the SPA bundle (no `localhost:`, refs the real read-api host, refs the CDN host), plus a 30-min ERROR-log sweep across all four Lambdas. Exits non-zero on any fail. Run after every deploy — `deploy.sh` chains it automatically. |
 | "What is this?" / "How does X work?" | [ARCHITECTURE.md](ARCHITECTURE.md) §1–§12 — pick the matching section |
 | "Add a CLI subcommand" | `src/einkgen/cli/<name>.py` + register in `cli/__init__.py` |
 | "Add a route on the read-api" | `src/einkgen/lambdas/read_api.py` + a test; CORS is pinned at API Gateway in `infra/lib/lambdas.ts` |
@@ -143,15 +146,29 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "Pick me a cheap domain" | `aws route53domains list-prices --region us-east-1` + filter where reg ≤ $10 *and* renew ≤ $10. Then `check-domain-availability` per candidate. Always surface renewal price — domain registration is a recurring cost. Don't autonomously register; have the human `cp register-domain.example.sh register-domain.sh` and fill in their PII (the live `.sh` is gitignored). |
 | "Change the dither algorithm" | `src/einkgen/core/convert.py`. **Read [TODOS.md](TODOS.md) §"Profile and replace pure-Python error-diffusion dither" first** — the current pure-Python Atkinson is the considered choice. Don't replace without re-measuring. |
 | "Change the device poll interval" / "make it check more often" | Edit **both** `SLEEP_MAX_SECONDS` + `SLEEP_FALLBACK_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) **and** redeploy with `-c einkgenPollIntervalSeconds=<n>`. See [QUICKSTART §3.12](QUICKSTART.md#312-optional-device-poll-interval) for the battery-life table. Server-only change is silently clamped by firmware. Don't conflate with the auto-gen `rate(2 hours)` cron — that's the OpenAI-cost knob, separate concern. |
-| "It's broken / debug this" | `AWS_PROFILE=einkgen ./infra/scripts/check-errors.sh 24h` first, then `aws logs tail /aws/lambda/<fn> --follow` |
+| "It's broken / debug this" / "Site is down" / "Tabs won't load" | **Run `AWS_PROFILE=einkgen ./infra/scripts/verify-deploy.sh` first.** It pinpoints which of {read-api, admin-api, manifest, image, SPA shell, SPA bundle env-vars, recent Lambda errors} is broken. Then `./infra/scripts/check-errors.sh 24h` for deeper log context, and `aws logs tail /aws/lambda/<fn> --follow` for live tail. If verify reports an SPA bundle regression (no `localhost:` check, etc.), fix is **`AWS_PROFILE=einkgen ./infra/scripts/deploy.sh`** — do not "fix" by editing the SPA. |
 | "QA the live SPA" | Use the deployed CloudFront URL and the browse tool (or `/qa-only` if gstack is loaded) |
 | "Set up an iPhone shortcut" / "Submit from Siri" / "Phone shortcut" | [shortcuts/README.md](shortcuts/README.md) — two paths: a 2-action email shortcut (if inbound email is set up) or a 4–8-action HTTP shortcut that calls the admin API. Both end with *"Hey Siri, einkgen."* |
-| "Cut a release" | Bump `VERSION`, prepend a `CHANGELOG.md` entry, then redeploy as in [QUICKSTART §3.6–§3.7](QUICKSTART.md#36-build-the-web-spa-against-the-deployed-urls) |
+| "Cut a release" | Bump `VERSION`, prepend a `CHANGELOG.md` entry, commit, then `AWS_PROFILE=einkgen ./infra/scripts/deploy.sh` (the canonical redeploy path — see top of Hard rules below). |
 | "Tear it all down" | `( cd infra && AWS_PROFILE=… npx cdk destroy -c env=<env> )` — **always confirm with the user first** |
 
 ---
 
 ## Hard rules
+
+- **The canonical redeploy path is `AWS_PROFILE=einkgen ./infra/scripts/deploy.sh`.**
+  Never `( cd web && npm run build )` followed by a bare `cdk deploy`
+  on a fresh worktree — `web/.env.production` is gitignored, so without
+  the wrapper's CFN-output fetch the Vite build silently falls back to
+  `http://localhost:3001` and the deployed SPA's Queue / History /
+  Device tabs spin forever. We shipped this regression to prod **twice**
+  before the wrapper existed. The wrapper fails fast if the freshly-built
+  bundle still contains `localhost:` and finishes by running
+  `./infra/scripts/verify-deploy.sh`, which exits non-zero on any
+  regression. After every deploy, the only acceptable end state is "14
+  pass / 0 fail" (or higher pass count if checks are added). If you have
+  a reason to skip the SPA rebuild step, use `deploy.sh --no-web`; don't
+  open-code the bare `cdk deploy` from memory.
 
 - **Don't strip `cdk.json` context on deploy.** `einkgenSiteDomain` and
   `einkgenInboundDomain` live in [infra/cdk.json](infra/cdk.json)

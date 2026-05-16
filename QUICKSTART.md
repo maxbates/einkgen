@@ -241,63 +241,61 @@ AWS_PROFILE=einkgen AWS_REGION=us-east-1 aws secretsmanager get-secret-value \
 # only do that intentionally (e.g. lost laptop).
 ```
 
-### 3.6. Build the web SPA against the deployed URLs
+### 3.6 / 3.7 / 3.8 — Build, deploy, verify (one command)
 
-Read the URLs from `infra/cdk-outputs.json` and write `web/.env.production`
-(gitignored):
+After the first-time bootstrap (§3.1–§3.5), every subsequent deploy goes
+through a single wrapper that does all three steps in order:
 
 ```sh
-READ_API_URL=$(jq -r '.["EinkgenStack-dev"].ReadApiUrl'  infra/cdk-outputs.json)
-CDN_DOMAIN=$(jq -r '.["EinkgenStack-dev"].CdnDomain'     infra/cdk-outputs.json)
+AWS_PROFILE=einkgen ./infra/scripts/deploy.sh
+```
+
+What it does:
+
+1. Reads the live API URLs from CloudFormation
+   (`aws cloudformation describe-stacks EinkgenStack-dev`) — works on a
+   fresh worktree even without `infra/cdk-outputs.json`.
+2. Writes `web/.env.production` with `VITE_READ_API_URL` + `VITE_CDN_BASE`
+   matching the live stack, then runs `npm run build`.
+3. **Fails fast** if the freshly-built bundle still contains `localhost:`
+   or doesn't reference the real read-api host. This catches the failure
+   mode we've shipped to prod at least twice — "Loading queue..." that
+   never resolves because env vars weren't set at build time.
+4. Runs `( cd infra && npx cdk deploy --outputs-file cdk-outputs.json
+   --require-approval never -c includeWebAssets=true )` with no domain
+   overrides (so the canonical context in `infra/cdk.json` is preserved
+   — see [CLAUDE.md](CLAUDE.md) hard rule).
+5. Runs `./infra/scripts/verify-deploy.sh`, which exercises read-api,
+   admin-api (direct + via CloudFront), `/current/manifest.json` +
+   `/current/image.bmp`, the SPA shell, and the bundle integrity checks
+   from step 3 against the live site. Exits non-zero on any fail.
+
+Flags: `--no-web` (skip the SPA rebuild, infra-only redeploy);
+`--no-verify` (skip post-deploy verification — not recommended).
+
+If you ever need to run the underlying steps manually (e.g. troubleshooting
+a deploy script bug), they are equivalent to:
+
+```sh
+READ_API_URL=$(aws cloudformation describe-stacks --stack-name EinkgenStack-dev \
+  --query 'Stacks[0].Outputs[?OutputKey==`ReadApiUrl`].OutputValue' --output text)
+CDN_DOMAIN=$(aws cloudformation describe-stacks --stack-name EinkgenStack-dev \
+  --query 'Stacks[0].Outputs[?OutputKey==`CdnDomain`].OutputValue' --output text)
 
 cat > web/.env.production <<EOF
 VITE_READ_API_URL=${READ_API_URL}
-VITE_CDN_BASE=https://${CDN_DOMAIN}
+VITE_CDN_BASE=https://einkgen.link   # or https://${CDN_DOMAIN} if no custom domain
 EOF
 
-# If you enabled inbound email in §3.11, add the domain so the Queue tab
-# shows the "email anything @<domain>" submission hint. Match this to the
-# `einkgenInboundDomain` flag you deploy with.
+# If you enabled inbound email in §3.10, add the domain so the Queue tab
+# shows the "email anything @<domain>" submission hint.
 # echo "VITE_INBOUND_EMAIL_DOMAIN=einkgen.link" >> web/.env.production
 
 ( cd web && npm run build )
-```
-
-This emits `web/dist/`.
-
-### 3.7. Redeploy with the web assets
-
-```sh
-( cd infra && AWS_PROFILE=einkgen AWS_REGION=us-east-1 npx cdk deploy \
-    --outputs-file cdk-outputs.json \
-    --require-approval never \
-    -c env=dev -c includeWebAssets=true )
-```
-
-This uploads `web/dist/*` to `s3://einkgen-dev/web/` and invalidates
-`/web/*` in CloudFront.
-
-### 3.8. Smoke test
-
-```sh
-READ_API_URL=$(jq -r '.["EinkgenStack-dev"].ReadApiUrl'      infra/cdk-outputs.json)
-DEVICE_URL=$(jq   -r '.["EinkgenStack-dev"].DeviceStatusUrl' infra/cdk-outputs.json)
-CDN_DOMAIN=$(jq   -r '.["EinkgenStack-dev"].CdnDomain'       infra/cdk-outputs.json)
-
-# Read API should respond 200 with an empty queue.
-curl -sS "${READ_API_URL}/queue"
-
-# Device-status should reject unauthenticated POSTs.
-curl -sS -o /dev/null -w "no token   -> %{http_code}\n" \
-  -X POST "${DEVICE_URL}/" -H 'Content-Type: application/json' -d '{}'
-
-# Admin API should reject unauthenticated session probes.
-curl -sS -o /dev/null -w "no cookie  -> %{http_code}\n" \
-  "https://${CDN_DOMAIN}/admin/me"
-# expect: 401
-
-# CloudFront should serve the SPA index.html.
-curl -sS -I "https://${CDN_DOMAIN}/" | head -3
+( cd infra && AWS_PROFILE=einkgen npx cdk deploy \
+    --outputs-file cdk-outputs.json --require-approval never \
+    -c includeWebAssets=true )
+AWS_PROFILE=einkgen ./infra/scripts/verify-deploy.sh
 ```
 
 Open `https://<CdnDomain>/` in a browser. You should see the four-tab
@@ -648,7 +646,8 @@ firmware obeys the hint up to its own cap; this is the safe direction.
 | Rotate device token | `aws secretsmanager put-secret-value …` + reflash `secrets.h` |
 | Rotate admin password | `aws secretsmanager put-secret-value --secret-id einkgen/admin_password …` (takes effect ≤5 min on warm Lambdas) |
 | Log every admin session out | `aws secretsmanager put-secret-value --secret-id einkgen/admin_cookie_signing_key --secret-string "$(openssl rand -base64 48)"` |
-| Deploy a code change | re-run §3.6 (web) and/or §3.7 (deploy) |
+| Deploy a code change | `AWS_PROFILE=einkgen ./infra/scripts/deploy.sh` (see §3.6) — chains web rebuild + cdk deploy + post-deploy verify |
+| Verify a live deploy | `AWS_PROFILE=einkgen ./infra/scripts/verify-deploy.sh` |
 | Tear it all down | `( cd infra && npx cdk destroy -c env=dev )` |
 
 `einkgen` CLI environment variables:
@@ -772,9 +771,13 @@ seconds of the `[status] OK HTTP 200` line.
   concurrency`** — your account's unreserved concurrency pool is too low.
   Either raise the account limit or lower the value in
   [infra/lib/lambdas.ts](infra/lib/lambdas.ts).
-- **Web SPA loads but data tabs say "Could not load"** — the
-  `VITE_READ_API_URL` baked into the build is stale or wrong. Re-run §3.6
-  with the current outputs and §3.7 to redeploy.
+- **Web SPA loads but data tabs say "Could not load" / spin forever** —
+  the `VITE_READ_API_URL` baked into the bundle is stale or missing
+  (`localhost:3001` fallback). Run
+  `AWS_PROFILE=einkgen ./infra/scripts/verify-deploy.sh` to confirm; then
+  `AWS_PROFILE=einkgen ./infra/scripts/deploy.sh` to rebuild against the
+  live URLs and redeploy. The deploy wrapper now fails fast if the bundle
+  still has `localhost:` in it, so this regression can't ship again.
 - **`/status` returns 404 in the browser console** — expected before any
   device has reported. The SPA handles it (shows "Device has not reported
   yet."); the 404 disappears once `status/device-default.json` exists.

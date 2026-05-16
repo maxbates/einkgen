@@ -5,6 +5,42 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.1.1] - 2026-05-16
+
+### Fixed
+- **Queue / History / Device tabs loaded "forever" on the live site.**
+  The SPA bundle currently in production was built without
+  `VITE_READ_API_URL` / `VITE_CDN_BASE` set, so the runtime fallback
+  (`http://localhost:3001`) was baked in and every API call from the
+  browser went to a non-existent local host. Rebuilt the bundle against
+  the live stack outputs and redeployed. No code changes to the SPA or
+  the read-api; the production data was always reachable, the deployed
+  client just couldn't find it.
+
+### Added
+- **`infra/scripts/deploy.sh`** — single safe redeploy path. Reads live
+  API URLs from CloudFormation, rebuilds `web/dist` against them, fails
+  fast if the resulting bundle still contains `localhost:` or doesn't
+  reference the real read-api host, runs `cdk deploy` (no domain
+  overrides — preserves the canonical `cdk.json` context), then chains
+  into `verify-deploy.sh`. Replaces the fragile "remember to do §3.6
+  before §3.7" recipe that broke twice. `--no-web` skips the SPA
+  rebuild; `--no-verify` skips the post-deploy check (not recommended).
+- **`infra/scripts/verify-deploy.sh`** — post-deploy smoke test.
+  Exercises the four API surfaces (read-api direct, admin-api direct +
+  via CloudFront, device-facing manifest + image), the SPA shell, and
+  the SPA bundle's integrity (no `localhost:`, refs the real read-api
+  host, refs the CDN host); also sweeps the last 30 min of ERROR-level
+  log lines across all four Lambdas. Curl-only, exits non-zero on any
+  fail. Run after every deploy — `deploy.sh` chains it automatically.
+
+### Changed
+- [CLAUDE.md](CLAUDE.md) and [QUICKSTART.md](QUICKSTART.md): the
+  "Redeploy" instructions now point at `deploy.sh` as the canonical
+  path; the manual `cdk deploy` recipe is preserved below it for
+  troubleshooting. §3.6, §3.7, and §3.8 are collapsed into a single
+  "build + deploy + verify" section.
+
 ## [0.4.1.0] - 2026-05-16
 
 ### Added
