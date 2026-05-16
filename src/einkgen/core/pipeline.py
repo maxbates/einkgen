@@ -59,9 +59,11 @@ def process_item(item: QueueItem) -> None:
     # frame — record it as such so history shows the model that touched it.
     image_was_generated = item.kind != "image" or bool(item.prompt)
 
-    # Generated images are 1536x1024 with a centered 1200x825 safe area, so
-    # they center-crop without resampling. Raw uploads can be any size — let
-    # convert() scale-fit them so we don't discard most of a phone photo.
+    # Generated images are 1200x832 composed for the whole canvas, so they
+    # center-crop a 7-pixel sliver off the height without resampling. Raw
+    # uploads can be any size — let convert() scale-fill them so the panel
+    # fills, accepting a small crop on the long axis instead of leaving white
+    # bars.
     processed_bmp = convert_mod.convert(original_png, is_generated=image_was_generated)
     source: dict[str, Any] = {
         "kind": "generated" if image_was_generated else "uploaded",

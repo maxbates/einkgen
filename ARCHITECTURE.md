@@ -218,15 +218,15 @@ A mostly-read-only dashboard. The public tabs have no buttons or forms — anyth
 
 Server-side dithering (not on-device) so previews match what the panel actually shows and we can tune algorithms per content.
 
-The display is **1200 × 825 px**, aspect **~1.4545 : 1**. The closest OpenAI `gpt-image-2` size is **1536 × 1024** (1.5 : 1), which exceeds the panel in both dimensions — so we crop to the exact resolution with **zero resampling**. 1:1 pixel mapping, no anti-aliasing.
+The display is **1200 × 825 px**, aspect **~1.4545 : 1**. `gpt-image-2` accepts arbitrary sizes provided both dimensions are multiples of 16 and total pixels are within 655,360–8,294,400 (see the OpenAI image-generation guide), so we ask for **1200 × 832** — the smallest valid size that exceeds the panel in both dims. The downstream step center-crops 7 px off the height with **zero resampling**. 1:1 pixel mapping, no anti-aliasing. We used to request 1536 × 1024 (inherited from `gpt-image-1`, which only offered fixed sizes); that generated 1,572,864 px and threw 37 % away.
 
 Steps:
 1. **Generate (or load)** the source image.
-   - For generated images: request `1536 × 1024` from `gpt-image-2` with the base prompt (below).
+   - For generated images: request `1200 × 832` from `gpt-image-2` with the base prompt (below).
    - For uploads: take whatever the user provides.
 2. **Fit to canvas.** Two paths, picked by `is_generated`:
-   - **Generated** (`gpt-image-2` at 1536×1024 with the base prompt's centered 1200×825 safe area): **center-crop** to exactly 1200×825 (pixel-exact, no resampling, no AA).
-   - **Uploaded** (any size, any aspect): **scale-fit** preserving aspect + pad with white. This is the default — a 4032×3024 phone photo is downsampled to 1100×825 (with ~50px white bars left/right), not center-cropped to a tiny middle slice.
+   - **Generated** (`gpt-image-2` at 1200×832, composed for the whole canvas with no safe-area inset): **center-crop** to exactly 1200×825 (pixel-exact, no resampling, no AA) — just trims a 7-pixel sliver off the height.
+   - **Uploaded** (any size, any aspect): **scale-fill** preserving aspect (CSS `background-size: cover`) + center-crop the overflow on the long axis. This is the default — a 4032×3024 phone photo is scaled to 1200×900 (using the larger of the two per-axis scale factors so the panel fills) and then cropped 37 px off the top and bottom. Filling the panel beats leaving white bars, and only a small slice on the long axis is lost.
 3. **Grayscale + tone curve.** Luminance, optional gamma/contrast tweak (e-ink loses midtones).
 4. **Dither** to 8 levels. Default **Atkinson** (high contrast, classic Mac look — best for the Inkplate's limited palette). Alternatives: Floyd–Steinberg, Bayer.
 5. **Encode as 8-bit indexed BMP** with an 8-entry grayscale palette (~990 KB).
@@ -237,11 +237,11 @@ Profiled cost on Lambda ARM64 1024 MB: dither ~2–3 s, OpenAI call ~52–55 s, 
 ### Base prompt (prepended to every generation)
 
 ```
-Compose a single image at 1536×1024 (landscape, 3:2). It will be center-cropped
-to 1200×825 (a 9.7" e-paper panel) and dithered to 8 grayscale levels. Keep
-important content within the centered safe area (1200×825). Use high-contrast
-tones, bold shapes, and clean edges — subtle gradients and fine textures will
-not survive dithering. No text or watermarks. Subject:
+Compose a single image at 1200×832 (landscape, ~1.44:1). It will be displayed on
+a 1200×825 e-paper panel (a 7-pixel sliver trimmed off the height) and dithered
+to 8 grayscale levels. The whole canvas is visible — there is no safe-area inset.
+Use high-contrast tones, bold shapes, and clean edges — subtle gradients and fine
+textures will not survive dithering. No text or watermarks. Subject:
 ```
 
 The user/random subject string is appended to this base.
@@ -360,7 +360,7 @@ Everything is in a single CDK stack under [infra/](infra/).
 | `.env` (gitignored) | Local CLI: `OPENAI_API_KEY`, `AWS_PROFILE`, `EINKGEN_BUCKET`, `EINKGEN_CDN_BASE` |
 | AWS Secrets Manager | `einkgen/openai_api_key`, `einkgen/device_status_token`, `einkgen/admin_password`, `einkgen/admin_cookie_signing_key` — Lambdas only |
 | `firmware/inkplate10/secrets.h` (gitignored) | Wi-Fi SSID/password and `DEVICE_STATUS_TOKEN` baked into the sketch |
-| `config.toml` | Non-secret defaults: model (`gpt-image-2`), model size (`1536x1024`), fit mode (`cover`), dither (`atkinson`), auto-gen cron (`2h`), device poll interval (`1h`, override via CDK context `einkgenPollIntervalSeconds`), next-check buffer (`5m`) |
+| `config.toml` | Non-secret defaults: model (`gpt-image-2`), model size (`1200x832`), fit mode (`cover`), dither (`atkinson`), auto-gen cron (`2h`), device poll interval (`1h`, override via CDK context `einkgenPollIntervalSeconds`), next-check buffer (`5m`) |
 
 Config resolution order: CLI flag → env var → `config.toml` → built-in defaults.
 
