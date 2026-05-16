@@ -213,3 +213,80 @@ def test_publish_prompt_kwarg_overrides_source(s3_bucket):
     )
     assert m.source["prompt"] == "overridden prompt"
     assert m.source["kind"] == "generated"
+
+
+# ---------------------------------------------------------------------------
+# set_current_from_history
+# ---------------------------------------------------------------------------
+
+
+def test_set_current_from_history_repoints_manifest(s3_bucket):
+    """Re-publishing a history item bumps version and points image_url at the
+    history bmp without touching the bytes."""
+    # First, publish a normal frame so history/id-A exists.
+    base_now = datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc)
+    first = publish.publish(
+        PROCESSED,
+        source={"kind": "generated", "model": "gpt-image-2", "prompt": "first"},
+        item_id="01HISTORYA",
+        now=base_now,
+    )
+    # And a second frame so "current" is something different.
+    publish.publish(
+        PROCESSED + b"X",
+        source={"kind": "generated", "model": "gpt-image-2", "prompt": "second"},
+        item_id="01HISTORYB",
+        now=base_now,
+    )
+
+    # Re-publishing the first item should bump version to 3, carry over the
+    # first frame's sha + bytes, and point image_url at history/<id>/processed.bmp.
+    later = datetime(2026, 5, 13, 15, 0, 0, tzinfo=timezone.utc)
+    m = publish.set_current_from_history("01HISTORYA", now=later)
+
+    assert m.version == 3
+    assert m.image_sha256 == first.image_sha256
+    assert m.image_bytes == first.image_bytes
+    assert m.image_url.endswith("/history/01HISTORYA/processed.bmp")
+    assert m.source["replayed_from"] == "01HISTORYA"
+    assert m.source["prompt"] == "first"
+
+    # And the live manifest on S3 actually reflects the rewrite.
+    live = s3_bucket.get_object(Bucket="einkgen-test", Key="current/manifest.json")
+    on_disk = Manifest.from_json(live["Body"].read())
+    assert on_disk == m
+
+    # current/image.bmp is unchanged — we did not copy.
+    cur_bmp = s3_bucket.get_object(
+        Bucket="einkgen-test", Key="current/image.bmp"
+    )["Body"].read()
+    assert cur_bmp == PROCESSED + b"X"
+
+
+def test_set_current_from_history_missing_raises(s3_bucket):
+    with pytest.raises(publish.HistoryItemNotFound):
+        publish.set_current_from_history("01DOESNOTEXIST")
+
+
+def test_set_current_from_history_invalidates_cf(s3_bucket, monkeypatch):
+    # Seed history without CF wired up — the publish() shouldn't invalidate.
+    publish.publish(
+        PROCESSED,
+        source={"kind": "generated"},
+        item_id="01HISTORYCF",
+        now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setenv("EINKGEN_CF_DISTRIBUTION_ID", "E456DEF")
+    fake_cf = MagicMock()
+    with _cf_only_patch(fake_cf):
+        publish.set_current_from_history(
+            "01HISTORYCF",
+            now=datetime(2026, 5, 13, 15, 0, 0, tzinfo=timezone.utc),
+        )
+    # image_url points at the (already cached) history bmp, so invalidation
+    # should only touch /current/manifest.json — never /current/image.bmp.
+    fake_cf.create_invalidation.assert_called_once()
+    kwargs = fake_cf.create_invalidation.call_args.kwargs
+    assert kwargs["DistributionId"] == "E456DEF"
+    paths = kwargs["InvalidationBatch"]["Paths"]["Items"]
+    assert paths == ["/current/manifest.json"]
