@@ -482,3 +482,77 @@ button {
   margin: 0;
   word-break: break-word;
 }
+
+/* Admin */
+.admin-login,
+.admin-panel,
+.admin-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 520px;
+}
+
+.admin-panel {
+  max-width: 720px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  gap: 16px;
+}
+
+.admin-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.admin-field-label {
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+
+.admin-input,
+.admin-textarea {
+  font-family: inherit;
+  font-size: 15px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.admin-textarea {
+  resize: vertical;
+  min-height: 70px;
+}
+
+.admin-inline-error {
+  margin: 0;
+  color: var(--error-fg);
+  background: var(--error-bg);
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+
+.admin-success {
+  margin: 0;
+  color: var(--fg);
+  background: var(--chip-bg);
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  font-size: 14px;
+}

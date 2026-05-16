@@ -183,26 +183,30 @@ on invoke (S3 event or 2h cron):
 
 ## 5. Web app
 
-A read-only dashboard. No buttons, no forms, no writes — anything that would cost money or change state is intentionally absent. A leaked URL grants nothing beyond visibility into work that's already public.
+A mostly-read-only dashboard. The public tabs have no buttons or forms — anything that would cost money or change state goes through the operator-only Admin tab, gated by a password. A leaked URL still grants nothing beyond visibility.
 
 ### Tabs
 
-- **Queue.** Ordered list of pending items: kind, prompt (or image thumbnail), submitted-at, source.
-- **History.** Grid of every published frame, newest first. Each tile shows the dithered BMP (browsers render 8-bit indexed BMP natively) + the prompt + timestamp. Click for full size and metadata.
-- **Device.** Latest battery voltage and percent, Wi-Fi RSSI, last-seen timestamp, current `image_sha256` the device confirmed drawing, firmware version.
+- **Queue.** Ordered list of pending items: kind, prompt (or image thumbnail), submitted-at, source. Public.
+- **History.** Grid of every published frame, newest first. Each tile shows the dithered BMP (browsers render 8-bit indexed BMP natively) + the prompt + timestamp. Click for full size and metadata. Public.
+- **Device.** Latest battery voltage and percent, Wi-Fi RSSI, last-seen timestamp, current `image_sha256` the device confirmed drawing, firmware version. Public.
+- **Admin.** Password-gated form for submitting text prompts and image uploads to the queue. Sets an HMAC-signed `einkgen_admin` session cookie (HttpOnly, Secure, SameSite=Lax, Path=`/admin`, 90-day expiry) on successful login. Public viewers see only the password prompt.
 
 ### Stack
 
 - **Frontend.** React + Vite SPA, no UI library, vanilla CSS. Built to static assets, hosted from S3 + CloudFront under the `web/` prefix.
-- **Backend.** A single `einkgen-read-api` Lambda fronted by an API Gateway HTTP API (CORS pinned to the CloudFront origin + localhost), serving:
+- **Read backend.** A single `einkgen-read-api` Lambda fronted by an API Gateway HTTP API (CORS pinned to the CloudFront origin + localhost), serving:
   - `GET /queue`   → lists `queue/*.json` from S3.
   - `GET /history` → lists recent `history/<id>/manifest.json` entries.
   - `GET /status`  → latest `status/device-<id>.json`.
-- The Lambda has IAM read-only access to the bucket. No writes, no API key for the API, no path that calls OpenAI.
-
-### Adding write access later
-
-When we add a text/email channel, that channel becomes its **own** Lambda with its **own** auth (shared secret, signed sender, whatever fits). The read-api Lambda stays read-only. The web app stays write-free unless we explicitly decide otherwise — at which point we add a token flow then.
+  The Lambda has IAM read-only access to the bucket. No writes, no API key for the API, no path that calls OpenAI.
+- **Write backend.** A separate `einkgen-admin-api` Lambda fronted by its own HTTP API and **routed through the same CloudFront distribution** at `/admin/*` (so the session cookie is same-origin and SameSite=Lax just works). Routes:
+  - `POST /admin/login`        — body `{"password": ...}`; on success returns 204 + a `Set-Cookie` HMAC-signed session token.
+  - `GET  /admin/me`           — 200 if cookie is valid, 401 otherwise.
+  - `POST /admin/logout`       — clears the cookie.
+  - `POST /admin/queue/prompt` — `{"prompt": "..."}` → enqueues a text prompt (`source="admin"`).
+  - `POST /admin/queue/image`  — `{"filename":..., "image_b64":..., "prompt":?}` → stages the image to `queue/staged/` and enqueues. Base64 keeps the Lambda multipart-free; API Gateway's 10 MB payload cap yields ~8 MB of decoded image.
+  The Lambda has read access to `einkgen/admin_password` + `einkgen/admin_cookie_signing_key` and write access to `queue/*`. Reserved concurrency = 5.
 
 ---
 
@@ -324,7 +328,7 @@ Browsers render 8-bit indexed BMP natively, so the History tab can `<img>` `proc
 
 ## 9. AWS infrastructure
 
-Three Lambdas, one bucket, one CloudFront distribution, two API Gateway HTTP APIs. No SQS, no SNS, no DynamoDB.
+Four Lambdas (five with inbound email), one bucket, one CloudFront distribution, three API Gateway HTTP APIs. No SQS, no SNS, no DynamoDB.
 
 - **S3 bucket `einkgen-<env>`** — single store: `current/`, `queue/`, `history/`, `status/`, `firmware/`, `web/`.
 - **CloudFront distribution** — fronts the bucket via an Origin Access Control. `current/*`, `history/<id>/processed.bmp`, and `web/*` are publicly readable; the rest of the bucket is locked down at the bucket-policy level and accessed only via Lambdas with IAM.
@@ -335,8 +339,9 @@ Three Lambdas, one bucket, one CloudFront distribution, two API Gateway HTTP API
   Reserved concurrency = **1** (serial drain). Async retries = **0** on both the function and the EventBridge target (caps OpenAI cost-amplification from transient failures). Reads `OPENAI_API_KEY` from Secrets Manager. ARM64 Graviton2, 1024 MB. Pillow is bundled into the function zip (no third-party Lambda layer).
 - **Lambda `einkgen-read-api`** — public API Gateway HTTP API with CORS pinned to the CloudFront origin (plus `http://localhost:5173` for dev). Read-only IAM on the bucket. Routes: `GET /queue`, `GET /history`, `GET /status`. The web app's only backend.
 - **Lambda `einkgen-device-status`** — API Gateway HTTP API with **no CORS** (firmware-only). Accepts `POST /` with an `X-Device-Token` header (validated against Secrets Manager). Writes `status/device-<id>.json`. Write-only IAM on the `status/` prefix. Reserved concurrency caps blast radius from abuse.
+- **Lambda `einkgen-admin-api`** — API Gateway HTTP API attached to CloudFront as the `/admin/*` behavior (same origin as the SPA, so the session cookie can be SameSite=Lax). All routes live under `/admin/`. Validates the operator password against `einkgen/admin_password` on login (constant-time compare), mints an HMAC-SHA256-signed session cookie keyed by `einkgen/admin_cookie_signing_key`, and writes to `queue/*` (text prompt) or `queue/staged/*` (image) on success. Reserved concurrency = 5.
 - **Lambda `einkgen-inbound-email`** *(opt-in, gated by the `einkgenInboundDomain` CDK context flag)*. S3 ObjectCreated on `inbound/*` triggers it; SES's receipt rule for the configured domain writes raw RFC 5322 messages there. Parses MIME, checks SES `Authentication-Results` for SPF/DKIM pass aligned with the From: domain, validates the sender against `config/email_allowlist.txt`, stages any image attachment under `queue/staged/`, calls `queue.enqueue(source="email")`, and sends a confirmation or rejection reply via SES. Scoped IAM: read+delete `inbound/*`, read `config/email_allowlist.txt`, write `queue/*`, `ses:SendEmail` constrained to the configured reply-From address. Reserved concurrency = 5.
-- **Secrets Manager** — `einkgen/openai_api_key`, `einkgen/device_status_token`. Lambdas get scoped read.
+- **Secrets Manager** — `einkgen/openai_api_key`, `einkgen/device_status_token`, `einkgen/admin_password`, `einkgen/admin_cookie_signing_key` (auto-generated by CDK on first deploy). Lambdas get scoped read.
 - **EventBridge rule** — `rate(2 hours)` → `einkgen-generator` (cron entrypoint).
 - **CloudWatch Logs** — 14-day retention per Lambda. One `MetricFilter` per Lambda emits an `ErrorLogCount-{name}` metric on the literal token `ERROR`. A CloudWatch dashboard (`einkgen-<env>`) plots invocations, errors, and duration p50/p99.
 
@@ -349,7 +354,7 @@ Everything is in a single CDK stack under [infra/](infra/).
 | Where | What |
 | --- | --- |
 | `.env` (gitignored) | Local CLI: `OPENAI_API_KEY`, `AWS_PROFILE`, `EINKGEN_BUCKET`, `EINKGEN_CDN_BASE` |
-| AWS Secrets Manager | `einkgen/openai_api_key`, `einkgen/device_status_token` — Lambdas only |
+| AWS Secrets Manager | `einkgen/openai_api_key`, `einkgen/device_status_token`, `einkgen/admin_password`, `einkgen/admin_cookie_signing_key` — Lambdas only |
 | `firmware/inkplate10/secrets.h` (gitignored) | Wi-Fi SSID/password and `DEVICE_STATUS_TOKEN` baked into the sketch |
 | `config.toml` | Non-secret defaults: model (`gpt-image-2`), model size (`1536x1024`), fit mode (`cover`), dither (`atkinson`), auto-gen cron (`2h`), device poll interval (`1h`, override via CDK context `einkgenPollIntervalSeconds`), next-check buffer (`5m`) |
 
@@ -380,6 +385,7 @@ Tabling each component against "what can go wrong":
 | --- | --- | --- |
 | **Public CloudFront `current/*` and `history/*processed.bmp`** | Anyone reads the latest dithered image. | Acceptable — that's the device's read path. The CloudFront viewer-request function blocks `history/*original.png` from public reads. |
 | **Read-api API Gateway endpoint** | Anyone reads queue/history/status metadata (incl. prompts). | Acceptable — public by design. CORS pinned to the CloudFront origin + `localhost:5173` to discourage casual abuse, but content is not sensitive. Lambda has read-only IAM so abuse can't escalate. |
+| **Admin-api `/admin/*` endpoints (login + write)** | Attacker brute-forces the password and triggers unbounded OpenAI spend. | Single shared password in Secrets Manager (constant-time compare). Cookie is HMAC-signed with a CDK-auto-generated 64-byte key; tampering or forging requires the key. Reserved concurrency = 5 on the admin Lambda + reserved concurrency = 1 on the generator caps any successful attack at the cron rate. No daily $ cap yet (deferred — see [TODOS.md](TODOS.md)). Rotate the cookie key via `put-secret-value` to invalidate every outstanding session. |
 | **Device-status API Gateway endpoint** | Attacker spams POSTs and fills `status/` with junk, racking up minor S3 costs. | `X-Device-Token` header validated against Secrets Manager via `hmac.compare_digest`. Wrong token → 401, no S3 write. `device_id` regex + 4 KB body cap + body-field allowlist. Lambda reserved concurrency caps blast radius. |
 | **Generator Lambda** | If someone could invoke it with their own input, they could burn OpenAI spend. | No external trigger — only S3 ObjectCreated on `queue/` (`.json` suffix only — staged images can't trigger it) and EventBridge. The only way to write to `queue/` is operator IAM. Async retries = 0 so a transient failure can't multiply OpenAI cost. |
 | **CLI / operator IAM** | Leaked AWS credentials → attacker spams the queue → unbounded OpenAI spend. | Scoped IAM policy (writes limited to `queue/`); standard credential hygiene (no committed `.env`); rotate on suspicion. No daily $ cap yet (deferred — see [TODOS.md](TODOS.md)). |
