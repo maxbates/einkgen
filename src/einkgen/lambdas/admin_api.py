@@ -8,6 +8,9 @@ Routes (all under the ``/admin`` prefix, behind a single HTTP API):
 - ``POST /admin/queue/prompt``  → ``{"prompt": "..."}``    → 200 ``{"id":...}``
 - ``POST /admin/queue/image``   → ``{"filename":..., "image_b64":..., "prompt":?}``
                                                             → 200 ``{"id":...}``
+- ``GET  /admin/prompts``       → 200 ``{"prompts": [...], "is_default": bool}``
+- ``PUT  /admin/prompts``       → ``{"prompts": [...]}``    → 200 ``{"prompts": [...]}``
+- ``POST /admin/prompts/reset`` → 200 ``{"prompts": [...]}`` (writes DEFAULTS)
 
 Auth
 ----
@@ -50,7 +53,7 @@ from typing import Any
 
 import boto3
 
-from einkgen.core import admin_cookie, queue
+from einkgen.core import admin_cookie, prompt_library, queue
 from einkgen.core import s3 as s3mod
 
 log = logging.getLogger(__name__)
@@ -68,6 +71,7 @@ SECRET_CACHE_TTL_SECONDS = 300
 MAX_REQUEST_BYTES = 10 * 1024 * 1024  # 10 MB JSON body cap
 MAX_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB decoded image
 MAX_PROMPT_CHARS = 4000               # plenty for any sane restyle hint
+MAX_LIBRARY_ENTRIES = 200             # ample headroom over the seed 10
 
 # Same charset cap the CLI uses when staging a local image.
 SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -362,6 +366,80 @@ def _handle_queue_image(event: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# /admin/prompts — operator-editable random-pick library
+# ---------------------------------------------------------------------------
+
+
+def _handle_prompts_get(event: dict[str, Any]) -> dict[str, Any]:
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    current = list(prompt_library.load(force=True))
+    return _response(
+        200,
+        {
+            "prompts": current,
+            "is_default": tuple(current) == prompt_library.DEFAULTS,
+            "defaults": list(prompt_library.DEFAULTS),
+        },
+    )
+
+
+def _handle_prompts_put(event: dict[str, Any]) -> dict[str, Any]:
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    body, err = _parse_json_body(event)
+    if err is not None:
+        return err
+    assert body is not None
+    raw = body.get("prompts")
+    if not isinstance(raw, list):
+        return _response(
+            400, {"error": "bad_request", "detail": "prompts must be a list"}
+        )
+    if len(raw) > MAX_LIBRARY_ENTRIES:
+        return _response(
+            413,
+            {
+                "error": "payload_too_large",
+                "detail": f"too many entries (max {MAX_LIBRARY_ENTRIES})",
+            },
+        )
+    cleaned: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            return _response(
+                400, {"error": "bad_request", "detail": "prompts must be strings"}
+            )
+        if len(entry) > MAX_PROMPT_CHARS:
+            return _response(
+                413,
+                {"error": "payload_too_large", "detail": "individual prompt too long"},
+            )
+        cleaned.append(entry)
+    try:
+        persisted = prompt_library.write(cleaned)
+    except ValueError as exc:
+        return _response(400, {"error": "bad_request", "detail": str(exc)})
+    return _response(
+        200,
+        {
+            "prompts": list(persisted),
+            "is_default": persisted == prompt_library.DEFAULTS,
+        },
+    )
+
+
+def _handle_prompts_reset(event: dict[str, Any]) -> dict[str, Any]:
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    persisted = prompt_library.reset_to_defaults()
+    return _response(
+        200,
+        {"prompts": list(persisted), "is_default": True},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -372,6 +450,9 @@ _ROUTES: dict[tuple[str, str], Any] = {
     ("POST", "/admin/logout"): None,  # filled in below — no event needed
     ("POST", "/admin/queue/prompt"): _handle_queue_prompt,
     ("POST", "/admin/queue/image"): _handle_queue_image,
+    ("GET", "/admin/prompts"): _handle_prompts_get,
+    ("PUT", "/admin/prompts"): _handle_prompts_put,
+    ("POST", "/admin/prompts/reset"): _handle_prompts_reset,
 }
 
 

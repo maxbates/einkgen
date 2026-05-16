@@ -12,6 +12,7 @@ from typing import Sequence
 from einkgen.cli import allowlist as allowlist_cmd
 from einkgen.cli import history as history_cmd
 from einkgen.cli import local as local_cli
+from einkgen.cli import prompts as prompts_cmd
 from einkgen.cli import queue as queue_cli
 from einkgen.cli import status as status_cmd
 
@@ -27,6 +28,7 @@ def _build_parser() -> argparse.ArgumentParser:
     history_cmd.register(sub)
     queue_cli.register(sub)
     allowlist_cmd.register(sub)
+    prompts_cmd.register(sub)
 
     local_parser = sub.add_parser(
         "local",

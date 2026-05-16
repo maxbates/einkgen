@@ -188,6 +188,48 @@ export async function adminEnqueuePrompt(prompt: string): Promise<AdminEnqueueRe
   return (await res.json()) as AdminEnqueueResponse;
 }
 
+export interface AdminPromptsResponse {
+  prompts: string[];
+  is_default: boolean;
+  defaults?: string[];
+}
+
+export async function adminGetPrompts(
+  signal?: AbortSignal,
+): Promise<AdminPromptsResponse> {
+  const res = await adminFetch("/admin/prompts", { method: "GET", signal });
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (!res.ok) {
+    throw new Error(`GET /admin/prompts failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as AdminPromptsResponse;
+}
+
+export async function adminPutPrompts(
+  prompts: string[],
+): Promise<AdminPromptsResponse> {
+  const res = await adminFetch("/admin/prompts", {
+    method: "PUT",
+    body: JSON.stringify({ prompts }),
+  });
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Save failed: ${res.status} ${detail}`);
+  }
+  return (await res.json()) as AdminPromptsResponse;
+}
+
+export async function adminResetPrompts(): Promise<AdminPromptsResponse> {
+  const res = await adminFetch("/admin/prompts/reset", { method: "POST" });
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Reset failed: ${res.status} ${detail}`);
+  }
+  return (await res.json()) as AdminPromptsResponse;
+}
+
 export async function adminEnqueueImage(
   file: File,
   prompt: string | null,

@@ -556,3 +556,9 @@ button {
   border-radius: var(--radius);
   font-size: 14px;
 }
+
+.admin-prompt-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
