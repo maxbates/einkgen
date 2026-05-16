@@ -29,6 +29,39 @@ This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
   `BASE_PROMPT` updated to drop the "centered safe area" concept — the whole
   canvas is now visible. See ARCHITECTURE §6.
 
+## [0.4.0.4] - 2026-05-16
+
+### Fixed
+- **`einkgen.link` and inbound email restored after a flag-less
+  redeploy wiped them.** The `0.4.0.3` redeploy (the CDK 2.254.0 bump
+  to retire `nodejs20.x`) was run without `-c einkgenSiteDomain=...`
+  / `-c einkgenInboundDomain=...`, so CloudFormation deleted the ACM
+  cert, both CloudFront aliases, the apex A + AAAA Route 53 records,
+  the MX record, all three DKIM CNAMEs, the SES domain identity, the
+  inbound-email Lambda, and the catch-all receipt rule. The site
+  stopped resolving (no A record) and email stopped being received.
+  This is the **second** time this footgun has fired. Re-issued the
+  cert, re-added the alias + A/AAAA / MX / DKIM records, re-created
+  the inbound Lambda + SES identity + rule set, and re-activated the
+  rule set. The orphan `einkgen-inbound` rule set left behind by the
+  failed delete (it was active so SES refused to remove it) was
+  deactivated and deleted before the redeploy so the new rule set
+  could take its name without collision.
+
+### Changed
+- **`einkgenSiteDomain` and `einkgenInboundDomain` are now defaults
+  in [infra/cdk.json](infra/cdk.json) `context`**, both set to
+  `einkgen.link`. From this commit forward, a bare
+  `cdk deploy` (no `-c` flags) preserves the live domain wiring on
+  every redeploy. CLI overrides still win, so forkers can pass
+  `-c einkgenSiteDomain=mydomain.com` (or `-c einkgenSiteDomain=`
+  to disable). The old "remember the right flags" workflow was the
+  proximate cause of the outage above; baking the defaults into
+  `cdk.json` makes the safe path the default path. Added a Hard
+  rule in [CLAUDE.md](CLAUDE.md) and an "Important" callout in
+  [QUICKSTART.md §3.10](QUICKSTART.md#310-optional-custom-domain-for-the-site)
+  explaining the trap and why the defaults are sticky.
+
 ## [0.4.0.3] - 2026-05-16
 
 ### Changed
