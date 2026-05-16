@@ -76,16 +76,34 @@ Arduino IDE 2.x.
 Treat the token like an API key — if it leaks, rotate it in AWS Secrets Manager
 and reflash the device.
 
-## Notes / TODOs left for hardware-test pass
+## Flash-time gotchas
+
+These bit the first hardware-test pass; full walkthrough lives in
+[QUICKSTART §5](../../QUICKSTART.md#part-5--flash-the-inkplate-10).
+
+- **"No serial data received"** during upload — close any open Serial
+  Monitor (`lsof /dev/cu.usbserial-…` to confirm nothing's holding the
+  port), or hold the **WAKE** button on the back of the Inkplate while
+  "Connecting……" prints.
+- **"Invalid head of packet (0xE0)"** after stub loads — set *Tools →
+  Upload Speed* to **115200**. The default 921600 baud-rate jump corrupts
+  packets on many USB-C cables and hubs.
+- **ArduinoJson** installs from the default Arduino registry via *Sketch
+  → Include Library → Manage Libraries…*. No extra board-manager URL is
+  needed for it — that URL is only for the Dasduino board package.
+
+## Notes / TODOs
 
 - HTTPS cert verification is currently disabled (`setInsecure()`). For v0 the
   threat model in [ARCHITECTURE §12](../../ARCHITECTURE.md#12-security--threat-model)
   accepts this — the worst case is denial of service. Pin the CloudFront cert
   before shipping outside a home LAN.
-- `display.image.draw(...)` is the Inkplate-Arduino-library API. The original
+- BMP-from-buffer rendering goes through
+  `display.image.drawBitmapFromBuffer(buf, x, y, dither, invert)` — confirmed
+  on hardware. The `image` accessor lives on the Inkplate10 board driver and
+  reads width/height from the BMP header itself (no length arg). The original
   spec called `display.drawImage(...)`; that name isn't exposed by the current
-  library, so the sketch uses `image.draw()`. Confirm on hardware that the
-  call returns true and the panel renders.
+  Soldered `InkplateLibrary`.
 - `display.readBattery()` returns a `double`; we cast to `float` and linearly
   map 3.3→4.2 V to 0→100 %. Calibrate against the actual cell once it's wired.
 - Partition scheme name may vary between Dasduino board package versions.

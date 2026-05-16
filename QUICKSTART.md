@@ -606,6 +606,103 @@ EINKGEN_CF_DISTRIBUTION_ID=…    # optional; enables CF invalidation on publish
 
 ---
 
+## Part 5 — Flash the Inkplate 10
+
+Do this when the physical device arrives. Hardware list, toolchain setup,
+and serial-log reference live in
+[firmware/inkplate10/README.md](firmware/inkplate10/README.md); this
+section is the connective tissue between the deployed stack and the
+sketch.
+
+### 5.1. Toolchain (one-time)
+
+Follow [firmware/inkplate10/README.md](firmware/inkplate10/README.md)
+sections *Toolchain* and *Build & flash* steps 1–4. Two non-obvious bits:
+
+- **ArduinoJson installs from the default registry** via *Sketch →
+  Include Library → Manage Libraries…* (the **Library** Manager, not the
+  **Boards** Manager). No extra board-package URL is needed for it —
+  only the Dasduino board URL.
+- **Partition scheme must be "Huge APP (3MB No OTA / 1MB SPIFFS)"** or
+  the HTTPS + JSON + image-decode payload won't fit.
+
+### 5.2. Collect the four `secrets.h` values
+
+```sh
+READ_API_URL=$(jq -r '.["EinkgenStack-dev"].ReadApiUrl'      infra/cdk-outputs.json)
+DEVICE_URL=$(jq   -r '.["EinkgenStack-dev"].DeviceStatusUrl' infra/cdk-outputs.json)
+CDN_DOMAIN=$(jq   -r '.["EinkgenStack-dev"].CdnDomain'       infra/cdk-outputs.json)
+
+echo "MANIFEST_URL      = https://${CDN_DOMAIN}/current/manifest.json"
+echo "DEVICE_STATUS_URL = ${DEVICE_URL}/"
+```
+
+Fetch the device-status token straight into the clipboard so it never
+hits the terminal scrollback:
+
+```sh
+AWS_PROFILE=einkgen aws secretsmanager get-secret-value \
+  --secret-id einkgen/device_status_token \
+  --region us-east-1 \
+  --query SecretString --output text | pbcopy
+```
+
+Then:
+
+```sh
+cp firmware/inkplate10/secrets.h.example firmware/inkplate10/secrets.h
+```
+
+Edit `firmware/inkplate10/secrets.h` and fill in `WIFI_SSID`,
+`WIFI_PASS` (2.4 GHz only — ESP32 doesn't do 5 GHz), `MANIFEST_URL`,
+`DEVICE_STATUS_URL`, and paste `DEVICE_STATUS_TOKEN` from the
+clipboard. `secrets.h` is gitignored.
+
+### 5.3. Flash
+
+1. Open [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino).
+2. *Tools → Board → Dasduino Boards →* **Soldered Inkplate10**.
+3. *Tools → Partition Scheme →* **Huge APP (3MB No OTA / 1MB SPIFFS)**.
+4. *Tools → Port →* the `/dev/cu.usbserial-…` that appears on plug-in.
+5. *Tools → Upload Speed →* **115200**. (Higher speeds corrupt the
+   flash-verify packet on many USB-C cables / hubs — see §5.4.)
+6. Click **Upload**. ~30–60 s at 115200.
+7. *Tools → Serial Monitor* at **115200 baud** — the boot log in
+   [firmware/inkplate10/README.md](firmware/inkplate10/README.md#what-you-should-see-on-serial)
+   should print, ending with `[sleep] deep-sleeping for … seconds`.
+
+Open `https://<CdnDomain>/` and the **Device** tab should flip from
+"Device has not reported yet." to live battery / RSSI within a few
+seconds of the `[status] OK HTTP 200` line.
+
+### 5.4. Flash-time gotchas (in order of frequency)
+
+- **`A fatal error occurred: Failed to connect to ESP32: No serial data
+  received.`** Two causes:
+  - Serial Monitor (or any other tool) is holding the port. Close it,
+    or `lsof /dev/cu.usbserial-110` and kill what's there.
+  - Auto-reset didn't trigger. Hold the **WAKE button** on the back of
+    the Inkplate for ~2 s right as "`Connecting......`" starts
+    printing. If that fails, hold it down from before clicking Upload
+    until "Writing at 0x..." appears.
+- **`A fatal error occurred: Unable to verify flash chip connection
+  (Invalid head of packet ...).`** The 921600-baud bump after the stub
+  loads is too aggressive for your cable. Lower *Tools → Upload Speed*
+  to **115200** and re-upload. If 115200 is painful, 230400 / 460800 are
+  worth trying once the stack is stable. (If *Upload Speed* isn't
+  exposed under Soldered Inkplate10, temporarily switch the board to
+  **ESP32 Dev Module**, upload, then switch back before your next
+  compile.)
+- **Library Manager pane empty** — index is still downloading. Wait
+  30 s; if it stays empty, *File → Preferences → Network* and clear any
+  bad proxy, then restart the IDE. Last resort: download the
+  ArduinoJson v7.x release ZIP and *Sketch → Include Library → Add .ZIP
+  Library…*.
+- **5 GHz Wi-Fi** — ESP32 only does 2.4 GHz. If you have a separate
+  5 GHz-only SSID, don't use it.
+
+---
+
 ## Troubleshooting
 
 - **`Cannot find module 'aws-cdk-lib'`** — run `npm install` inside
