@@ -210,7 +210,8 @@ A mostly-read-only dashboard. The public tabs have no buttons or forms — anyth
   - `POST /admin/logout`       — clears the cookie.
   - `POST /admin/queue/prompt` — `{"prompt": "..."}` → enqueues a text prompt (`source="admin"`).
   - `POST /admin/queue/image`  — `{"filename":..., "image_b64":..., "prompt":?}` → stages the image to `queue/staged/` and enqueues. Base64 keeps the Lambda multipart-free; API Gateway's 10 MB payload cap yields ~8 MB of decoded image.
-  The Lambda has read access to `einkgen/admin_password` + `einkgen/admin_cookie_signing_key` and write access to `queue/*`. Reserved concurrency = 5.
+  - `POST /admin/show`         — `{"history_id": "..."}` → re-publishes an existing history frame as current. Reads `history/<id>/manifest.json`, then writes a new `current/manifest.json` whose `image_url` points back at `history/<id>/processed.bmp` and whose `image_sha256`/`image_bytes` carry over. No byte copy, no regenerate, no queue item, no OpenAI call. The next normal generation overwrites the manifest back to `current/image.bmp`. The manifest's `source.replayed_from` field carries the history id so the SPA can mark the "now showing" tile unambiguously even when two history items share a SHA-256.
+  The Lambda has read access to `einkgen/admin_password` + `einkgen/admin_cookie_signing_key`, write access to `queue/*`, read access to `history/*`, read+write access to `current/*`, and `cloudfront:CreateInvalidation` on the distribution. Reserved concurrency = 5.
 
 ---
 
@@ -397,6 +398,6 @@ Tabling each component against "what can go wrong":
 | **Web app (React)** | XSS via untrusted prompt strings rendered in the Queue/History tabs. | React escapes by default. We never `dangerouslySetInnerHTML`. Prompt sources are all trusted (CLI operator + built-in library). |
 | **Firmware credentials** | Inkplate is stolen → Wi-Fi password + `DEVICE_STATUS_TOKEN` are readable from flash. | Acceptable. Token only writes status; Wi-Fi password is the same risk as any home IoT device. |
 | **Supply chain** | Compromised Python or npm dep runs in Lambda or CLI. | Pin versions in `pyproject.toml` / `package-lock.json`; minimize deps (Pillow, boto3, openai, ULID; React, Vite). |
-| **Manifest tampering** | Attacker writes a malicious `manifest.json` pointing the device at a payload. | Only the generator Lambda has write access to `current/*`. Bucket policy denies anonymous and operator writes to `current/*`. Device only fetches over HTTPS from CloudFront. |
+| **Manifest tampering** | Attacker writes a malicious `manifest.json` pointing the device at a payload. | Only the generator and admin-api Lambdas have write access to `current/*` (admin-api needs it for `POST /admin/show`, which is operator-trusted and inside the same blast-radius cap as the rest of the admin routes). Bucket policy denies anonymous and operator writes to `current/*`. Device only fetches over HTTPS from CloudFront. |
 
 Things we are explicitly **not** defending against in v1: cost-runaway from a compromised AWS account (deferred → cost cap is a future ask, [TODOS.md](TODOS.md)), DDoS of the public endpoints (AWS absorbs it; only S3 read amplification, which is bounded), and physical attacks on the Inkplate.
