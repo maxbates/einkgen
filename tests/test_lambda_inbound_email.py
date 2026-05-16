@@ -135,6 +135,10 @@ def test_allowlisted_prompt_email_enqueues_prompt(s3_bucket, env, reset_state, s
     assert kwargs["Source"] == "einkgen@submit.example.com"
     assert kwargs["Destination"]["ToAddresses"] == ["me@example.com"]
     assert "queued" in kwargs["Message"]["Subject"]["Data"].lower()
+    # The captured prompt is echoed back so the sender can verify it.
+    body = kwargs["Message"]["Body"]["Text"]["Data"]
+    assert "Mountains at sunset" in body
+    assert "Prompt:" in body
 
 
 def test_allowlisted_image_email_enqueues_image(s3_bucket, env, reset_state, ses_mock):
@@ -154,6 +158,10 @@ def test_allowlisted_image_email_enqueues_image(s3_bucket, env, reset_state, ses
     # Staged image bytes match.
     staged = s3_bucket.get_object(Bucket=TEST_BUCKET, Key=item.image_s3_key)
     assert staged["Body"].read() == b"\xff\xd8\xffjpeg-bytes"
+
+    # No prompt was captured → confirmation must not include a Prompt: section.
+    kwargs = ses_mock.send_email.call_args.kwargs
+    assert "Prompt:" not in kwargs["Message"]["Body"]["Text"]["Data"]
 
 
 def test_allowlisted_image_plus_prompt_keeps_both(s3_bucket, env, reset_state, ses_mock):

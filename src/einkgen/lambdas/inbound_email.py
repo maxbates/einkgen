@@ -127,7 +127,7 @@ def _process_one(key: str) -> None:
         "inbound_email: enqueued %s (kind=%s, sender=%s)",
         item.id, item.kind, sender,
     )
-    _send_confirmation(sender, item.id, item.kind)
+    _send_confirmation(sender, item.id, item.kind, item.prompt)
     _safe_delete(key)
 
 
@@ -216,7 +216,9 @@ def _send_rejection(to: str | None) -> None:
     _send_email(reply_from, to, "einkgen: submission not accepted", body)
 
 
-def _send_confirmation(to: str, item_id: str, kind: str) -> None:
+def _send_confirmation(
+    to: str, item_id: str, kind: str, prompt: str | None
+) -> None:
     reply_from = _reply_from()
     if not reply_from:
         return
@@ -224,7 +226,15 @@ def _send_confirmation(to: str, item_id: str, kind: str) -> None:
         "prompt": "Queued your prompt for generation.",
         "image": "Queued your image for processing.",
     }.get(kind, f"Queued ({kind}).")
-    body = f"{detail}\n\nQueue id: {item_id}\n\n— einkgen\n"
+    sections = [detail]
+    if prompt:
+        # Echo the cleaned prompt back so the sender can verify what we
+        # captured after subject/body merging and signature stripping.
+        quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
+        sections.append(f"Prompt:\n{quoted}")
+    sections.append(f"Queue id: {item_id}")
+    sections.append("— einkgen")
+    body = "\n\n".join(sections) + "\n"
     _send_email(reply_from, to, "einkgen: submission queued", body)
 
 
