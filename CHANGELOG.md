@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.0.1] - 2026-05-16
+
+### Fixed
+- **Cron self-heals stranded queue items.** When the 2 h auto-gen cron fires
+  and the queue is non-empty, the generator Lambda now processes exactly
+  one head item (was: no-op). Previously, an item enqueued while the
+  generator was failing (e.g. a deploy briefly stuck with the
+  synth-only-stub asset, an OpenAI outage longer than Lambda's async-retry
+  budget, or a per-item pipeline bug) could be stranded forever — S3
+  ObjectCreated retries exhaust within 6 h and the cron's old branch
+  never touched a non-empty queue. One-per-tick keeps OpenAI cost bounded
+  even with a real backlog; steady-state, the S3 event has already drained
+  the queue by the time cron fires.
+
 ## [0.4.0.0] - 2026-05-15
 
 The SPA grows an **Admin tab**. The operator can now submit text prompts and

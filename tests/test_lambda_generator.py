@@ -53,21 +53,28 @@ def test_cron_empty_queue_enqueues_random(monkeypatch, s3_bucket):
     assert process_calls == []
 
 
-def test_cron_nonempty_queue_is_noop(monkeypatch, s3_bucket):
-    process_calls: list = []
+def test_cron_nonempty_queue_processes_head(monkeypatch, s3_bucket):
+    """Cron self-heals items stranded by a prior failed S3 delivery.
+
+    Steady-state, the S3 event has already drained these. The cron only
+    sees a non-empty queue when something went wrong upstream — process
+    exactly one item per tick.
+    """
+    process_calls: list[QueueItem] = []
     monkeypatch.setattr(
         "einkgen.lambdas.generator.pipeline.process_item",
         lambda item: process_calls.append(item),
     )
 
-    existing = q.enqueue("prompt", prompt="already pending")
+    head = q.enqueue("prompt", prompt="stranded head")
+    tail = q.enqueue("prompt", prompt="stranded tail")
 
     generator.handler(CRON_EVENT, None)
 
-    # Same one item, nothing new.
-    items = q.list()
-    assert [it.id for it in items] == [existing.id]
-    assert process_calls == []
+    # Exactly one — the head — got processed and popped.
+    assert [c.id for c in process_calls] == [head.id]
+    remaining = q.list()
+    assert [it.id for it in remaining] == [tail.id]
 
 
 def test_s3_event_pops_and_processes(monkeypatch, s3_bucket):

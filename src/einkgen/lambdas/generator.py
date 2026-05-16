@@ -3,9 +3,13 @@
 Two triggers:
 
 - **EventBridge ``rate(2 hours)``** (cron) — if the queue is empty, enqueue
-  a ``random`` item. The S3 ObjectCreated event from that put re-invokes
-  this Lambda and the same code path drains it. If the queue is non-empty,
-  it's a no-op: pending items have priority.
+  a ``random`` item (the resulting S3 ObjectCreated event re-invokes this
+  Lambda and the same code path drains it). If the queue is non-empty,
+  process **exactly one** item — the head — to self-heal items stranded by
+  a prior failed S3 delivery (e.g. an init-time crash that exhausted
+  Lambda's async-retry budget). One item per tick keeps OpenAI cost bounded
+  to the cron cadence even if the queue has a backlog; the normal S3-event
+  path drains in real time and is what handles steady-state.
 - **S3 ObjectCreated** on ``queue/`` — drain pending items.
 
 Reserved concurrency = 1 keeps drains serial. We drain to empty per
@@ -47,7 +51,16 @@ def handler(event: dict[str, Any], context: Any = None) -> None:
     if _is_cron_event(event):
         if queue.empty():
             queue.enqueue("random", source="cron")
-        # Either way: cron itself never processes; the S3 event does.
+            # The resulting S3 event drains the new item.
+            return
+        # Non-empty queue: process exactly one head item. This is the
+        # backstop for items stranded by a failed S3 delivery; under normal
+        # operation the S3 event has already drained them.
+        item = queue.peek_head()
+        if item is None:
+            return
+        pipeline.process_item(item)
+        queue.finalize(item)
         return
 
     # Any non-cron invocation: drain until empty (or until the safety cap).
