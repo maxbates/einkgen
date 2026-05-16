@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.0.6] - 2026-05-16
+
+### Changed
+- **Uploaded images now scale-fill the panel instead of scale-fitting with
+  white bars.** `_fit_to_canvas` (the upload path, `is_generated=False`)
+  scales by the *larger* of the two per-axis ratios (CSS `background-size:
+  cover` semantics) and center-crops the overflow on the long axis. A
+  4032×3024 phone photo now lands as 1200×900 → center-crop 37 px off the top
+  and bottom → 1200×825 filling the whole panel, instead of being scaled to
+  1100×825 with ~50 px white bars on either side.
+- **Generator now asks `gpt-image-2` for 1200×832 instead of 1536×1024.**
+  `gpt-image-2` accepts arbitrary sizes when both edges are multiples of 16
+  (`gpt-image-1` only offered fixed sizes — 1024×1024, 1536×1024, 1024×1536 —
+  which is why we were stuck on 1536×1024 even after upgrading the model).
+  1200×832 is the smallest valid size that exceeds the 1200×825 panel in both
+  dimensions, so the `is_generated=True` center-crop now just trims a 7-pixel
+  sliver off the height instead of cropping 17 % off the height *and* 336 px
+  off the width — the model used to spend 37 % of its output on pixels we
+  threw away. Net effects: meaningfully cheaper per call (image-output tokens
+  scale with pixel count), faster generation, and the model composes for the
+  panel's aspect (1.4423 vs 1.4545, 0.84 % off) instead of for 3:2.
+  `BASE_PROMPT` updated to drop the "centered safe area" concept — the whole
+  canvas is now visible. See ARCHITECTURE §6.
+
 ## [0.4.0.5] - 2026-05-16
 
 ### Added

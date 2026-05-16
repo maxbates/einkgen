@@ -1,8 +1,13 @@
 """OpenAI `gpt-image-2` adapter, base prompt, and the random prompt library.
 
-The pipeline always requests 1536x1024 from the model — the closest size to
-the panel's 1200x825 (1.5:1 vs ~1.4545:1) — so the downstream `convert()` step
-can center-crop with zero resampling. See ARCHITECTURE §6.
+The pipeline always requests 1200x832 from the model — the smallest size
+`gpt-image-2` accepts (both dims must be multiples of 16) that still covers
+the panel's 1200x825 in both dimensions — so the downstream `convert()` step
+center-crops 7 px off the height with zero resampling. Aspect 1.4423 vs panel
+1.4545 is 0.84% off; the model effectively composes for the panel. This used
+to be 1536x1024 (`gpt-image-1`'s only landscape option, inherited when we
+upgraded to `gpt-image-2`) which generated 1,572,864 px and threw 37% away.
+See ARCHITECTURE §6.
 
 We deliberately call the model at ``quality="medium"`` rather than ``"high"``.
 The dither step erases sub-pixel detail anyway, so the extra cost of high
@@ -18,11 +23,11 @@ from typing import Any
 
 # Prepended to every user/random subject string. Lifted verbatim from ARCHITECTURE §6.
 BASE_PROMPT = (
-    "Compose a single image at 1536×1024 (landscape, 3:2). It will be center-cropped\n"
-    "to 1200×825 (a 9.7\" e-paper panel) and dithered to 8 grayscale levels. Keep\n"
-    "important content within the centered safe area (1200×825). Use high-contrast\n"
-    "tones, bold shapes, and clean edges — subtle gradients and fine textures will\n"
-    "not survive dithering. No text or watermarks. Subject:"
+    "Compose a single image at 1200×832 (landscape, ~1.44:1). It will be displayed on\n"
+    "a 1200×825 e-paper panel (a 7-pixel sliver trimmed off the height) and dithered\n"
+    "to 8 grayscale levels. The whole canvas is visible — there is no safe-area inset.\n"
+    "Use high-contrast tones, bold shapes, and clean edges — subtle gradients and fine\n"
+    "textures will not survive dithering. No text or watermarks. Subject:"
 )
 
 # The 10 entries from ARCHITECTURE §6. Each is a complete prompt string (the
@@ -44,7 +49,7 @@ PROMPT_LIBRARY: list[str] = [
 assert len(PROMPT_LIBRARY) == 10, "PROMPT_LIBRARY must have exactly 10 entries"
 
 MODEL = "gpt-image-2"
-IMAGE_SIZE = "1536x1024"
+IMAGE_SIZE = "1200x832"
 QUALITY = "medium"
 
 

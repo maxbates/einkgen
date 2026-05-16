@@ -58,7 +58,7 @@ def test_generate_prepends_base_prompt_and_calls_with_correct_size():
     # Called with the right size, model, and prepended BASE_PROMPT.
     client.images.generate.assert_called_once()
     call_kwargs = client.images.generate.call_args.kwargs
-    assert call_kwargs["size"] == IMAGE_SIZE == "1536x1024"
+    assert call_kwargs["size"] == IMAGE_SIZE == "1200x832"
     assert call_kwargs["model"] == "gpt-image-2"
     assert call_kwargs["quality"] == "medium"
     assert call_kwargs["n"] == 1

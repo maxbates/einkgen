@@ -2,11 +2,12 @@
 
 Takes an arbitrary source image and produces an 8-bit indexed BMP at the
 panel's native resolution (1200x825) with an 8-entry evenly-spaced grayscale
-palette. Per ARCHITECTURE §6, generated images come in at 1536x1024 composed
-with a centered 1200x825 safe area, so they center-crop with zero resampling
-(`is_generated=True`). Uploads are arbitrary size and may be much larger than
-the panel, so the default path scale-fits + pads with white — center-cropping a
-4032x3024 phone photo would otherwise discard most of the image.
+palette. Per ARCHITECTURE §6, generated images come in at 1200x832 (the
+smallest gpt-image-2 size that covers the panel and has both dims divisible by
+16), so they center-crop a 7-pixel sliver off the height with zero resampling
+(`is_generated=True`). Uploads are arbitrary size and any aspect, so the
+default path scale-fills the panel (CSS `background-size: cover` semantics) and
+center-crops the overflow — fills the screen, loses a little on the long axis.
 """
 
 from __future__ import annotations
@@ -39,11 +40,12 @@ def _fit_to_canvas(img: Image.Image, *, is_generated: bool = False) -> Image.Ima
     """Get the image to exactly PANEL_WIDTH x PANEL_HEIGHT.
 
     - is_generated=True and both dims >= panel: center-crop (pixel-exact, no
-      resampling). Used for `gpt-image-2` 1536x1024 outputs which are composed
-      with a centered 1200x825 safe area.
-    - Otherwise: scale-fit (preserve aspect) + white pad to the canvas. The
-      default — uploads can be arbitrary size, and scale-fit preserves the
-      whole image instead of discarding most of it.
+      resampling). Used for `gpt-image-2` 1200x832 outputs (just 7 px taller
+      than the panel) — composed for the whole canvas, no safe-area inset.
+    - Otherwise: scale-fill (preserve aspect, cover the canvas) then center-crop
+      the overflow on the long axis. Uploads are arbitrary size and aspect, and
+      filling the panel beats leaving white bars — the user accepts losing a
+      little off the long axis.
     """
     w, h = img.size
     if is_generated and w >= PANEL_WIDTH and h >= PANEL_HEIGHT:
@@ -51,26 +53,16 @@ def _fit_to_canvas(img: Image.Image, *, is_generated: bool = False) -> Image.Ima
         top = (h - PANEL_HEIGHT) // 2
         return img.crop((left, top, left + PANEL_WIDTH, top + PANEL_HEIGHT))
 
-    # Scale to fit (downsample or upsample) while preserving aspect ratio, then
-    # pad with white to fill the canvas.
-    scale = min(PANEL_WIDTH / w, PANEL_HEIGHT / h)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
+    # Scale so the image covers the panel on both axes (max of per-axis scale),
+    # then center-crop the overflow on the long axis. Upsamples small sources.
+    scale = max(PANEL_WIDTH / w, PANEL_HEIGHT / h)
+    new_w = max(PANEL_WIDTH, int(round(w * scale)))
+    new_h = max(PANEL_HEIGHT, int(round(h * scale)))
     scaled = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # Pad with white. Use mode "L" if input was grayscale-ish; we'll convert
-    # to L further down anyway, so RGB white is fine here.
-    canvas_mode = "RGB" if scaled.mode not in ("L", "LA", "P") else "L"
-    fill = (255, 255, 255) if canvas_mode == "RGB" else 255
-    canvas = Image.new(canvas_mode, (PANEL_WIDTH, PANEL_HEIGHT), fill)
-    paste_x = (PANEL_WIDTH - new_w) // 2
-    paste_y = (PANEL_HEIGHT - new_h) // 2
-    # Use the scaled image's alpha as a mask if present.
-    if scaled.mode in ("RGBA", "LA"):
-        canvas.paste(scaled.convert(canvas_mode), (paste_x, paste_y), scaled.split()[-1])
-    else:
-        canvas.paste(scaled.convert(canvas_mode), (paste_x, paste_y))
-    return canvas
+    left = (new_w - PANEL_WIDTH) // 2
+    top = (new_h - PANEL_HEIGHT) // 2
+    return scaled.crop((left, top, left + PANEL_WIDTH, top + PANEL_HEIGHT))
 
 
 def _to_grayscale(img: Image.Image) -> Image.Image:
@@ -247,9 +239,10 @@ def convert(
     8-entry grayscale palette.
 
     Set ``is_generated=True`` when the source came from `gpt-image-2` at
-    1536x1024 (composed with a centered 1200x825 safe area) so the fit step can
-    center-crop with zero resampling. The default — scale-fit + white pad — is
-    correct for arbitrary uploads.
+    1200x832 (composed for the whole canvas, no safe-area inset) so the fit
+    step can center-crop the 7-pixel height overflow with zero resampling. The
+    default — scale-fill + center-crop — is correct for arbitrary uploads: the
+    panel fills, a little off the long axis is sacrificed.
     """
     img = _load(src_image)
     fitted = _fit_to_canvas(img, is_generated=is_generated)

@@ -168,8 +168,9 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
   confirm with the human before deploying a diff that deletes any
   `CdnSite*`, `InboundEmail*`, or `*Route53*` resource.
 - **OpenAI cost.** Each generator invocation calls `gpt-image-2` at
-  1536×1024 with `quality="medium"` — cheaper than the previous
-  `gpt-image-1` high-quality default, but still real per-call $. Don't
+  1200×832 with `quality="medium"` — cheaper than the original 1536×1024
+  `gpt-image-1` high-quality default by a wide margin (37 % fewer pixels
+  on top of the medium-quality drop), but still real per-call $. Don't
   enqueue more than 1–2 test prompts per session. Don't trigger cron
   faster than its 2 h rate. Don't "fix" things by running the generator
   in a loop. There is **no daily $ cap yet** (see [TODOS.md](TODOS.md)).
