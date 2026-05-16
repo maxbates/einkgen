@@ -98,7 +98,7 @@ einkgen local preview  "<text>"               # generate + convert, save preview
 
 - An EventBridge rule fires a thin entry in the generator Lambda **every 2 hours**.
 - If the queue is empty, the Lambda enqueues a `{kind: "random"}` item; that drop triggers the normal S3-event path and the same Lambda invocation drains it.
-- If the queue is non-empty, cron is a no-op — pending items aren't pre-empted.
+- If the queue is non-empty, the Lambda processes **exactly one** head item per tick. This is a backstop for items stranded by a prior failed S3 delivery (e.g. a Lambda init crash that exhausted async retries). Steady-state, the S3 event has already drained them and the queue is empty by the time cron fires; one-per-tick keeps OpenAI cost bounded even if a real backlog builds up.
 
 ### Web app (read-only)
 
@@ -159,9 +159,13 @@ Field constraints by kind:
 
 ```
 on invoke (S3 event or 2h cron):
-  if cron and queue.empty():
-    queue.enqueue({kind: "random"})    # falls through to the S3-event path
-    return
+  if cron:
+    if queue.empty():
+      queue.enqueue({kind: "random"})  # falls through to the S3-event path
+      return
+    item = queue.pop_head()            # one item per tick, self-heal backstop
+    if item is None: return
+    process(item); return
   item = queue.pop_head()              # atomic via reserved concurrency = 1
   if item is None: return
   match item.kind:
