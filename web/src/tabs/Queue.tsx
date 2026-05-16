@@ -7,28 +7,55 @@ type State =
   | { status: "ok"; items: QueueItem[] }
   | { status: "error"; message: string };
 
+const POLL_MS = 10000;
+
 export function Queue() {
   const [state, setState] = useState<State>({ status: "loading" });
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
-    const ctrl = new AbortController();
-    setState({ status: "loading" });
-    getQueue(ctrl.signal)
-      .then((res) => setState({ status: "ok", items: res.items }))
-      .catch((err) => {
-        if (ctrl.signal.aborted) return;
-        setState({
-          status: "error",
-          message: err instanceof Error ? err.message : String(err),
-        });
-      });
-    return () => ctrl.abort();
+    let cancelled = false;
+    let ctrl: AbortController | null = null;
+
+    async function tick() {
+      ctrl?.abort();
+      ctrl = new AbortController();
+      setRefreshing(true);
+      try {
+        const res = await getQueue(ctrl.signal);
+        if (cancelled) return;
+        setState({ status: "ok", items: res.items });
+      } catch (err) {
+        if (cancelled || ctrl?.signal.aborted) return;
+        // Keep showing the last good list if we have one — a transient
+        // poll failure shouldn't wipe what the operator was reading.
+        setState((prev) =>
+          prev.status === "ok"
+            ? prev
+            : {
+                status: "error",
+                message: err instanceof Error ? err.message : String(err),
+              },
+        );
+      } finally {
+        if (!cancelled) setRefreshing(false);
+      }
+    }
+
+    tick();
+    const id = window.setInterval(tick, POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      ctrl?.abort();
+    };
   }, []);
 
   if (state.status === "loading") {
     return (
       <>
         <SubmissionHint />
+        <QueueHeader refreshing={refreshing} />
         <p className="muted">Loading queue…</p>
       </>
     );
@@ -37,6 +64,7 @@ export function Queue() {
     return (
       <>
         <SubmissionHint />
+        <QueueHeader refreshing={refreshing} />
         <div className="error">
           <p>Could not load queue.</p>
           <p className="muted small">{state.message}</p>
@@ -47,6 +75,7 @@ export function Queue() {
   return (
     <>
       <SubmissionHint />
+      <QueueHeader refreshing={refreshing} />
       {state.items.length === 0 ? (
         <p className="muted">Queue is empty.</p>
       ) : (
@@ -57,6 +86,20 @@ export function Queue() {
         </ol>
       )}
     </>
+  );
+}
+
+function QueueHeader({ refreshing }: { refreshing: boolean }) {
+  return (
+    <div className="queue-status" aria-live="polite">
+      <span
+        className={`spinner ${refreshing ? "" : "spinner-idle"}`}
+        aria-hidden="true"
+      />
+      <span className="muted small">
+        {refreshing ? "Refreshing…" : `Auto-refresh every ${POLL_MS / 1000}s`}
+      </span>
+    </div>
   );
 }
 

@@ -209,6 +209,30 @@ button {
   color: var(--fg);
 }
 
+.queue-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  min-height: 16px;
+}
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--fg);
+  animation: spinner-rot 0.8s linear infinite;
+}
+.spinner-idle {
+  animation: none;
+  opacity: 0.35;
+}
+@keyframes spinner-rot {
+  to { transform: rotate(360deg); }
+}
+
 .queue-list {
   list-style: none;
   padding: 0;
