@@ -5,6 +5,21 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.4.3] - 2026-05-15
+
+### Changed
+- **Test-suite bootstrap now uses `uv` instead of bare pip.** `CLAUDE.md`
+  documents `uv run --extra dev pytest` as the canonical way to run the
+  test suite, and warns away from `pip install -e ".[dev]"` + bare
+  `pytest`. Without this, every fresh worktree (and every Claude Code
+  session that landed in one) re-downloaded Pillow + moto + boto3 etc.
+  from PyPI because the system pip cache was empty and the system Python
+  on macOS dev boxes doesn't satisfy `requires-python >=3.11`. `uv`
+  auto-syncs `.venv/` from `pyproject.toml` and reuses a global wheel
+  cache, so a fresh worktree boots in seconds after the first install.
+  Lockfile (`uv.lock`) is now committed so the resolved dependency set
+  is reproducible across worktrees and machines.
+
 ## [0.3.4.2] - 2026-05-15
 
 ### Fixed

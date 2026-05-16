@@ -121,6 +121,7 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "What is this?" / "How does X work?" | [ARCHITECTURE.md](ARCHITECTURE.md) §1–§12 — pick the matching section |
 | "Add a CLI subcommand" | `src/einkgen/cli/<name>.py` + register in `cli/__init__.py` |
 | "Add a route on the read-api" | `src/einkgen/lambdas/read_api.py` + a test; CORS is pinned at API Gateway in `infra/lib/lambdas.ts` |
+| "Run the tests" / "Run the test suite" | `uv run --extra dev pytest` from the repo (or worktree) root. `uv` syncs `.venv/` from `pyproject.toml` on demand and reuses a global wheel cache (`~/.cache/uv/`), so first run in a fresh worktree is one-time-slow and every subsequent run is seconds. Do **not** bootstrap with bare `pip install -e ".[dev]"` + `pytest` — pip has no shared cache and the system Python on macOS dev boxes often doesn't satisfy `requires-python >=3.11`, so it re-downloads everything every time and may pick the wrong interpreter. |
 | "Set up email submission" / "Enable inbound email" | [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel). Pick path A (register a new domain via `infra/scripts/register-domain.sh`) or B (delegate an existing domain to Route 53). Then `cdk deploy -c einkgenInboundDomain=<domain>`. DKIM CNAMEs + MX record + receipt-rule activation are still manual steps after the deploy. |
 | "Add an allowed email sender" | `einkgen allowlist add <email>` (writes `config/email_allowlist.txt`). Comparison is case-insensitive. Never hardcode addresses in committed CDK — first-deploy seeding goes through the `einkgenAllowlistSeed` context flag instead. |
 | "Pick me a cheap domain" | `aws route53domains list-prices --region us-east-1` + filter where reg ≤ $10 *and* renew ≤ $10. Then `check-domain-availability` per candidate. Always surface renewal price — domain registration is a recurring cost. Don't autonomously register; have the human `cp register-domain.example.sh register-domain.sh` and fill in their PII (the live `.sh` is gitignored). |
@@ -183,7 +184,11 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
   operational mode (e.g. a future `RUNBOOK.md` for incident response).
 - **Tests use moto.** Don't add tests that hit real AWS. The pytest
   fixtures in `tests/conftest.py` stub the boto3 layer; follow the
-  existing pattern.
+  existing pattern. Run them with `uv run --extra dev pytest` — `uv`
+  auto-syncs `.venv/` from `pyproject.toml` and reuses a global wheel
+  cache, so fresh worktrees install once and run in seconds thereafter.
+  Don't reach for system Python directly; `requires-python >=3.11` is
+  not guaranteed there and `moto` won't be installed.
 - **Versioning.** 4-digit `MAJOR.MINOR.PATCH.MICRO` in `VERSION`. Every
   user-visible change goes in `CHANGELOG.md` under `[Added] / [Changed]
   / [Fixed] / [Security]`.
