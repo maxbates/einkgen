@@ -4,13 +4,25 @@ The sketch that runs on the device. On every wake it joins Wi-Fi, fetches
 `manifest.json`, redraws the panel if the image hash changed (or if the
 battery has crossed the low-battery threshold, so the overlay can appear or
 disappear), reports status to the device-status Lambda, then deep-sleeps
-until the next check.
+until the next check — or until you press the **WAKE** button to force a
+refresh.
 
 When reported charge drops below `BATT_LOW_THRESHOLD_PCT` (default 10%) a
 small iPhone-status-bar-style battery badge with the percentage is composited
 into the top-right corner of the rendered frame — meant as a "go charge this"
 cue, sized so its presence reads from across the room and the number reads up
 close. The image pipeline is unchanged, the overlay only exists on the panel.
+
+## On-demand refresh
+
+The WAKE button on the back of the Inkplate is wired as an EXT0 deep-sleep
+wake source. Pressing it while the device is asleep ends the sleep early
+and triggers a fresh `setup()` run, which always polls the manifest and
+redraws if the hash changed. Use it when you've just enqueued a prompt and
+don't want to wait out the rest of the current sleep window.
+
+Serial output prints the wake cause on every boot (`wake-button` / `timer`
+/ `reset-or-power-on`) so it's clear which path you're on.
 
 See [ARCHITECTURE.md](../../ARCHITECTURE.md) for the system overview
 (§1 device, §7 manifest, §11 firmware spec).
@@ -60,6 +72,7 @@ Arduino IDE 2.x.
 
 ```
 [boot] einkgen firmware 0.1.0
+[boot] wake cause: timer
 [wifi] connecting to SSID "..."
 [wifi] connected, IP=..., RSSI=-58
 [ntp] synced, epoch=...
