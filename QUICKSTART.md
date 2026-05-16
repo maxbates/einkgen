@@ -106,6 +106,10 @@ you use) inside the repo root:
 > - Environment name: `dev`
 > - OpenAI API key: (I'll paste when you ask)
 > - Device-status token: (I'll paste when you ask)
+> - Device poll interval: `default` (1 hour) — or pass an integer of
+>   seconds (e.g. `900` for 15 min) and the agent will edit
+>   `firmware/inkplate10/inkplate10.ino` + add the
+>   `-c einkgenPollIntervalSeconds=...` flag in §3.12.
 >
 > Run each command, summarise the output, and only proceed if the previous
 > step succeeded. Don't print secret values back at me — show length or a
@@ -257,8 +261,9 @@ curl -sS -I "https://${CDN_DOMAIN}/" | head -3
 
 Open `https://<CdnDomain>/` in a browser. You should see the three-tab
 SPA with `Queue is empty.`, `Device has not reported yet.`, and an empty
-History grid. Within 2 hours the EventBridge cron will tick and you'll
-see your first frame appear.
+History grid. Within 2 hours the auto-generation cron will tick and you'll
+see your first frame appear (the cron runs every 2 h regardless of the
+device-poll cadence — see §3.12 for poll-cadence tuning).
 
 ### 3.9. (Optional) Enqueue a test prompt now
 
@@ -509,6 +514,61 @@ EINKGEN_BUCKET=einkgen-dev AWS_PROFILE=einkgen einkgen allowlist rm  other@examp
 Senders not on the list receive a friendly rejection email that never
 names other allowed addresses; nothing is enqueued. Email matching is
 case-insensitive on both sides.
+
+### 3.12. (Optional) Device poll interval
+
+The Inkplate firmware wakes from deep sleep, fetches `current/manifest.json`,
+redraws only if `image_sha256` changed, posts a status heartbeat, and
+sleeps again. **Default cadence: 1 hour.** Each wake costs ~0.3 mAh
+(Wi-Fi join + HTTPS round-trip dominates; the redraw itself is cheap),
+giving roughly a year of battery on the stock 3000 mAh cell.
+
+Rough trade-off table:
+
+| Cadence | Wakes/day | Approx. battery life | Use when |
+| --- | --- | --- | --- |
+| 3 hours | 8 | ~2 years | Mostly-static dashboard, you'll redraw manually anyway |
+| **1 hour (default)** | 24 | ~1 year | Daily art + occasional manual prompt |
+| 15 minutes | 96 | ~3 months | Hourly-ish news / weather feed |
+| 3 minutes | 480 | ~3 weeks | Near-realtime; consider a USB-powered install |
+
+Battery math is approximate — see `firmware/inkplate10/inkplate10.ino`
+for the constants and Wi-Fi/HTTPS cost assumptions.
+
+To change the cadence, both the **server** (so the manifest's hint
+matches) and the **firmware** (so the sleep cap matches) need updating
+in lockstep. Pick your interval in seconds, then:
+
+1. **Edit `firmware/inkplate10/inkplate10.ino`:** set both
+   `SLEEP_MAX_SECONDS` and `SLEEP_FALLBACK_SECONDS` to your interval.
+   Reflash the device. The constants live near the top of the file
+   under `// ----- Tunables -----`.
+
+2. **Pass the matching CDK context flag on the next deploy:**
+
+   ```sh
+   ( cd infra && AWS_PROFILE=einkgen AWS_REGION=us-east-1 npx cdk deploy \
+       --outputs-file cdk-outputs.json \
+       --require-approval never \
+       -c env=dev -c includeWebAssets=true \
+       -c einkgenPollIntervalSeconds=900 )   # 15 minutes
+   ```
+
+   This sets `EINKGEN_POLL_INTERVAL_SECONDS` on the generator + inbound-email
+   Lambdas. New manifests written after the deploy embed `next_check_after`
+   at the new cadence. Manifests already on S3 keep their old hint; the next
+   publish refreshes it.
+
+If the firmware constant is **smaller** than the server's hint, the
+device silently clamps and polls more often than the server expects —
+harmless, just shorter battery life than intended.
+
+If the firmware constant is **larger** than the server's hint, the
+firmware obeys the hint up to its own cap; this is the safe direction.
+
+> **Agent note:** when a human asks to change the poll cadence, edit
+> both places in the same change and bump `CHANGELOG.md`. Don't change
+> only one — the asymmetry above is confusing in operation.
 
 ---
 

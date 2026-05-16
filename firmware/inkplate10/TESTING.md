@@ -160,6 +160,9 @@ Restore real token before continuing.
   ESP32 didn't actually deep-sleep.
 - **Hash persistence across hard reset.** Pull power for 10 s, replug.
   NVS should survive: log shows `stored="<previous>"` not `stored=""`.
-- **Long-soak run.** Leave the device on a charged battery overnight with
-  cron publishing every 2 h. Next morning, check `status/` log for ~12
-  fresh entries.
+- **Long-soak run.** Leave the device on a charged battery overnight.
+  With the default 1 h device-poll cadence and the 2 h auto-gen cron,
+  expect ~12 status entries in `status/` by morning (one per wake), of
+  which ~6 record a hash change (one per cron tick). If you've raised
+  `SLEEP_MAX_SECONDS` / `einkgenPollIntervalSeconds`, scale both counts
+  proportionally.

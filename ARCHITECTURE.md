@@ -274,7 +274,9 @@ Used when cron fires with an empty queue. Ten entries: a mix of constrained styl
 }
 ```
 
-`next_check_after = (time of next scheduled cron tick) + 5 min buffer`. The buffer covers the seconds-to-a-minute it takes to call the model and publish, so a device that exactly hits the hint won't arrive before the next image has landed. Firmware caps actual sleep at **1 hour**, so even if the server says "no need to check for 4 hours" the device still polls every hour. That cap is what bounds worst-case latency between an enqueue and the panel actually updating.
+`next_check_after = (time of next device-poll tick) + 5 min buffer`. The buffer covers the seconds-to-a-minute it takes to call the model and publish, so a device that exactly hits the hint won't arrive before the next image has landed. Firmware caps actual sleep at **1 hour by default** (`SLEEP_MAX_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino)), so even if the server says "no need to check for 4 hours" the device still polls every hour. That cap is what bounds worst-case latency between an enqueue and the panel actually updating.
+
+The device-poll tick is independent of the **EventBridge auto-gen cron** (still 2 h — §3). To change device polling, set `EINKGEN_POLL_INTERVAL_SECONDS` on the generator + inbound-email Lambdas (CDK context flag: `-c einkgenPollIntervalSeconds=...`) **and** edit the firmware's `SLEEP_MAX_SECONDS` so the sleep cap matches. Server-only changes get clamped; firmware-only changes are honoured but the manifest hint is wrong. See [QUICKSTART §3.12](QUICKSTART.md#312-optional-device-poll-interval) for the trade-off table.
 
 ---
 
@@ -349,7 +351,7 @@ Everything is in a single CDK stack under [infra/](infra/).
 | `.env` (gitignored) | Local CLI: `OPENAI_API_KEY`, `AWS_PROFILE`, `EINKGEN_BUCKET`, `EINKGEN_CDN_BASE` |
 | AWS Secrets Manager | `einkgen/openai_api_key`, `einkgen/device_status_token` — Lambdas only |
 | `firmware/inkplate10/secrets.h` (gitignored) | Wi-Fi SSID/password and `DEVICE_STATUS_TOKEN` baked into the sketch |
-| `config.toml` | Non-secret defaults: model (`gpt-image-1`), model size (`1536x1024`), fit mode (`cover`), dither (`atkinson`), tick interval (`2h`), device sleep cap (`1h`), next-check buffer (`5m`) |
+| `config.toml` | Non-secret defaults: model (`gpt-image-1`), model size (`1536x1024`), fit mode (`cover`), dither (`atkinson`), auto-gen cron (`2h`), device poll interval (`1h`, override via CDK context `einkgenPollIntervalSeconds`), next-check buffer (`5m`) |
 
 Config resolution order: CLI flag → env var → `config.toml` → built-in defaults.
 
