@@ -381,6 +381,18 @@ The two flags can't currently point at *different* domains in the same
 stack (assertion in [infra/lib/einkgen-stack.ts](infra/lib/einkgen-stack.ts)
 will fail synth) — split that out when you actually need it.
 
+> **Important — keep these flags sticky across redeploys.** Once you've
+> deployed with `einkgenSiteDomain` / `einkgenInboundDomain` set, **edit
+> [infra/cdk.json](infra/cdk.json) `context`** to make them defaults.
+> The canonical `einkgen.link` deploy already does this. Every future
+> `cdk deploy` (without the `-c` flags) will then preserve the domain
+> wiring. If you instead rely on remembering the `-c` flags, a single
+> deploy without them will **delete the ACM cert, the CloudFront
+> aliases, the Route 53 A/AAAA records, the MX, all three DKIM CNAMEs,
+> the SES rule set, and the inbound Lambda** — the site stops
+> resolving and email stops being received. This footgun has bitten
+> twice. Bake the flags into `cdk.json`.
+
 ### 3.11. (Optional) Email submission channel
 
 The base stack is read-only-public; submitting requires the operator's

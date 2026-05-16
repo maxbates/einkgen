@@ -124,13 +124,14 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | User says... | Do this |
 | --- | --- |
 | "Deploy this" / "Set this up" / "Get it running" | [QUICKSTART.md](QUICKSTART.md), follow Part 3 |
+| "Redeploy" / "Push the latest code" / "Roll out my change" | `( cd infra && AWS_PROFILE=einkgen npx cdk deploy --require-approval never )`. The canonical site + inbound domain (`einkgen.link`) live in [infra/cdk.json](infra/cdk.json) `context` so a **bare** `cdk deploy` keeps all live wiring intact. Add `-c includeWebAssets=true` only when you just rebuilt `web/dist` and want CloudFront to pick it up. **Do not** override `einkgenSiteDomain` / `einkgenInboundDomain` to empty unless you actually want to tear down the custom domain or inbound email — see Hard rule on context-stripping below. |
 | "What is this?" / "How does X work?" | [ARCHITECTURE.md](ARCHITECTURE.md) §1–§12 — pick the matching section |
 | "Add a CLI subcommand" | `src/einkgen/cli/<name>.py` + register in `cli/__init__.py` |
 | "Add a route on the read-api" | `src/einkgen/lambdas/read_api.py` + a test; CORS is pinned at API Gateway in `infra/lib/lambdas.ts` |
 | "Add a route on the admin-api" / "Add a thing the operator can do from the SPA" | `src/einkgen/lambdas/admin_api.py` (cookie-gated dispatcher) + a test in `tests/test_lambda_admin_api.py` + a typed client in `web/src/api.ts` + UI in `web/src/tabs/Admin.tsx`. No CORS — admin endpoints are same-origin via the CloudFront `/admin/*` behavior wired in `infra/lib/einkgen-stack.ts`. |
 | "Rotate the admin password" | `aws secretsmanager put-secret-value --secret-id einkgen/admin_password --secret-string '<new>'` (takes effect ≤5 min on warm Lambdas). To log every existing browser session out as well, rotate `einkgen/admin_cookie_signing_key` the same way. |
 | "Run the tests" / "Run the test suite" | `uv run --extra dev pytest` from the repo (or worktree) root. `uv` syncs `.venv/` from `pyproject.toml` on demand and reuses a global wheel cache (`~/.cache/uv/`), so first run in a fresh worktree is one-time-slow and every subsequent run is seconds. Do **not** bootstrap with bare `pip install -e ".[dev]"` + `pytest` — pip has no shared cache and the system Python on macOS dev boxes often doesn't satisfy `requires-python >=3.11`, so it re-downloads everything every time and may pick the wrong interpreter. |
-| "Set up email submission" / "Enable inbound email" | [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel). Pick path A (register a new domain via `infra/scripts/register-domain.sh`) or B (delegate an existing domain to Route 53). Then `cdk deploy -c einkgenInboundDomain=<domain>`. DKIM CNAMEs + MX record + receipt-rule activation are still manual steps after the deploy. |
+| "Set up email submission" / "Enable inbound email" | Already on for the canonical `einkgen.link` deploy via [infra/cdk.json](infra/cdk.json) context. For a **new** domain, follow [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel) — pick path A (register a new domain via `infra/scripts/register-domain.sh`) or B (delegate an existing domain to Route 53), edit `einkgenInboundDomain` in `infra/cdk.json` to that domain (or pass `-c einkgenInboundDomain=<domain>` to override), redeploy. DKIM CNAMEs + MX are auto-created by CDK; **receipt-rule activation is one-time-manual** (`aws ses set-active-receipt-rule-set --rule-set-name einkgen-inbound`) — survives all future redeploys. |
 | "Add an allowed email sender" | `einkgen allowlist add <email>` (writes `config/email_allowlist.txt`). Comparison is case-insensitive. Never hardcode addresses in committed CDK — first-deploy seeding goes through the `einkgenAllowlistSeed` context flag instead. |
 | "Pick me a cheap domain" | `aws route53domains list-prices --region us-east-1` + filter where reg ≤ $10 *and* renew ≤ $10. Then `check-domain-availability` per candidate. Always surface renewal price — domain registration is a recurring cost. Don't autonomously register; have the human `cp register-domain.example.sh register-domain.sh` and fill in their PII (the live `.sh` is gitignored). |
 | "Change the dither algorithm" | `src/einkgen/core/convert.py`. **Read [TODOS.md](TODOS.md) §"Profile and replace pure-Python error-diffusion dither" first** — the current pure-Python Atkinson is the considered choice. Don't replace without re-measuring. |
@@ -144,6 +145,24 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 
 ## Hard rules
 
+- **Don't strip `cdk.json` context on deploy.** `einkgenSiteDomain` and
+  `einkgenInboundDomain` live in [infra/cdk.json](infra/cdk.json)
+  `context` so a bare `cdk deploy` preserves the live wiring. Passing
+  `-c einkgenSiteDomain=` (empty string), `-c einkgenInboundDomain=`,
+  or removing those keys from `cdk.json` tells CDK to **delete**: the
+  ACM cert, both CloudFront aliases, the apex A + AAAA Route 53
+  records, the MX record, all three DKIM CNAMEs, the inbound-email
+  Lambda, the SES domain identity, and the SES receipt rule set. The
+  site stops resolving (no A record) and inbound email stops being
+  received. This has happened **twice** — both times because someone
+  redeployed without remembering the override flags, before they were
+  baked into `cdk.json`. The fix is now permanent at the file level;
+  don't undo it. To intentionally tear those resources down (e.g.
+  retiring the domain), do it as a deliberate two-step: edit
+  `cdk.json` to remove the keys, commit the change with a clear
+  message, then deploy. Always run `cdk diff` first and **always**
+  confirm with the human before deploying a diff that deletes any
+  `CdnSite*`, `InboundEmail*`, or `*Route53*` resource.
 - **OpenAI cost.** Each generator invocation calls `gpt-image-2` at
   1536×1024 with `quality="medium"` — cheaper than the previous
   `gpt-image-1` high-quality default, but still real per-call $. Don't
