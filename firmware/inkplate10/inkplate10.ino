@@ -29,6 +29,19 @@
 static const uint32_t WIFI_TIMEOUT_MS       = 20000;
 static const uint32_t HTTP_TIMEOUT_MS       = 20000;
 static const uint32_t NTP_TIMEOUT_MS        = 10000;
+
+// Device-poll cadence. Each wake costs ~0.3 mAh (Wi-Fi join + HTTPS GET +
+// status POST); 1 h matches the server's default ``next_check_after`` and
+// gives roughly a year of battery on a 3000 mAh cell. To poll faster
+// (shorter latency, shorter battery life) lower SLEEP_MAX_SECONDS *and*
+// pass ``-c einkgenPollIntervalSeconds=<n>`` to ``cdk deploy`` so the
+// manifest's hint matches; otherwise the firmware silently clamps to
+// SLEEP_MAX_SECONDS. SLEEP_MIN_SECONDS is a defensive floor against a
+// server bug emitting an instant-wake hint.
+//   3 minutes:  SLEEP_MAX_SECONDS = 180  / einkgenPollIntervalSeconds=180
+//   15 minutes: SLEEP_MAX_SECONDS = 900  / einkgenPollIntervalSeconds=900
+//   1 hour:     SLEEP_MAX_SECONDS = 3600 / einkgenPollIntervalSeconds unset
+//   3 hours:    SLEEP_MAX_SECONDS = 10800/ einkgenPollIntervalSeconds=10800
 static const uint64_t SLEEP_MIN_SECONDS     = 60;
 static const uint64_t SLEEP_MAX_SECONDS     = 3600;
 static const uint64_t SLEEP_FALLBACK_SECONDS = 3600;

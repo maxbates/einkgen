@@ -8,7 +8,7 @@ matching CloudFront paths.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import boto3
@@ -37,6 +37,26 @@ def _cdn_base() -> str:
 
 
 _MISSING_OBJECT_CODES = {"NoSuchKey", "NotFound", "404"}
+
+
+def _poll_interval() -> timedelta:
+    """Read ``EINKGEN_POLL_INTERVAL_SECONDS`` and return a timedelta.
+
+    Falls back to ``compute_next_check_after``'s own default (1 hour) when
+    the env var is unset, empty, or unparseable. We intentionally silently
+    fall back on bad values: a malformed override shouldn't take the
+    publish path down.
+    """
+    raw = os.environ.get("EINKGEN_POLL_INTERVAL_SECONDS", "").strip()
+    if not raw:
+        return timedelta(hours=1)
+    try:
+        seconds = int(raw)
+    except ValueError:
+        return timedelta(hours=1)
+    if seconds <= 0:
+        return timedelta(hours=1)
+    return timedelta(seconds=seconds)
 
 
 def _read_previous_version() -> int:
@@ -109,7 +129,7 @@ def publish(
         source_with_prompt["prompt"] = prompt
 
     previous_version = _read_previous_version()
-    next_check = compute_next_check_after(now)
+    next_check = compute_next_check_after(now, tick_interval=_poll_interval())
 
     manifest = Manifest(
         version=previous_version + 1,

@@ -24,6 +24,13 @@ export interface EinkgenLambdasProps {
   cdnBase: string;
   openaiApiKey: secretsmanager.Secret;
   deviceStatusToken: secretsmanager.Secret;
+  /**
+   * Override the manifest's ``next_check_after`` cadence (seconds).
+   * Set on the generator Lambda as ``EINKGEN_POLL_INTERVAL_SECONDS``;
+   * ``publish.py`` reads it. Unset → built-in default (1 hour). Must be
+   * kept in sync with firmware ``SLEEP_MAX_SECONDS`` if raised above 3600.
+   */
+  pollIntervalSeconds?: string;
 }
 
 // Root of the Python package on disk. Bundling stages a copy under
@@ -159,6 +166,9 @@ export class EinkgenLambdas extends Construct {
         EINKGEN_CDN_BASE: props.cdnBase,
         EINKGEN_CF_DISTRIBUTION_ID: props.distribution.distributionId,
         OPENAI_API_KEY_SECRET_NAME: props.openaiApiKey.secretName,
+        ...(props.pollIntervalSeconds
+          ? { EINKGEN_POLL_INTERVAL_SECONDS: props.pollIntervalSeconds }
+          : {}),
       },
     });
     // ARCHITECTURE §8 access table — generator writes current/ and history/,
