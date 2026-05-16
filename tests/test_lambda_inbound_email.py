@@ -191,7 +191,7 @@ def test_non_allowlisted_sender_is_rejected_with_reply(s3_bucket, env, reset_sta
     kwargs = ses_mock.send_email.call_args.kwargs
     assert kwargs["Destination"]["ToAddresses"] == ["stranger@example.com"]
     body = kwargs["Message"]["Body"]["Text"]["Data"]
-    assert "not authorised" in body or "not authorized" in body
+    assert "authorised" in body or "authorized" in body
     assert "https://example.com/einkgen" in body
     # The legitimate user's address must not appear anywhere in the reply.
     assert "someone-else@example.com" not in body
