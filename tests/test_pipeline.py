@@ -40,8 +40,8 @@ def _install_fake_modules(monkeypatch: pytest.MonkeyPatch):
         calls["random_prompt"].append(True)
         return "Geometric composition: overlapping circles"
 
-    def fake_convert(png):
-        calls["convert"].append(png)
+    def fake_convert(png, *, is_generated=False):
+        calls["convert"].append({"png": png, "is_generated": is_generated})
         return b"fake-bmp-" + png[:16]
 
     def fake_publish(processed_bmp, *, source, item_id, original, prompt):
@@ -88,7 +88,10 @@ def test_prompt_kind_runs_generate_convert_publish(monkeypatch):
 
     assert calls["generate"] == ["a foggy cliff at dawn"]
     assert len(calls["convert"]) == 1
-    assert calls["convert"][0].startswith(b"fake-png-bytes-for-")
+    assert calls["convert"][0]["png"].startswith(b"fake-png-bytes-for-")
+    # Prompt-kind output is a `gpt-image-2` 1536x1024 with a centered safe
+    # area — convert can center-crop without resampling.
+    assert calls["convert"][0]["is_generated"] is True
     assert len(calls["publish"]) == 1
     p = calls["publish"][0]
     assert p["item_id"] == "01HFTEST0001"
@@ -121,8 +124,9 @@ def test_image_kind_fetches_from_s3(monkeypatch, s3_bucket):
     # No call to generate for image kind.
     assert calls["generate"] == []
     assert calls["random_prompt"] == []
-    # Convert sees the bytes we fetched from S3.
-    assert calls["convert"] == [b"real-jpeg-bytes"]
+    # Convert sees the bytes we fetched from S3. Raw uploads pass through
+    # without is_generated so convert scale-fits arbitrary dimensions.
+    assert calls["convert"] == [{"png": b"real-jpeg-bytes", "is_generated": False}]
     p = calls["publish"][0]
     assert p["item_id"] == "01HFTEST0002"
     assert p["original"] == b"real-jpeg-bytes"
@@ -165,8 +169,11 @@ def test_image_kind_with_prompt_calls_generate_from_image(monkeypatch, s3_bucket
     assert edit_call["image"] == b"real-jpeg-bytes"
     assert edit_call["filename"] == "abc12345-skyline.jpg"
 
-    # Convert sees the restyled bytes, not the original upload.
-    assert calls["convert"] == [b"restyled-png-from-render as a woodcut"]
+    # Convert sees the restyled bytes, not the original upload. Restyled
+    # output is a generated frame so is_generated=True.
+    assert calls["convert"] == [
+        {"png": b"restyled-png-from-render as a woodcut", "is_generated": True}
+    ]
     p = calls["publish"][0]
     # Restyled image is a generated frame — record the model + prompt.
     assert p["source"] == {

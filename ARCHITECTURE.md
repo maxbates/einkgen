@@ -224,9 +224,9 @@ Steps:
 1. **Generate (or load)** the source image.
    - For generated images: request `1536 × 1024` from `gpt-image-2` with the base prompt (below).
    - For uploads: take whatever the user provides.
-2. **Fit to canvas (no resampling when possible).**
-   - Source ≥1200×825 in both dims: **center-crop** to exactly 1200×825 (pixel-exact, no AA). Default.
-   - Source smaller in either dim: scale to fit + pad with white (resampling unavoidable). Only happens on uploads.
+2. **Fit to canvas.** Two paths, picked by `is_generated`:
+   - **Generated** (`gpt-image-2` at 1536×1024 with the base prompt's centered 1200×825 safe area): **center-crop** to exactly 1200×825 (pixel-exact, no resampling, no AA).
+   - **Uploaded** (any size, any aspect): **scale-fit** preserving aspect + pad with white. This is the default — a 4032×3024 phone photo is downsampled to 1100×825 (with ~50px white bars left/right), not center-cropped to a tiny middle slice.
 3. **Grayscale + tone curve.** Luminance, optional gamma/contrast tweak (e-ink loses midtones).
 4. **Dither** to 8 levels. Default **Atkinson** (high contrast, classic Mac look — best for the Inkplate's limited palette). Alternatives: Floyd–Steinberg, Bayer.
 5. **Encode as 8-bit indexed BMP** with an 8-entry grayscale palette (~990 KB).

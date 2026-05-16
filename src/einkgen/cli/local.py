@@ -92,7 +92,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
 def _cmd_preview(args: argparse.Namespace) -> int:
     client = _make_client()
     png_bytes = generate_mod.generate(args.prompt, client=client)
-    bmp_bytes = convert_mod.convert(png_bytes, dither=args.dither)
+    bmp_bytes = convert_mod.convert(png_bytes, dither=args.dither, is_generated=True)
     # ARCHITECTURE §6: preview writes PNG, not BMP, "so we can eyeball it before pushing".
     bmp_img = Image.open(io.BytesIO(bmp_bytes))
     args.output.parent.mkdir(parents=True, exist_ok=True)
