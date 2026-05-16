@@ -1,8 +1,16 @@
 # Inkplate 10 firmware
 
 The sketch that runs on the device. On every wake it joins Wi-Fi, fetches
-`manifest.json`, redraws the panel only if the image hash changed, reports
-status to the device-status Lambda, then deep-sleeps until the next check.
+`manifest.json`, redraws the panel if the image hash changed (or if the
+battery has crossed the low-battery threshold, so the overlay can appear or
+disappear), reports status to the device-status Lambda, then deep-sleeps
+until the next check.
+
+When reported charge drops below `BATT_LOW_THRESHOLD_PCT` (default 10%) a
+small iPhone-status-bar-style battery badge with the percentage is composited
+into the top-right corner of the rendered frame — meant as a "go charge this"
+cue, sized so its presence reads from across the room and the number reads up
+close. The image pipeline is unchanged, the overlay only exists on the panel.
 
 See [ARCHITECTURE.md](../../ARCHITECTURE.md) for the system overview
 (§1 device, §7 manifest, §11 firmware spec).
@@ -61,8 +69,9 @@ Arduino IDE 2.x.
 [manifest] image_sha256=...
 [manifest] next_check_after=2026-05-13T16:05:00Z
 [hash] stored="" new="9f1c..." changed=1
-[draw] downloading and rendering image
-[draw] OK, hash persisted
+[batt] 90% low=0 wasLow=0 changed=0
+[draw] downloading and verifying image
+[draw] OK, hash + battery state persisted
 [status] battery=4.11V (90%) rssi=-58
 [status] POST https://...lambda-url.../
 [status] OK HTTP 200
