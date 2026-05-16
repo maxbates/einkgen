@@ -5,6 +5,40 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.1.0] - 2026-05-15
+
+Device-poll cadence is now configurable from a single CDK context flag, and
+the default cadence moved from "manifest says 2 h, firmware clamps to 1 h"
+to a coherent "both sides say 1 h."
+
+### Changed
+- **Default `next_check_after` hint dropped from 2 h to 1 h.** The firmware
+  already capped sleep at 1 h via `SLEEP_MAX_SECONDS`, so devices were
+  always polling hourly regardless of the 2-h hint. The manifest now tells
+  the truth. Battery impact: zero (firmware behaviour unchanged at the
+  default).
+- **`compute_next_check_after`'s default `tick_interval` is now 1 hour.**
+  Callers passing an explicit value are unaffected.
+
+### Added
+- **`EINKGEN_POLL_INTERVAL_SECONDS` env var** read by `publish.publish`.
+  When set to a positive integer, overrides the manifest's
+  `next_check_after` cadence. Unparseable / non-positive values silently
+  fall back to the 1-hour default so a bad override can't take publish
+  down.
+- **CDK context flag `einkgenPollIntervalSeconds`.** Sets the env var
+  above on both the generator and inbound-email Lambdas. Default unset →
+  built-in 1 h. Validated at synth time (must be a positive integer);
+  documented as something the operator must keep in lockstep with the
+  firmware's `SLEEP_MAX_SECONDS`.
+- **QUICKSTART §3.12** — optional "Device poll interval" section with a
+  battery-life trade-off table (3 min → 3 weeks; 1 h → ~1 year; 3 h → ~2
+  years on a 3000 mAh cell), the two edits needed (firmware constants +
+  CDK context), and the clamp-asymmetry caveat.
+- **Firmware comment block** above `SLEEP_*_SECONDS` documenting the
+  cadence/battery trade-off and the required-in-lockstep relationship
+  with `einkgenPollIntervalSeconds`.
+
 ## [0.3.0.1] - 2026-05-15
 
 Live dashboard polish: the Queue tab now refreshes itself on a 10-second
@@ -24,6 +58,7 @@ re-fetches every time you click into it.
   re-clicking it while it's already active — forces the Device component to
   remount and fetch fresh status, instead of showing whatever loaded the
   first time the tab was opened.
+
 ### Changed
 - **Email submissions can now combine subject and body as the prompt.** Previously
   the body was used only as a fallback when the subject was empty; now whenever
