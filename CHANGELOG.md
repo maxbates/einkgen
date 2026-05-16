@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.4.0] - 2026-05-15
+
+### Added
+- **Firmware: WAKE button forces an immediate poll.** The Inkplate's WAKE
+  button (GPIO 36, active-low) is now configured as an EXT0 deep-sleep wake
+  source alongside the existing timer. Pressing it during sleep ends the
+  sleep early; `setup()` runs as usual, which already polls the manifest and
+  redraws on every wake — so the button becomes a "refresh now" affordance
+  without any new code path. Boot log also prints the wake cause
+  (`wake-button` / `timer` / `reset-or-power-on`) so it's obvious in serial
+  output why the device came up. The 60-second `SLEEP_MIN_SECONDS` floor on
+  every wake still applies, so mashing the button gets you one refresh, not
+  a request loop.
+
 ## [0.3.3.0] - 2026-05-15
 
 Device-poll cadence is now configurable from a single CDK context flag, and

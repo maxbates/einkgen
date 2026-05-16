@@ -7,7 +7,8 @@
 //      low-battery threshold since last draw, redraw: drawBitmapFromBuffer()
 //      + (optionally) drawBatteryOverlay() + display() + persist.
 //   4. POST {battery, rssi, current_hash, fw_version} to device-status Lambda.
-//   5. Deep-sleep until min(next_check_after, now + 1h), floor 60 s.
+//   5. Deep-sleep until min(next_check_after, now + 1h), floor 60 s — or
+//      until the WAKE button is pressed, whichever comes first.
 //
 // loop() is empty — every wake is a fresh setup() run.
 
@@ -48,6 +49,12 @@ static const uint64_t SLEEP_MIN_SECONDS     = 60;
 static const uint64_t SLEEP_MAX_SECONDS     = 3600;
 static const uint64_t SLEEP_FALLBACK_SECONDS = 3600;
 
+// WAKE button on Inkplate 10 is wired to GPIO 36 (SENSOR_VP, RTC-domain,
+// input-only). Active-low: pressed = 0 V, released = 3.3 V via the on-board
+// pull-up. Configured as an EXT0 deep-sleep wake source so a press during
+// sleep triggers a fresh setup() and an immediate manifest poll + redraw.
+static const gpio_num_t WAKE_BUTTON_GPIO = GPIO_NUM_36;
+
 // 1200x825 8-bit indexed BMP is ~990 KB; cap at 2 MB so a runaway server
 // can't try to push more than fits in PSRAM (4 MB total) leaving room for
 // the framebuffer and stack.
@@ -80,10 +87,22 @@ static void deepSleepFor(uint64_t seconds)
 {
     if (seconds < SLEEP_MIN_SECONDS) seconds = SLEEP_MIN_SECONDS;
     if (seconds > SLEEP_MAX_SECONDS) seconds = SLEEP_MAX_SECONDS;
-    Serial.printf("[sleep] deep-sleeping for %llu seconds\n", (unsigned long long)seconds);
+    Serial.printf("[sleep] deep-sleeping for %llu seconds (or until WAKE pressed)\n",
+                  (unsigned long long)seconds);
     Serial.flush();
     esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup(WAKE_BUTTON_GPIO, 0);  // 0 = low = pressed
     esp_deep_sleep_start();
+}
+
+static const char *wakeReasonName(esp_sleep_wakeup_cause_t cause)
+{
+    switch (cause) {
+        case ESP_SLEEP_WAKEUP_EXT0:  return "wake-button";
+        case ESP_SLEEP_WAKEUP_TIMER: return "timer";
+        case ESP_SLEEP_WAKEUP_UNDEFINED: return "reset-or-power-on";
+        default: return "other";
+    }
 }
 
 static bool joinWiFi()
@@ -414,6 +433,8 @@ void setup()
     delay(100);
     Serial.println();
     Serial.printf("[boot] einkgen firmware %s\n", FW_VERSION);
+    Serial.printf("[boot] wake cause: %s\n",
+                  wakeReasonName(esp_sleep_get_wakeup_cause()));
 
     display.begin();
     display.setRotation(0);  // native landscape, 1200x825
