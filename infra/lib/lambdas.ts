@@ -1,7 +1,7 @@
 import { Construct } from 'constructs';
 import * as path from 'path';
 import * as fs from 'fs';
-import { Duration } from 'aws-cdk-lib';
+import { AssetHashType, Duration } from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
@@ -24,6 +24,8 @@ export interface EinkgenLambdasProps {
   cdnBase: string;
   openaiApiKey: secretsmanager.Secret;
   deviceStatusToken: secretsmanager.Secret;
+  adminPassword: secretsmanager.Secret;
+  adminCookieSigningKey: secretsmanager.Secret;
   /**
    * Override the manifest's ``next_check_after`` cadence (seconds).
    * Set on the generator Lambda as ``EINKGEN_POLL_INTERVAL_SECONDS``;
@@ -122,6 +124,14 @@ export function bundlePython(requirementsFile: string, sourceStaged: boolean): l
     ? 'cp -r /asset-input/_src/einkgen /asset-output/einkgen'
     : 'mkdir -p /asset-output/einkgen && echo "stub" > /asset-output/einkgen/__init__.py';
   return lambda.Code.fromAsset(assetRoot, {
+    // Force OUTPUT-content hashing. The default for bundled assets is source-
+    // based, which means the synth-only local bundler and the real Docker
+    // bundler produce IDENTICAL asset hashes despite their outputs differing
+    // by 30 MB of pip-installed deps. cdk-assets then dedups on the hash and
+    // refuses to overwrite a previously-uploaded stub zip — Lambdas end up
+    // pointing at the stub even after a clean redeploy. Hashing the output
+    // keeps the two paths distinct.
+    assetHashType: AssetHashType.OUTPUT,
     bundling: {
       image: lambda.Runtime.PYTHON_3_12.bundlingImage,
       command: [
@@ -141,8 +151,11 @@ export class EinkgenLambdas extends Construct {
   public readonly generator: lambda.Function;
   public readonly readApi: lambda.Function;
   public readonly deviceStatus: lambda.Function;
+  public readonly adminApi: lambda.Function;
   public readonly readApiUrl: string;
   public readonly deviceStatusUrl: string;
+  public readonly adminApiUrl: string;
+  public readonly adminApiHttp: HttpApi;
 
   constructor(scope: Construct, id: string, props: EinkgenLambdasProps) {
     super(scope, id);
@@ -325,5 +338,60 @@ export class EinkgenLambdas extends Construct {
       ),
     });
     this.deviceStatusUrl = deviceStatusHttp.apiEndpoint;
+
+    // ---- admin-api ----------------------------------------------------
+    // Operator-facing write endpoints fronted by /admin/* on the CloudFront
+    // distribution (same origin as the SPA → SameSite=Lax cookies just work,
+    // and no CORS preflight is needed). The CloudFront behavior is added
+    // back in einkgen-stack.ts because the CDN construct doesn't know about
+    // this HTTP API at construction time.
+    this.adminApi = new lambda.Function(this, 'AdminApi', {
+      functionName: 'einkgen-admin-api',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'einkgen.lambdas.admin_api.handler',
+      code: bundlePython('requirements-admin-api.txt', sourceStaged),
+      memorySize: 256,
+      // Larger than read-api because /admin/queue/image base64-decodes up to
+      // ~8 MB and writes it to S3 in one shot.
+      timeout: Duration.seconds(20),
+      // Cap blast radius if a token is ever leaked: even with perfect creds,
+      // attacker can't drive more than 5 concurrent generations (the
+      // generator's own reservedConcurrentExecutions=1 then serialises them).
+      reservedConcurrentExecutions: 5,
+      logRetention: logs.RetentionDays.TWO_WEEKS,
+      environment: {
+        EINKGEN_BUCKET: props.bucket.bucketName,
+        ADMIN_PASSWORD_SECRET_NAME: props.adminPassword.secretName,
+        ADMIN_COOKIE_KEY_SECRET_NAME: props.adminCookieSigningKey.secretName,
+      },
+    });
+    // Mirror the generator's queue/* access — admin-api writes both the
+    // staged image and the queue item.
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:PutObject'],
+        resources: [`${props.bucket.bucketArn}/queue/*`],
+      }),
+    );
+    props.adminPassword.grantRead(this.adminApi);
+    props.adminCookieSigningKey.grantRead(this.adminApi);
+
+    // HTTP API. No CORS preflight here — CloudFront fronts the API at the
+    // same origin as the SPA, so the browser never issues an OPTIONS request.
+    this.adminApiHttp = new HttpApi(this, 'AdminApiHttp', {
+      apiName: 'einkgen-admin-api',
+    });
+    this.adminApiHttp.addRoutes({
+      path: '/admin/{proxy+}',
+      // ANY so the handler can dispatch on its own and we don't have to
+      // enumerate every method/path pair at the platform layer.
+      methods: [HttpMethod.ANY],
+      integration: new HttpLambdaIntegration(
+        'AdminApiIntegration',
+        this.adminApi,
+      ),
+    });
+    this.adminApiUrl = this.adminApiHttp.apiEndpoint;
   }
 }

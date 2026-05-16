@@ -4,9 +4,10 @@ A small AWS pipeline that generates (or accepts) images, dithers and resizes
 them for an **Inkplate 10** 9.7" e-paper display, and publishes them to S3
 where the device pulls the latest frame on its own schedule.
 
-**Live example:** <https://einkgen.link/> — three read-only
-tabs (Queue, History, Device) over a real dev deployment. History fills in
-every 2 hours from the cron tick.
+**Live example:** <https://einkgen.link/> — three read-only public tabs
+(Queue, History, Device) plus a password-gated Admin tab for submitting
+prompts or photos from a phone or laptop. History fills in every 2 hours
+from the cron tick.
 
 ```
    CLI ──┐            ┌────────────────────┐                     ┌──────────────────┐
@@ -49,17 +50,17 @@ The fastest path is to open this repo in [Claude Code](https://claude.com/claude
 > Deploy einkgen to my AWS account. Walk me through what I need first.
 
 The agent will read [CLAUDE.md](CLAUDE.md) + [QUICKSTART.md](QUICKSTART.md),
-ask you for the four things only a human can provide (AWS profile, OpenAI
-key, device-status token, environment name), and then run the deploy
-itself.
+ask you for the things only a human can provide (AWS profile, OpenAI key,
+device-status token, admin password, environment name), and then run the
+deploy itself.
 
 ## Repo layout
 
 ```
 src/einkgen/    Python: CLI + Lambda handlers + core image/queue/publish logic
-web/            React + Vite SPA (the three-tab read-only dashboard)
+web/            React + Vite SPA (read-only public tabs + admin tab)
 firmware/       Inkplate 10 Arduino sketch
-infra/          AWS CDK (one stack, three Lambdas, one bucket, one CloudFront)
+infra/          AWS CDK (one stack, four Lambdas, one bucket, one CloudFront)
 tests/          pytest suite, moto-backed
 ```
 

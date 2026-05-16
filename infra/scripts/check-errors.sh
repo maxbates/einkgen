@@ -24,6 +24,7 @@ LAMBDAS=(
   "einkgen-generator"
   "einkgen-read-api"
   "einkgen-device-status"
+  "einkgen-admin-api"
 )
 
 QUERY='fields @timestamp, @message

@@ -1,0 +1,5 @@
+# admin-api uses stdlib (hmac, hashlib, base64, json) plus boto3 (in the
+# runtime). einkgen.core.queue imports `ulid` at module load, and
+# typing_extensions is an unconditional import inside python-ulid 3.1+.
+python-ulid>=3.0,<4.0
+typing_extensions>=4.0

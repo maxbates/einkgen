@@ -6,10 +6,11 @@ fast-path orientation; everything else is one hop away.
 ## What this is
 
 A small AWS pipeline that generates dithered images for an **Inkplate 10**
-e-paper display. CLI / cron / future input channels write into an S3-prefix
-queue → a generator Lambda drains it → S3 + CloudFront serve the manifest +
-BMP to the device. The web app is a public read-only dashboard with three
-tabs (Queue, History, Device).
+e-paper display. CLI / cron / inbound-email / admin-tab write into an
+S3-prefix queue → a generator Lambda drains it → S3 + CloudFront serve the
+manifest + BMP to the device. The web app is a public dashboard with three
+read-only tabs (Queue, History, Device) plus a password-gated **Admin** tab
+for submitting prompts/images from a phone or laptop.
 
 Live example: <https://einkgen.link/>
 
@@ -31,15 +32,18 @@ The most common first-time interaction is *"I want to deploy this."* Do this:
    - AWS profile name (default `einkgen`)
    - AWS region (default `us-east-1`)
    - Environment name (default `dev`)
-   - OpenAI API key + device-status token — ask the user to paste these
-     when you reach [§3.5](QUICKSTART.md#35-populate-the-secrets), not
-     up-front. Never echo either value back at them.
+   - OpenAI API key + device-status token + admin password — ask the user
+     to paste these when you reach
+     [§3.5](QUICKSTART.md#35-populate-the-secrets), not up-front. Never
+     echo any of them back at them.
 3. **Execute Part 3 step by step.** Summarise each command's output;
    stop and ask if anything looks unexpected. Don't paper over failures.
-4. **After §3.7,** open the deployed CloudFront URL and confirm the three
-   tabs render. The `Queue` tab should say "Queue is empty.", `Device`
-   should say "Device has not reported yet.", `History` will fill in on
-   the first cron tick (within 2 h) or on the first manual enqueue (§3.9).
+4. **After §3.7,** open the deployed CloudFront URL and confirm all four
+   tabs render. `Queue` should say "Queue is empty.", `Device` should say
+   "Device has not reported yet.", `History` will fill in on the first
+   cron tick (within 2 h) or on the first manual enqueue (§3.9), and the
+   `Admin` tab should show a password prompt. Confirm the password from
+   §3.5 logs in and stays in (90-day cookie).
 
 For anything else, jump to the table below.
 
@@ -77,17 +81,19 @@ src/einkgen/
 │   ├── pipeline.py             one queue item → published frame
 │   ├── email_allowlist.py      S3-backed sender allowlist for inbound email
 │   ├── email_parse.py          MIME parse + SPF/DKIM check from SES auth headers
+│   ├── admin_cookie.py         HMAC-signed session cookie for the SPA Admin tab
 │   └── s3.py                   thin boto3 wrapper
 └── lambdas/
     ├── generator.py            S3 event + cron handlers
     ├── read_api.py             GET /queue, /history, /status
     ├── device_status.py        POST / (X-Device-Token)
-    └── inbound_email.py        S3-triggered SES inbound parser → queue.enqueue
+    ├── inbound_email.py        S3-triggered SES inbound parser → queue.enqueue
+    └── admin_api.py            POST /admin/{login,logout,queue/prompt,queue/image} + GET /admin/me
 
-web/                            React + Vite SPA (read-only dashboard)
-├── src/api.ts                  typed client for read-api Lambda
+web/                            React + Vite SPA (read-only dashboard + admin tab)
+├── src/api.ts                  typed client for read-api + admin-api Lambdas
 ├── src/format.ts               pure helpers (timestamps, hashes) — has unit tests
-└── src/tabs/{Queue,History,Device}.tsx
+└── src/tabs/{Queue,History,Device,Admin}.tsx
 
 firmware/inkplate10/            Arduino sketch + own README
 ├── inkplate10.ino              main sketch
@@ -97,11 +103,11 @@ firmware/inkplate10/            Arduino sketch + own README
 infra/                          AWS CDK stack (TypeScript)
 ├── bin/einkgen.ts              CDK app entry (one stack per env)
 ├── lib/einkgen-stack.ts        top-level wiring
-├── lib/lambdas.ts              3 base Lambdas + 2 API Gateway HTTP APIs + EventBridge
+├── lib/lambdas.ts              4 base Lambdas + 3 API Gateway HTTP APIs + EventBridge
 ├── lib/inbound-email.ts        opt-in SES inbound stack (gated by einkgenInboundDomain context)
 ├── lib/bucket.ts               S3 bucket (public access blocked, OAC for CDN)
-├── lib/cloudfront.ts           distribution + viewer-request gate on history/*
-├── lib/secrets.ts              openai_api_key + device_status_token
+├── lib/cloudfront.ts           distribution + viewer-request gate on history/* (admin/* behavior added in einkgen-stack.ts)
+├── lib/secrets.ts              openai_api_key + device_status_token + admin_password + admin_cookie_signing_key
 ├── lib/observability.ts        log retention + ERROR metric filters + dashboard
 ├── lambda/                     per-Lambda requirements.txt + staged Python src
 ├── scripts/check-errors.sh     24h ERROR sweep across all Lambdas
@@ -121,6 +127,8 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "What is this?" / "How does X work?" | [ARCHITECTURE.md](ARCHITECTURE.md) §1–§12 — pick the matching section |
 | "Add a CLI subcommand" | `src/einkgen/cli/<name>.py` + register in `cli/__init__.py` |
 | "Add a route on the read-api" | `src/einkgen/lambdas/read_api.py` + a test; CORS is pinned at API Gateway in `infra/lib/lambdas.ts` |
+| "Add a route on the admin-api" / "Add a thing the operator can do from the SPA" | `src/einkgen/lambdas/admin_api.py` (cookie-gated dispatcher) + a test in `tests/test_lambda_admin_api.py` + a typed client in `web/src/api.ts` + UI in `web/src/tabs/Admin.tsx`. No CORS — admin endpoints are same-origin via the CloudFront `/admin/*` behavior wired in `infra/lib/einkgen-stack.ts`. |
+| "Rotate the admin password" | `aws secretsmanager put-secret-value --secret-id einkgen/admin_password --secret-string '<new>'` (takes effect ≤5 min on warm Lambdas). To log every existing browser session out as well, rotate `einkgen/admin_cookie_signing_key` the same way. |
 | "Run the tests" / "Run the test suite" | `uv run --extra dev pytest` from the repo (or worktree) root. `uv` syncs `.venv/` from `pyproject.toml` on demand and reuses a global wheel cache (`~/.cache/uv/`), so first run in a fresh worktree is one-time-slow and every subsequent run is seconds. Do **not** bootstrap with bare `pip install -e ".[dev]"` + `pytest` — pip has no shared cache and the system Python on macOS dev boxes often doesn't satisfy `requires-python >=3.11`, so it re-downloads everything every time and may pick the wrong interpreter. |
 | "Set up email submission" / "Enable inbound email" | [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel). Pick path A (register a new domain via `infra/scripts/register-domain.sh`) or B (delegate an existing domain to Route 53). Then `cdk deploy -c einkgenInboundDomain=<domain>`. DKIM CNAMEs + MX record + receipt-rule activation are still manual steps after the deploy. |
 | "Add an allowed email sender" | `einkgen allowlist add <email>` (writes `config/email_allowlist.txt`). Comparison is case-insensitive. Never hardcode addresses in committed CDK — first-deploy seeding goes through the `einkgenAllowlistSeed` context flag instead. |
@@ -147,9 +155,10 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
   human with the renewal price and let them approve / pick the name
   before they run their copy of `register-domain.sh`. ICANN-required
   contact info goes in the script — never make it up.
-- **Secrets.** Never echo the OpenAI key or device-status token back to
-  the user. When verifying, print *length only* (`wc -c`) or a SHA-256
-  prefix. Never commit `.env`, `firmware/inkplate10/secrets.h`, or
+- **Secrets.** Never echo the OpenAI key, device-status token, **admin
+  password**, or admin cookie-signing key back to the user. When
+  verifying, print *length only* (`wc -c`) or a SHA-256 prefix. Never
+  commit `.env`, `firmware/inkplate10/secrets.h`, or
   `infra/cdk-outputs.json` — all three are gitignored for a reason.
 - **PII / allowlist data stays out of git.** Don't hardcode email
   addresses in committed CDK or Python — including in

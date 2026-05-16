@@ -9,6 +9,7 @@ export interface EinkgenObservabilityProps {
   generator: lambda.Function;
   readApi: lambda.Function;
   deviceStatus: lambda.Function;
+  adminApi: lambda.Function;
 }
 
 const METRIC_NAMESPACE = 'einkgen';
@@ -23,6 +24,7 @@ export class EinkgenObservability extends Construct {
       { name: 'generator', fn: props.generator },
       { name: 'read-api', fn: props.readApi },
       { name: 'device-status', fn: props.deviceStatus },
+      { name: 'admin-api', fn: props.adminApi },
     ];
 
     // Metric filter per log group on the literal token ERROR. Using

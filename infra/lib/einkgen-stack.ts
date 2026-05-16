@@ -1,7 +1,9 @@
 import { Construct } from 'constructs';
 import * as path from 'path';
 import * as fs from 'fs';
-import { CfnOutput, Stack, StackProps } from 'aws-cdk-lib';
+import { CfnOutput, Duration, Fn, Stack, StackProps } from 'aws-cdk-lib';
+import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
+import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 
@@ -107,14 +109,51 @@ export class EinkgenStack extends Stack {
       cdnBase,
       openaiApiKey: secrets.openaiApiKey,
       deviceStatusToken: secrets.deviceStatusToken,
+      adminPassword: secrets.adminPassword,
+      adminCookieSigningKey: secrets.adminCookieSigningKey,
       pollIntervalSeconds,
     });
+
+    // Front the admin API on the same origin as the SPA so the session
+    // cookie can use SameSite=Lax (Safari and Firefox both block third-party
+    // cookies even with SameSite=None, which would lock out the SPA on
+    // those browsers). The API Gateway HTTP API URL has the form
+    // `https://<apiId>.execute-api.<region>.amazonaws.com` — strip the
+    // scheme so HttpOrigin gets the bare hostname it expects.
+    const adminApiHost = Fn.select(
+      2,
+      Fn.split('/', lambdas.adminApiUrl),
+    );
+    cdn.distribution.addBehavior(
+      'admin/*',
+      new origins.HttpOrigin(adminApiHost, {
+        protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+        // The admin Lambda already chooses a tight timeout; keep CloudFront
+        // closer to that so a stuck handler doesn't tie up viewers for the
+        // 30 s CloudFront default.
+        readTimeout: Duration.seconds(30),
+      }),
+      {
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        // Admin responses are never cacheable (401/204/JSON of just-enqueued
+        // ids) and the requests carry cookies/JSON bodies that vary per
+        // viewer. Disabling cache also keeps Set-Cookie from getting eaten.
+        cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+        // Forward Cookie + Authorization + body to origin. Drops the Host
+        // header so API Gateway sees its own hostname (otherwise it returns
+        // 403 because the host doesn't match an attached domain).
+        originRequestPolicy:
+          cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+      },
+    );
 
     new EinkgenObservability(this, 'Observability', {
       envName: props.envName,
       generator: lambdas.generator,
       readApi: lambdas.readApi,
       deviceStatus: lambdas.deviceStatus,
+      adminApi: lambdas.adminApi,
     });
 
     // ---- Inbound-email submissions (opt-in) -----------------------------
@@ -203,9 +242,13 @@ export class EinkgenStack extends Stack {
     new CfnOutput(this, 'CdnDistributionId', { value: cdn.distribution.distributionId });
     new CfnOutput(this, 'ReadApiUrl', { value: lambdas.readApiUrl });
     new CfnOutput(this, 'DeviceStatusUrl', { value: lambdas.deviceStatusUrl });
+    new CfnOutput(this, 'AdminApiUrl', { value: lambdas.adminApiUrl });
     new CfnOutput(this, 'OpenAiSecretName', { value: secrets.openaiApiKey.secretName });
     new CfnOutput(this, 'DeviceStatusSecretName', {
       value: secrets.deviceStatusToken.secretName,
+    });
+    new CfnOutput(this, 'AdminPasswordSecretName', {
+      value: secrets.adminPassword.secretName,
     });
   }
 }

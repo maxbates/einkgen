@@ -2,13 +2,15 @@ import { useState } from "react";
 import { Queue } from "./tabs/Queue";
 import { History } from "./tabs/History";
 import { Device } from "./tabs/Device";
+import { Admin } from "./tabs/Admin";
 
-type Tab = "queue" | "history" | "device";
+type Tab = "queue" | "history" | "device" | "admin";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "queue", label: "Queue" },
   { id: "history", label: "History" },
   { id: "device", label: "Device" },
+  { id: "admin", label: "Admin" },
 ];
 
 export function App() {
@@ -44,6 +46,7 @@ export function App() {
         {active === "queue" && <Queue />}
         {active === "history" && <History />}
         {active === "device" && <Device key={deviceNonce} />}
+        {active === "admin" && <Admin />}
       </main>
     </div>
   );
