@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.2.0] - 2026-05-15
+
+Firmware-only feature: the Inkplate now draws its own low-battery indicator on
+the panel when charge runs low, so the device tells you it needs charging
+without anyone having to look at the dashboard.
+
+### Added
+- **On-display low-battery overlay.** When `display.readBattery()` reports
+  below `BATT_LOW_THRESHOLD_PCT` (default 10%), the firmware composites a
+  small iPhone-status-bar-style battery icon with the percentage inside it
+  into the top-right corner of the rendered frame (~80×32 px on the
+  1200×825 panel — presence is enough, legible up close), on a white card so
+  it stays readable over dark image regions. The image pipeline is
+  unchanged — the badge only exists on the panel, never in the BMP that S3 /
+  CloudFront serve, so the manifest's `image_sha256` doesn't churn and the
+  cache stays hot. Implemented entirely in `firmware/inkplate10/inkplate10.ino`
+  using Inkplate's `drawRect` / `fillRect` / `print` primitives between
+  `drawBitmapFromBuffer()` and `display()`.
+### Changed
+- **Firmware redraw trigger.** The panel now also refreshes when reported
+  battery crosses the low-battery threshold in either direction (tracked in
+  NVS under `batt_low`), so the overlay can appear when charge drops and
+  disappear when the device is plugged back in — previously the panel only
+  redrew on `image_sha256` change. This adds at most two extra image
+  downloads per battery cycle (one when crossing down, one when crossing
+  back up); no extra OpenAI cost.
+
 ## [0.3.1.0] - 2026-05-15
 
 First hardware-validated firmware release. The Inkplate 10 boots, fetches

@@ -3,7 +3,9 @@
 // On every wake:
 //   1. Join Wi-Fi.
 //   2. GET manifest.json from CloudFront.
-//   3. If image_sha256 differs from NVS, drawImage() + display() + persist.
+//   3. If image_sha256 differs from NVS, OR battery has crossed the
+//      low-battery threshold since last draw, redraw: drawBitmapFromBuffer()
+//      + (optionally) drawBatteryOverlay() + display() + persist.
 //   4. POST {battery, rssi, current_hash, fw_version} to device-status Lambda.
 //   5. Deep-sleep until min(next_check_after, now + 1h), floor 60 s.
 //
@@ -39,12 +41,21 @@ static const uint64_t SLEEP_FALLBACK_SECONDS = 3600;
 static const size_t   IMAGE_MAX_BYTES       = 2 * 1024 * 1024;
 
 // NVS namespace + keys
-static const char *NVS_NAMESPACE   = "einkgen";
-static const char *NVS_KEY_HASH    = "image_sha256";
+static const char *NVS_NAMESPACE    = "einkgen";
+static const char *NVS_KEY_HASH     = "image_sha256";
+// Tracks whether the frame currently on the panel includes the low-battery
+// overlay, so we know to redraw when the battery crosses the threshold even
+// if the manifest hash hasn't changed.
+static const char *NVS_KEY_BATT_LOW = "batt_low";
 
 // Battery linear map endpoints (volts)
 static const float BATT_V_EMPTY = 3.3f;
 static const float BATT_V_FULL  = 4.2f;
+
+// Show the on-display low-battery overlay (iPhone-style icon + percentage in
+// the top-right corner) when reported charge drops below this threshold.
+// Kept low on purpose: the badge is a "go charge this" cue, not a status bar.
+static const int BATT_LOW_THRESHOLD_PCT = 10;
 
 // 8-level grayscale display mode (3-bit)
 // INKPLATE_3BIT is defined in the Inkplate library.
@@ -167,7 +178,10 @@ static time_t parseIso8601Utc(const char *s)
 // hash. Without this path the `image_sha256` field is purely advisory and a
 // MITM (or a partial CloudFront response) can render arbitrary bytes while
 // firmware persists the manifest's claimed hash as if it were verified.
-static bool downloadVerifyAndDraw(const char *imageUrl, const char *expectedHash)
+static void drawBatteryOverlay(int pct);
+
+static bool downloadVerifyAndDraw(const char *imageUrl, const char *expectedHash,
+                                  bool overlayBattery, int batteryPct)
 {
     Serial.printf("[image] GET %s\n", imageUrl);
     WiFiClientSecure client;
@@ -262,6 +276,10 @@ static bool downloadVerifyAndDraw(const char *imageUrl, const char *expectedHash
         Serial.println("[draw] drawBitmapFromBuffer failed");
         return false;
     }
+    if (overlayBattery) {
+        Serial.printf("[overlay] low-battery badge: %d%%\n", batteryPct);
+        drawBatteryOverlay(batteryPct);
+    }
     display.display();
     return true;
 }
@@ -272,6 +290,70 @@ static int batteryPercent(float volts)
     if (pct < 0.0f)   pct = 0.0f;
     if (pct > 100.0f) pct = 100.0f;
     return (int)(pct + 0.5f);
+}
+
+// Small iPhone-status-bar-style battery badge in the top-right corner with
+// the percentage inside the body. Drawn into the framebuffer AFTER drawing
+// the image and BEFORE display(), so it ends up composited on the e-paper
+// as a single refresh. Sits on a white card so it stays legible over dark
+// image regions. Sized to be a "presence" cue from across the room and
+// legible up close; the goal is "go charge this", not a live status readout.
+// In INKPLATE_3BIT mode, color values are 0 (black) through 7 (white).
+static void drawBatteryOverlay(int pct)
+{
+    const uint16_t BLACK = 0;
+    const uint16_t WHITE = 7;
+
+    const int margin   = 18;  // distance from panel edges
+    const int bodyW    = 80;  // battery body width
+    const int bodyH    = 32;  // battery body height
+    const int border   = 2;   // outline thickness
+    const int capW     = 5;   // positive-terminal nub width
+    const int capH     = 14;  // positive-terminal nub height
+    const int cardPad  = 6;   // white card padding around the icon
+
+    const int bodyX = display.width() - margin - bodyW - capW;
+    const int bodyY = margin;
+
+    display.fillRect(bodyX - cardPad, bodyY - cardPad,
+                     bodyW + capW + 2 * cardPad, bodyH + 2 * cardPad, WHITE);
+
+    // Battery body outline — draw nested rects to fake a thick border.
+    for (int i = 0; i < border; ++i) {
+        display.drawRect(bodyX + i, bodyY + i,
+                         bodyW - 2 * i, bodyH - 2 * i, BLACK);
+    }
+
+    // Positive-terminal nub on the right.
+    display.fillRect(bodyX + bodyW, bodyY + (bodyH - capH) / 2,
+                     capW, capH, BLACK);
+
+    // Proportional fill bar on the left of the interior. At <10% the bar is
+    // narrow enough that the centred percentage text below stays on white.
+    const int innerX = bodyX + border;
+    const int innerY = bodyY + border;
+    const int innerW = bodyW - 2 * border;
+    const int innerH = bodyH - 2 * border;
+    int fillW = (innerW * pct) / 100;
+    if (fillW > 0) {
+        display.fillRect(innerX, innerY, fillW, innerH, BLACK);
+    }
+
+    // Percentage text centred inside the body. setTextColor(fg, bg) repaints
+    // each glyph cell, so the text stays readable even where it overlaps the
+    // fill bar.
+    char label[8];
+    snprintf(label, sizeof(label), "%d%%", pct);
+
+    const int textSize = 2;                          // Adafruit-GFX scale
+    const int textW    = (int)strlen(label) * 6 * textSize;
+    const int textH    = 8 * textSize;
+
+    display.setTextSize(textSize);
+    display.setTextColor(BLACK, WHITE);
+    display.setCursor(bodyX + (bodyW - textW) / 2,
+                      bodyY + (bodyH - textH) / 2);
+    display.print(label);
 }
 
 // Best-effort status POST. Logs but never throws.
@@ -359,13 +441,24 @@ void setup()
     Serial.printf("[manifest] image_sha256=%s\n", imageHash);
     Serial.printf("[manifest] next_check_after=%s\n", nextCheckAfter);
 
-    // Compare to stored hash.
+    // Read battery before deciding whether to redraw, so we can also trigger
+    // a refresh when charge crosses the low-battery threshold (the overlay
+    // needs to appear or disappear even if the manifest hash hasn't changed).
+    float battV   = (float)display.readBattery();
+    int   battPct = batteryPercent(battV);
+    bool  isLow   = (battPct < BATT_LOW_THRESHOLD_PCT);
+
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, /*readOnly=*/false);
     String storedHash = prefs.getString(NVS_KEY_HASH, "");
-    bool changed = (storedHash != imageHash);
+    bool   wasLow     = prefs.getBool(NVS_KEY_BATT_LOW, false);
+    bool   hashChanged = (storedHash != imageHash);
+    bool   battChanged = (isLow != wasLow);
+    bool   needsRedraw = hashChanged || battChanged;
     Serial.printf("[hash] stored=\"%s\" new=\"%s\" changed=%d\n",
-                  storedHash.c_str(), imageHash, changed ? 1 : 0);
+                  storedHash.c_str(), imageHash, hashChanged ? 1 : 0);
+    Serial.printf("[batt] %d%% low=%d wasLow=%d changed=%d\n",
+                  battPct, isLow ? 1 : 0, wasLow ? 1 : 0, battChanged ? 1 : 0);
 
     // currentHash tracks what we're ACTUALLY showing right now. It only
     // advances to the manifest's claimed hash if download + SHA verify +
@@ -373,24 +466,23 @@ void setup()
     // server's Device tab doesn't lie about what's on screen.
     String currentHash = storedHash;
 
-    if (changed) {
+    if (needsRedraw) {
         Serial.println("[draw] downloading and verifying image");
-        if (downloadVerifyAndDraw(imageUrl, imageHash)) {
+        if (downloadVerifyAndDraw(imageUrl, imageHash, isLow, battPct)) {
             prefs.putString(NVS_KEY_HASH, imageHash);
+            prefs.putBool(NVS_KEY_BATT_LOW, isLow);
             currentHash = imageHash;
-            Serial.println("[draw] OK, hash persisted");
+            Serial.println("[draw] OK, hash + battery state persisted");
         } else {
             Serial.println("[draw] failed — leaving previous frame on screen");
         }
     } else {
-        Serial.println("[draw] hash unchanged, skipping redraw");
+        Serial.println("[draw] hash + battery state unchanged, skipping redraw");
     }
     prefs.end();
 
-    // Battery + RSSI + status POST. Report what we're actually showing.
-    float battV   = (float)display.readBattery();
-    int   battPct = batteryPercent(battV);
-    int   rssi    = WiFi.RSSI();
+    // RSSI + status POST. Report what we're actually showing.
+    int rssi = WiFi.RSSI();
     Serial.printf("[status] battery=%.2fV (%d%%) rssi=%d\n", battV, battPct, rssi);
     postStatus(battV, battPct, rssi, currentHash.c_str());
 
