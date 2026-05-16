@@ -251,18 +251,15 @@ static bool downloadVerifyAndDraw(const char *imageUrl, const char *expectedHash
     }
     Serial.println("[verify] hash OK");
 
-    // Render from the in-memory buffer.
-    // TODO: confirm the exact Inkplate-Arduino-library buffer-draw signature
-    // for the installed version. As of writing the canonical call is
-    // display.drawImage(buf, x, y, len, dither, invert), but some forks expose
-    // image.drawBmpFromBuffer(...) or drawBitmapFromBuffer(...). If linking
-    // fails, swap for the matching name — the contract is the same: render
-    // the BMP we already SHA-verified, not a fresh HTTP fetch.
-    bool ok = display.drawImage((const uint8_t *)buf, /*x=*/0, /*y=*/0,
-                                /*len=*/total, /*dither=*/false, /*invert=*/false);
+    // Render from the in-memory buffer. The Inkplate Arduino library exposes
+    // BMP-from-buffer rendering on the public `image` member of the board
+    // driver; it reads width/height from the BMP header itself, so no length
+    // arg is needed.
+    bool ok = display.image.drawBitmapFromBuffer(buf, /*x=*/0, /*y=*/0,
+                                                 /*dither=*/false, /*invert=*/false);
     heap_caps_free(buf);
     if (!ok) {
-        Serial.println("[draw] drawImage from buffer failed");
+        Serial.println("[draw] drawBitmapFromBuffer failed");
         return false;
     }
     display.display();

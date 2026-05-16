@@ -5,6 +5,38 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.1.0] - 2026-05-15
+
+First hardware-validated firmware release. The Inkplate 10 boots, fetches
+`current/manifest.json`, renders the BMP, posts status, and deep-sleeps.
+
+### Fixed
+- **Firmware: BMP-from-buffer render call.** The sketch was calling
+  `display.drawImage(buf, x, y, len, dither, invert)`, a signature that
+  doesn't exist on the Soldered `InkplateLibrary`. Replaced with
+  `display.image.drawBitmapFromBuffer(buf, x, y, dither, invert)` — the
+  call the library actually exposes on the Inkplate10 board driver, which
+  reads width/height from the BMP header. Validated end-to-end on
+  hardware: panel renders the queued frame and the Device tab populates
+  within seconds. Without this, the sketch failed to compile against the
+  installed library and could never have drawn.
+- **Inbound email: rejection wording.** The non-allowlisted-sender reply
+  now reads "is not authorised" instead of "isn't authorised", which also
+  unbreaks the regression test that asserts the rejection message contains
+  the phrase users actually search for.
+
+### Changed
+- **Quickstart: new Part 5 covers flashing the Inkplate.** Walks through
+  toolchain setup, pulling the four `secrets.h` values from
+  `cdk-outputs.json` + Secrets Manager, board / partition / upload-speed
+  picks, and the two flash-time errors that surfaced on the first
+  hardware-test pass (`No serial data received` → close Serial Monitor or
+  hold the WAKE button; `Invalid head of packet` → lower upload speed to
+  115200).
+- **Firmware README.** Added a "Flash-time gotchas" section mirroring the
+  QUICKSTART troubleshooting bullets, and marked `drawBitmapFromBuffer`
+  as confirmed on hardware rather than a TODO for the bring-up pass.
+
 ## [0.3.0.1] - 2026-05-15
 
 Live dashboard polish: the Queue tab now refreshes itself on a 10-second
