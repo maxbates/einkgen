@@ -108,9 +108,9 @@ Public, AWS-hosted SPA. Three tabs: **Queue**, **History**, **Device**. No butto
 
 You can submit to the queue by emailing a configured address. Three modes:
 
-- **Text only** — subject (or first line of body, if subject is empty) becomes the prompt. Kind = `prompt`.
+- **Text only** — subject and first body line both contribute. When both carry text they are concatenated (subject, blank line, body); either alone is used as-is. Kind = `prompt`.
 - **Image attached** — the image becomes the input frame, converted to B&W and published as-is. Kind = `image`.
-- **Image + text** — image is fed to `gpt-image-1`'s edit endpoint with the prompt as a restyle hint, then dithered and published. Kind = `image` with a prompt set.
+- **Image + text** — image is fed to `gpt-image-1`'s edit endpoint with the prompt (same subject/body concatenation rule) as a restyle hint, then dithered and published. Kind = `image` with a prompt set.
 
 **Cost protection.** A plain-text allowlist at `s3://<bucket>/config/email_allowlist.txt` lists every address permitted to submit. Senders not on the list get a friendly rejection email and **nothing is enqueued**; the reply never names other allowed addresses. Manage with `einkgen allowlist {ls,add,rm}` or edit the file directly. CDK seeds the initial allowlist on first deploy — see [QUICKSTART.md](QUICKSTART.md#email-submission-channel-optional).
 
