@@ -2,9 +2,12 @@ import { useEffect, useState, type FormEvent } from "react";
 import {
   adminEnqueueImage,
   adminEnqueuePrompt,
+  adminGetPrompts,
   adminLogin,
   adminLogout,
   adminMe,
+  adminPutPrompts,
+  adminResetPrompts,
 } from "../api";
 
 type SessionState =
@@ -280,6 +283,178 @@ function AdminPanel({
         </p>
       ) : state.kind === "error" ? (
         <p className="admin-inline-error">{state.message}</p>
+      ) : null}
+
+      <PromptLibraryEditor />
+    </div>
+  );
+}
+
+type LibraryState =
+  | { kind: "loading" }
+  | { kind: "loaded"; text: string; persisted: string; isDefault: boolean }
+  | { kind: "saving"; text: string; persisted: string; isDefault: boolean }
+  | { kind: "error"; message: string };
+
+function PromptLibraryEditor() {
+  const [state, setState] = useState<LibraryState>({ kind: "loading" });
+  const [notice, setNotice] = useState<
+    { kind: "ok"; message: string } | { kind: "error"; message: string } | null
+  >(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const res = await adminGetPrompts(ctrl.signal);
+        if (cancelled) return;
+        const text = res.prompts.join("\n");
+        setState({
+          kind: "loaded",
+          text,
+          persisted: text,
+          isDefault: res.is_default,
+        });
+      } catch (err) {
+        if (cancelled || ctrl.signal.aborted) return;
+        setState({
+          kind: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
+  }, []);
+
+  if (state.kind === "loading") {
+    return (
+      <div className="admin-card">
+        <p className="submit-hint-heading">Random prompt library</p>
+        <p className="muted">Loading…</p>
+      </div>
+    );
+  }
+  if (state.kind === "error") {
+    return (
+      <div className="admin-card">
+        <p className="submit-hint-heading">Random prompt library</p>
+        <p className="admin-inline-error">{state.message}</p>
+      </div>
+    );
+  }
+
+  const isSaving = state.kind === "saving";
+  const dirty = state.text !== state.persisted;
+  // Same parsing the server does: trim, drop blanks + comment-only lines.
+  const entryCount = state.text
+    .split("\n")
+    .map((line) => line.split("#")[0].trim())
+    .filter((line) => line.length > 0).length;
+
+  async function save() {
+    if (state.kind !== "loaded" && state.kind !== "saving") return;
+    const lines = state.text.split("\n");
+    setNotice(null);
+    setState({ ...state, kind: "saving" });
+    try {
+      const res = await adminPutPrompts(lines);
+      const text = res.prompts.join("\n");
+      setState({
+        kind: "loaded",
+        text,
+        persisted: text,
+        isDefault: res.is_default,
+      });
+      setNotice({
+        kind: "ok",
+        message: `Saved ${res.prompts.length} prompt${res.prompts.length === 1 ? "" : "s"}.`,
+      });
+    } catch (err) {
+      setState({ ...state, kind: "loaded" });
+      setNotice({
+        kind: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  async function reset() {
+    if (state.kind !== "loaded" && state.kind !== "saving") return;
+    const ok = window.confirm(
+      "Replace the current library with the original 10 seed prompts? This cannot be undone.",
+    );
+    if (!ok) return;
+    setNotice(null);
+    setState({ ...state, kind: "saving" });
+    try {
+      const res = await adminResetPrompts();
+      const text = res.prompts.join("\n");
+      setState({
+        kind: "loaded",
+        text,
+        persisted: text,
+        isDefault: res.is_default,
+      });
+      setNotice({ kind: "ok", message: "Restored seed prompts." });
+    } catch (err) {
+      setState({ ...state, kind: "loaded" });
+      setNotice({
+        kind: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return (
+    <div className="admin-card">
+      <div>
+        <p className="submit-hint-heading">Random prompt library</p>
+        <p className="muted small">
+          One prompt per line. The 2-hour cron picks from this bank when the
+          queue is empty. Blank lines and lines starting with <code>#</code>{" "}
+          are ignored.
+          {state.isDefault && !dirty ? " (Currently the seed defaults.)" : ""}
+        </p>
+      </div>
+      <label className="admin-field">
+        <span className="admin-field-label">Prompts ({entryCount})</span>
+        <textarea
+          className="admin-textarea"
+          rows={12}
+          value={state.text}
+          onChange={(e) =>
+            setState({ ...state, kind: "loaded", text: e.target.value })
+          }
+          disabled={isSaving}
+          spellCheck={false}
+        />
+      </label>
+      <div className="admin-prompt-actions">
+        <button
+          type="button"
+          className="button"
+          onClick={save}
+          disabled={isSaving || !dirty || entryCount === 0}
+        >
+          {isSaving ? "Saving…" : dirty ? "Save changes" : "Saved"}
+        </button>
+        <button
+          type="button"
+          className="button"
+          onClick={reset}
+          disabled={isSaving}
+        >
+          Reset to defaults
+        </button>
+      </div>
+      {notice?.kind === "ok" ? (
+        <p className="admin-success">{notice.message}</p>
+      ) : notice?.kind === "error" ? (
+        <p className="admin-inline-error">{notice.message}</p>
       ) : null}
     </div>
   );

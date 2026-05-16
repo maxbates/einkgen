@@ -8,7 +8,7 @@ import json
 import boto3
 import pytest
 
-from einkgen.core import admin_cookie, queue
+from einkgen.core import admin_cookie, prompt_library, queue
 from einkgen.lambdas import admin_api
 
 TEST_PASSWORD = "photos-for-anyone"
@@ -20,8 +20,10 @@ COOKIE_SECRET_NAME = "einkgen-test/admin_cookie_signing_key"
 @pytest.fixture
 def reset_cache():
     admin_api._reset_cache()
+    prompt_library._reset_cache()
     yield
     admin_api._reset_cache()
+    prompt_library._reset_cache()
 
 
 @pytest.fixture
@@ -335,6 +337,149 @@ def test_enqueue_image_bad_base64_returns_400(secrets, s3_bucket):
         )
     )
     assert resp["statusCode"] == 400
+
+
+# ---------------------------------------------------------------------------
+# /admin/prompts
+# ---------------------------------------------------------------------------
+
+
+def _auth_cookies() -> list[str]:
+    login = _login()
+    token = _session_cookie_value(login)
+    return [f"einkgen_admin={token}"]
+
+
+def test_get_prompts_requires_session(secrets, s3_bucket):
+    resp = admin_api.handler(_event("GET", "/admin/prompts"))
+    assert resp["statusCode"] == 401
+
+
+def test_get_prompts_returns_defaults_when_unconfigured(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event("GET", "/admin/prompts", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["prompts"] == list(prompt_library.DEFAULTS)
+    assert body["is_default"] is True
+    assert body["defaults"] == list(prompt_library.DEFAULTS)
+
+
+def test_get_prompts_reflects_saved_state(secrets, s3_bucket):
+    prompt_library.write(["custom one", "custom two"])
+    resp = admin_api.handler(
+        _event("GET", "/admin/prompts", cookies=_auth_cookies())
+    )
+    body = json.loads(resp["body"])
+    assert body["prompts"] == ["custom one", "custom two"]
+    assert body["is_default"] is False
+
+
+def test_put_prompts_requires_session(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event("PUT", "/admin/prompts", body={"prompts": ["x"]})
+    )
+    assert resp["statusCode"] == 401
+    # And nothing landed on S3.
+    assert prompt_library.load(force=True) == prompt_library.DEFAULTS
+
+
+def test_put_prompts_happy_path(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event(
+            "PUT",
+            "/admin/prompts",
+            body={"prompts": ["  one ", "two", "one", "# skip"]},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["prompts"] == ["one", "two"]
+    assert body["is_default"] is False
+    # And the file actually landed on S3.
+    assert prompt_library.load(force=True) == ("one", "two")
+
+
+def test_put_prompts_with_only_blanks_returns_400(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event(
+            "PUT",
+            "/admin/prompts",
+            body={"prompts": ["  ", "# only comments"]},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 400
+
+
+def test_put_prompts_non_list_returns_400(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event(
+            "PUT",
+            "/admin/prompts",
+            body={"prompts": "one, two, three"},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 400
+
+
+def test_put_prompts_non_string_entry_returns_400(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event(
+            "PUT",
+            "/admin/prompts",
+            body={"prompts": ["ok", 42]},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 400
+
+
+def test_put_prompts_overlong_entry_returns_413(secrets, s3_bucket):
+    huge = "x" * (admin_api.MAX_PROMPT_CHARS + 1)
+    resp = admin_api.handler(
+        _event(
+            "PUT",
+            "/admin/prompts",
+            body={"prompts": ["ok", huge]},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 413
+
+
+def test_put_prompts_too_many_entries_returns_413(secrets, s3_bucket):
+    too_many = [f"prompt {i}" for i in range(admin_api.MAX_LIBRARY_ENTRIES + 1)]
+    resp = admin_api.handler(
+        _event(
+            "PUT",
+            "/admin/prompts",
+            body={"prompts": too_many},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 413
+
+
+def test_post_prompts_reset_requires_session(secrets, s3_bucket):
+    resp = admin_api.handler(_event("POST", "/admin/prompts/reset"))
+    assert resp["statusCode"] == 401
+
+
+def test_post_prompts_reset_restores_defaults(secrets, s3_bucket):
+    prompt_library.write(["custom"])
+    assert prompt_library.load(force=True) == ("custom",)
+    resp = admin_api.handler(
+        _event("POST", "/admin/prompts/reset", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["prompts"] == list(prompt_library.DEFAULTS)
+    assert body["is_default"] is True
+    assert prompt_library.load(force=True) == prompt_library.DEFAULTS
 
 
 # ---------------------------------------------------------------------------

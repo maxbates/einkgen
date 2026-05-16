@@ -205,6 +205,15 @@ export class EinkgenLambdas extends Construct {
         resources: [props.bucket.bucketArn],
       }),
     );
+    // Random-pick library: read-only on the cron path. The Lambda calls
+    // `s3.head_object` first, which needs ListBucket scoped to `config/*`
+    // so a missing file returns 404 (→ fallback to DEFAULTS) instead of 403.
+    this.generator.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject'],
+        resources: [`${props.bucket.bucketArn}/config/prompt_library.txt`],
+      }),
+    );
     props.openaiApiKey.grantRead(this.generator);
     this.generator.addToRolePolicy(
       new iam.PolicyStatement({
@@ -372,6 +381,28 @@ export class EinkgenLambdas extends Construct {
       new iam.PolicyStatement({
         actions: ['s3:PutObject'],
         resources: [`${props.bucket.bucketArn}/queue/*`],
+      }),
+    );
+    // Random-pick library: full read/write on the single config file so the
+    // operator can edit the bank from the SPA Admin tab.
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:PutObject'],
+        resources: [`${props.bucket.bucketArn}/config/prompt_library.txt`],
+      }),
+    );
+    // ListBucket on config/* so head_object on a missing file returns a
+    // clean 404 (→ fallback to DEFAULTS) instead of 403. Mirrors the
+    // inbound-email pattern.
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:ListBucket'],
+        resources: [props.bucket.bucketArn],
+        conditions: {
+          StringLike: {
+            's3:prefix': ['config/*'],
+          },
+        },
       }),
     );
     props.adminPassword.grantRead(this.adminApi);

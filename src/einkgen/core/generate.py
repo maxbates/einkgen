@@ -1,4 +1,4 @@
-"""OpenAI `gpt-image-2` adapter, base prompt, and the random prompt library.
+"""OpenAI `gpt-image-2` adapter and the BASE_PROMPT preamble.
 
 The pipeline always requests 1200x832 from the model — the smallest size
 `gpt-image-2` accepts (both dims must be multiples of 16) that still covers
@@ -12,14 +12,19 @@ See ARCHITECTURE §6.
 We deliberately call the model at ``quality="medium"`` rather than ``"high"``.
 The dither step erases sub-pixel detail anyway, so the extra cost of high
 quality is wasted on an 8-grayscale e-paper panel.
+
+The random-pick prompt library is in ``einkgen.core.prompt_library`` —
+operator-editable at runtime via the SPA admin tab and the ``einkgen
+prompts`` CLI. ``random_prompt()`` below delegates to it.
 """
 
 from __future__ import annotations
 
 import base64
 import os
-import random
 from typing import Any
+
+from einkgen.core import prompt_library as _prompt_library
 
 # Prepended to every user/random subject string. Lifted verbatim from ARCHITECTURE §6.
 BASE_PROMPT = (
@@ -30,23 +35,11 @@ BASE_PROMPT = (
     "textures will not survive dithering. No text or watermarks. Subject:"
 )
 
-# The 10 entries from ARCHITECTURE §6. Each is a complete prompt string (the
-# descriptive text after the dash, not just the title) so generators can append
-# them to BASE_PROMPT verbatim.
-PROMPT_LIBRARY: list[str] = [
-    "Geometric composition — overlapping circles, squares, triangles; bold flat shapes; high contrast.",
-    "Botanical illustration — pen-and-ink style; a single plant or flower; scientific-diagram aesthetic.",
-    "Pixel art scene — 32×32 or 64×64 motif scaled up; chunky, low-detail.",
-    "Architectural line drawing — building, bridge, or interior; technical-drawing feel.",
-    "Topographic / contour pattern — abstract elevation lines or isobars.",
-    "Vintage scientific diagram — anatomy, astronomy, or mechanical schematic.",
-    "Baby-friendly collage — simple recognisable objects (animal, fruit, toy) arranged playfully.",
-    "Abstract generative pattern — flow fields, Voronoi, fractal noise.",
-    "Portrait study — single face, woodcut or charcoal feel.",
-    "Model's choice — open-ended: anything striking that reads well in 8 grays.",
-]
-
-assert len(PROMPT_LIBRARY) == 10, "PROMPT_LIBRARY must have exactly 10 entries"
+# Re-export the seed library so callers that want the unedited bank (tests,
+# `einkgen prompts reset`) have one import path. The runtime library is
+# operator-editable at s3://<bucket>/config/prompt_library.txt — see
+# einkgen.core.prompt_library.
+PROMPT_LIBRARY: list[str] = list(_prompt_library.DEFAULTS)
 
 MODEL = "gpt-image-2"
 IMAGE_SIZE = "1200x832"
@@ -155,5 +148,10 @@ def _decode_first(response: Any) -> bytes:
 
 
 def random_prompt() -> str:
-    """Return a random entry from PROMPT_LIBRARY (raw subject string)."""
-    return random.choice(PROMPT_LIBRARY)
+    """Return a random entry from the operator-editable prompt library.
+
+    Reads ``s3://<bucket>/config/prompt_library.txt`` via the prompt_library
+    module (cached for 60 s on warm Lambdas). Falls back to ``PROMPT_LIBRARY``
+    (the seed defaults) if the file is missing.
+    """
+    return _prompt_library.random_prompt()
