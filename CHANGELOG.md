@@ -5,6 +5,16 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.0.1] - 2026-05-15
+
+### Changed
+- **Email submissions can now combine subject and body as the prompt.** Previously
+  the body was used only as a fallback when the subject was empty; now whenever
+  both carry text they are concatenated (subject first, blank line, then the first
+  meaningful body line) so a phone user can type a short subject ("watercolor")
+  and elaborate in the body ("of a mountain at dawn"). Existing subject-only,
+  body-only, and image + prompt restyle paths are unchanged.
+
 ## [0.3.0.0] - 2026-05-15
 
 Email submission channel. The queue gains a new write path: send a prompt, an
