@@ -36,7 +36,7 @@ ORIGINAL = b"\x89PNG" + b"\x00" * 50
 
 def test_publish_writes_current_and_history(s3_bucket):
     item_id = "01HF7ZTEST"
-    source = {"kind": "generated", "model": "gpt-image-1", "prompt": "a cliff"}
+    source = {"kind": "generated", "model": "gpt-image-2", "prompt": "a cliff"}
 
     manifest = publish.publish(
         PROCESSED,
@@ -206,7 +206,7 @@ def test_publish_falls_back_when_poll_interval_env_nonpositive(
 def test_publish_prompt_kwarg_overrides_source(s3_bucket):
     m = publish.publish(
         PROCESSED,
-        source={"kind": "generated", "model": "gpt-image-1"},
+        source={"kind": "generated", "model": "gpt-image-2"},
         item_id="id-prompt",
         prompt="overridden prompt",
         now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),

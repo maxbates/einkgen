@@ -59,7 +59,8 @@ def test_generate_prepends_base_prompt_and_calls_with_correct_size():
     client.images.generate.assert_called_once()
     call_kwargs = client.images.generate.call_args.kwargs
     assert call_kwargs["size"] == IMAGE_SIZE == "1536x1024"
-    assert call_kwargs["model"] == "gpt-image-1"
+    assert call_kwargs["model"] == "gpt-image-2"
+    assert call_kwargs["quality"] == "medium"
     assert call_kwargs["n"] == 1
     assert call_kwargs["prompt"].startswith(BASE_PROMPT)
     assert call_kwargs["prompt"].endswith("a foggy cliff at dawn")
@@ -96,7 +97,8 @@ def test_generate_from_image_calls_edit_endpoint_with_prepended_base_prompt():
     assert out == fake_png
     client.images.edit.assert_called_once()
     kwargs = client.images.edit.call_args.kwargs
-    assert kwargs["model"] == "gpt-image-1"
+    assert kwargs["model"] == "gpt-image-2"
+    assert kwargs["quality"] == "medium"
     assert kwargs["size"] == IMAGE_SIZE
     assert kwargs["n"] == 1
     assert kwargs["prompt"].startswith(BASE_PROMPT)

@@ -27,7 +27,7 @@ def test_manifest_json_round_trip():
         image_bytes=990123,
         display={"width": 1200, "height": 825, "levels": 8},
         next_check_after="2026-05-13T16:05:00Z",
-        source={"kind": "generated", "model": "gpt-image-1", "prompt": "a foggy cliff"},
+        source={"kind": "generated", "model": "gpt-image-2", "prompt": "a foggy cliff"},
     )
 
     payload = m.to_json()
