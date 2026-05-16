@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.4.2] - 2026-05-15
+
+### Fixed
+- **Firmware now compiles.** `drawBatteryOverlay()` declared local
+  `const uint16_t BLACK = 0;` and `const uint16_t WHITE = 7;` for
+  INKPLATE_3BIT colour values, but the Inkplate Arduino library's
+  `defines.h` `#define`s `BLACK 1` and `WHITE 0` at the include level.
+  Those macros expanded inside the function before the constants were
+  parsed, producing `const uint16_t 1 = 0;` and a compile error.
+  Renamed the locals to `INK_BLACK` / `INK_WHITE`. Latent since
+  v0.3.2.0 — surfaced when the v0.3.4.0 WAKE-button work prompted a
+  hardware re-flash and the overlay code hit the preprocessor for the
+  first time.
+
 ## [0.3.4.1] - 2026-05-15
 
 ### Changed

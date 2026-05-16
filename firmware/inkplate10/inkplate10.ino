@@ -333,8 +333,8 @@ static int batteryPercent(float volts)
 // In INKPLATE_3BIT mode, color values are 0 (black) through 7 (white).
 static void drawBatteryOverlay(int pct)
 {
-    const uint16_t BLACK = 0;
-    const uint16_t WHITE = 7;
+    const uint16_t INK_BLACK = 0;
+    const uint16_t INK_WHITE = 7;
 
     const int margin   = 18;  // distance from panel edges
     const int bodyW    = 80;  // battery body width
@@ -348,17 +348,17 @@ static void drawBatteryOverlay(int pct)
     const int bodyY = margin;
 
     display.fillRect(bodyX - cardPad, bodyY - cardPad,
-                     bodyW + capW + 2 * cardPad, bodyH + 2 * cardPad, WHITE);
+                     bodyW + capW + 2 * cardPad, bodyH + 2 * cardPad, INK_WHITE);
 
     // Battery body outline — draw nested rects to fake a thick border.
     for (int i = 0; i < border; ++i) {
         display.drawRect(bodyX + i, bodyY + i,
-                         bodyW - 2 * i, bodyH - 2 * i, BLACK);
+                         bodyW - 2 * i, bodyH - 2 * i, INK_BLACK);
     }
 
     // Positive-terminal nub on the right.
     display.fillRect(bodyX + bodyW, bodyY + (bodyH - capH) / 2,
-                     capW, capH, BLACK);
+                     capW, capH, INK_BLACK);
 
     // Proportional fill bar on the left of the interior. At <10% the bar is
     // narrow enough that the centred percentage text below stays on white.
@@ -368,7 +368,7 @@ static void drawBatteryOverlay(int pct)
     const int innerH = bodyH - 2 * border;
     int fillW = (innerW * pct) / 100;
     if (fillW > 0) {
-        display.fillRect(innerX, innerY, fillW, innerH, BLACK);
+        display.fillRect(innerX, innerY, fillW, innerH, INK_BLACK);
     }
 
     // Percentage text centred inside the body. setTextColor(fg, bg) repaints
@@ -382,7 +382,7 @@ static void drawBatteryOverlay(int pct)
     const int textH    = 8 * textSize;
 
     display.setTextSize(textSize);
-    display.setTextColor(BLACK, WHITE);
+    display.setTextColor(INK_BLACK, INK_WHITE);
     display.setCursor(bodyX + (bodyW - textW) / 2,
                       bodyY + (bodyH - textH) / 2);
     display.print(label);
