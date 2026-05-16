@@ -32,6 +32,22 @@ without anyone having to look at the dashboard.
   downloads per battery cycle (one when crossing down, one when crossing
   back up); no extra OpenAI cost.
 
+## [0.3.1.1] - 2026-05-15
+
+Switch the image model from `gpt-image-1` to `gpt-image-2` and call it at
+`quality="medium"` rather than the previous default. Both the text-to-image
+and image-edit (restyle) paths are affected. Output size, the base prompt,
+and the panel-side dither pipeline are unchanged — the visible difference is
+cheaper per-call cost and the new model name in history manifests.
+
+### Changed
+- **OpenAI model.** `src/einkgen/core/generate.py` now calls `gpt-image-2` with
+  `quality="medium"` for both `generate()` and `generate_from_image()`. The
+  pipeline records `model: "gpt-image-2"` in `source` for generated and
+  restyled frames; historical manifests keep their original `gpt-image-1`
+  value. The 8-level e-paper dither erases sub-pixel detail anyway, so
+  `quality="high"` was wasted spend.
+
 ## [0.3.1.0] - 2026-05-15
 
 First hardware-validated firmware release. The Inkplate 10 boots, fetches

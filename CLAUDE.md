@@ -69,7 +69,7 @@ src/einkgen/
 │   ├── allowlist.py            einkgen allowlist {ls,add,rm} (inbound-email senders)
 │   └── local.py                einkgen local {generate,convert,preview}
 ├── core/                       shared image/queue/publish logic (CLI ↔ Lambda)
-│   ├── generate.py             OpenAI gpt-image-1 generate + edit + BASE_PROMPT + PROMPT_LIBRARY
+│   ├── generate.py             OpenAI gpt-image-2 generate + edit + BASE_PROMPT + PROMPT_LIBRARY (quality=medium)
 │   ├── convert.py              crop + grayscale + Atkinson dither + 8-bit BMP
 │   ├── publish.py              writes current/, archives history/, CF invalidate
 │   ├── manifest.py             manifest schema + next_check_after
@@ -134,11 +134,12 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 
 ## Hard rules
 
-- **OpenAI cost.** Each generator invocation costs ~$0.04 (gpt-image-1 at
-  1536×1024). Don't enqueue more than 1–2 test prompts per session.
-  Don't trigger cron faster than its 2 h rate. Don't "fix" things by
-  running the generator in a loop. There is **no daily $ cap yet** (see
-  [TODOS.md](TODOS.md)).
+- **OpenAI cost.** Each generator invocation calls `gpt-image-2` at
+  1536×1024 with `quality="medium"` — cheaper than the previous
+  `gpt-image-1` high-quality default, but still real per-call $. Don't
+  enqueue more than 1–2 test prompts per session. Don't trigger cron
+  faster than its 2 h rate. Don't "fix" things by running the generator
+  in a loop. There is **no daily $ cap yet** (see [TODOS.md](TODOS.md)).
 - **Domain registration is a recurring cost.** Never auto-register a
   domain via `route53domains register-domain`. Always present the
   human with the renewal price and let them approve / pick the name

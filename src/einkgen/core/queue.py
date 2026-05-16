@@ -60,7 +60,7 @@ def _validate(kind: str, prompt: str | None, image_s3_key: str | None) -> None:
     elif kind == "image":
         # kind='image' accepts an optional prompt. With no prompt we treat the
         # upload as "convert to B&W and publish". With a prompt we feed both
-        # to gpt-image-1's edit endpoint so the prompt restyles the image.
+        # to gpt-image-2's edit endpoint so the prompt restyles the image.
         if not image_s3_key:
             raise ValueError("kind='image' requires image_s3_key")
     elif kind == "random":

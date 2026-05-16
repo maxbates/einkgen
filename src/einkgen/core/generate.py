@@ -1,8 +1,12 @@
-"""OpenAI `gpt-image-1` adapter, base prompt, and the random prompt library.
+"""OpenAI `gpt-image-2` adapter, base prompt, and the random prompt library.
 
 The pipeline always requests 1536x1024 from the model — the closest size to
 the panel's 1200x825 (1.5:1 vs ~1.4545:1) — so the downstream `convert()` step
 can center-crop with zero resampling. See ARCHITECTURE §6.
+
+We deliberately call the model at ``quality="medium"`` rather than ``"high"``.
+The dither step erases sub-pixel detail anyway, so the extra cost of high
+quality is wasted on an 8-grayscale e-paper panel.
 """
 
 from __future__ import annotations
@@ -39,8 +43,9 @@ PROMPT_LIBRARY: list[str] = [
 
 assert len(PROMPT_LIBRARY) == 10, "PROMPT_LIBRARY must have exactly 10 entries"
 
-MODEL = "gpt-image-1"
+MODEL = "gpt-image-2"
 IMAGE_SIZE = "1536x1024"
+QUALITY = "medium"
 
 
 def _resolve_api_key() -> str | None:
@@ -76,7 +81,7 @@ def _default_client() -> Any:
 
 
 def generate(prompt: str, *, client: Any = None) -> bytes:
-    """Generate a PNG via OpenAI gpt-image-1 and return raw PNG bytes.
+    """Generate a PNG via OpenAI gpt-image-2 and return raw PNG bytes.
 
     BASE_PROMPT is prepended to `prompt` inside this function — callers should
     pass only the subject text. `client` is a dependency-injection hook for
@@ -89,6 +94,7 @@ def generate(prompt: str, *, client: Any = None) -> bytes:
         model=MODEL,
         prompt=full_prompt,
         size=IMAGE_SIZE,
+        quality=QUALITY,
         n=1,
     )
     return _decode_first(response)
@@ -101,7 +107,7 @@ def generate_from_image(
     image_filename: str = "input.png",
     client: Any = None,
 ) -> bytes:
-    """Restyle an input image per `prompt` via gpt-image-1's edit endpoint.
+    """Restyle an input image per `prompt` via gpt-image-2's edit endpoint.
 
     Used when an email arrives with both an attachment and a body/subject —
     the attachment is the reference, the prompt steers the regeneration. The
@@ -123,6 +129,7 @@ def generate_from_image(
         image=buf,
         prompt=full_prompt,
         size=IMAGE_SIZE,
+        quality=QUALITY,
         n=1,
     )
     return _decode_first(response)
@@ -131,7 +138,7 @@ def generate_from_image(
 def _decode_first(response: Any) -> bytes:
     """Extract base64 PNG bytes from an OpenAI images response."""
     datum = response.data[0]
-    # `gpt-image-1` returns base64 in `b64_json` by default. Some wrappers/mocks
+    # `gpt-image-2` returns base64 in `b64_json` by default. Some wrappers/mocks
     # expose `url` instead; we don't fetch URLs here — callers/tests should
     # provide b64_json.
     b64 = getattr(datum, "b64_json", None)

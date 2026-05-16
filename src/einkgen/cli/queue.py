@@ -32,7 +32,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     im.add_argument("path")
     im.add_argument(
         "--prompt",
-        help="optional restyle prompt; if set, the image is fed to gpt-image-1's "
+        help="optional restyle prompt; if set, the image is fed to gpt-image-2's "
         "edit endpoint instead of being passed through B&W only",
     )
     im.set_defaults(func=_cmd_image)

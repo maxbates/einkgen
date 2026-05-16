@@ -57,7 +57,7 @@ def process_item(item: QueueItem) -> None:
     processed_bmp = convert_mod.convert(original_png)
 
     # "uploaded" means the published frame is the user's bytes (passed through
-    # B&W only). When an image is restyled via gpt-image-1, it's a generated
+    # B&W only). When an image is restyled via the image model, it's a generated
     # frame — record it as such so history shows the model that touched it.
     image_was_generated = item.kind != "image" or bool(item.prompt)
     source: dict[str, Any] = {
@@ -67,7 +67,7 @@ def process_item(item: QueueItem) -> None:
     # that are passed through unchanged. A restyled image is a generated frame,
     # so it does carry model/prompt.
     if image_was_generated:
-        source["model"] = "gpt-image-1"
+        source["model"] = generate.MODEL
     if item.prompt is not None:
         source["prompt"] = item.prompt
 

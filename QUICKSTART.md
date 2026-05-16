@@ -485,7 +485,7 @@ Send a test email from an allowlisted sender to any address
 - **Image attached, no text** → `kind=image`. The image is converted to
   B&W and published as-is.
 - **Image + subject and/or body** → `kind=image` with a prompt. The image
-  is fed to gpt-image-1's edit endpoint with the prompt (same subject/body
+  is fed to gpt-image-2's edit endpoint with the prompt (same subject/body
   concatenation rule) as a restyle hint.
 
 Watch the Lambda log:
