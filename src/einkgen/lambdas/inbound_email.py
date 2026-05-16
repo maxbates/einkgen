@@ -208,7 +208,7 @@ def _send_rejection(to: str | None) -> None:
     )
     body = (
         "Hi,\n\n"
-        "Your email address isn't authorised to submit prompts or images to "
+        "Your email address is not authorised to submit prompts or images to "
         "this einkgen device, so the message was dropped.\n\n"
         f"{setup_pointer}\n\n"
         "— einkgen\n"
