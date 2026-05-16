@@ -13,6 +13,14 @@ const TABS: { id: Tab; label: string }[] = [
 
 export function App() {
   const [active, setActive] = useState<Tab>("queue");
+  // Bumped on every Device-tab click so the Device component remounts and
+  // its useEffect re-runs even when the user re-clicks the active tab.
+  const [deviceNonce, setDeviceNonce] = useState(0);
+
+  function onTabClick(id: Tab) {
+    if (id === "device") setDeviceNonce((n) => n + 1);
+    setActive(id);
+  }
 
   return (
     <div className="app">
@@ -25,7 +33,7 @@ export function App() {
               role="tab"
               aria-selected={active === t.id}
               className={`tab ${active === t.id ? "tab-active" : ""}`}
-              onClick={() => setActive(t.id)}
+              onClick={() => onTabClick(t.id)}
             >
               {t.label}
             </button>
@@ -35,7 +43,7 @@ export function App() {
       <main className="app-main">
         {active === "queue" && <Queue />}
         {active === "history" && <History />}
-        {active === "device" && <Device />}
+        {active === "device" && <Device key={deviceNonce} />}
       </main>
     </div>
   );

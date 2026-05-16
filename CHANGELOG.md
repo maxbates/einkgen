@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.0.1] - 2026-05-15
+
+Live dashboard polish: the Queue tab now refreshes itself on a 10-second
+cadence so new submissions appear without a manual reload, and the Device tab
+re-fetches every time you click into it.
+
+### Added
+- **Queue auto-refresh.** The Queue tab polls `/queue` every 10 seconds and
+  swaps the list in place — no flash of the "Loading queue…" placeholder on
+  each tick. A small spinner in the header spins whenever a fetch is in
+  flight and dims to idle between ticks; the label flips between
+  "Refreshing…" and "Auto-refresh every 10s" so the state stays legible
+  without motion. Transient poll errors are swallowed if a previous good
+  list is on screen, so a single flaky request doesn't blank what the
+  operator was reading.
+- **Device tab refetch on click.** Clicking the Device tab — including
+  re-clicking it while it's already active — forces the Device component to
+  remount and fetch fresh status, instead of showing whatever loaded the
+  first time the tab was opened.
+
 ## [0.3.0.0] - 2026-05-15
 
 Email submission channel. The queue gains a new write path: send a prompt, an
