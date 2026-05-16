@@ -65,9 +65,11 @@ def _parse_bmp_header(data: bytes) -> dict:
     }
 
 
-def test_large_upload_scales_to_fit(tiny_panel):
-    # Source larger than panel in both dims — default (upload) path scale-fits
-    # instead of center-cropping, so the whole image survives.
+def test_large_upload_scales_to_fill(tiny_panel):
+    # Source larger than panel in both dims — default (upload) path scale-fills
+    # (cover) and center-crops the overflow on the long axis. 100x80 → scale by
+    # max(60/100, 40/80) = 0.6 → 60x48 → center-crop top/bottom 4px → 60x40.
+    # The full horizontal gradient survives, so we still see both extremes.
     src = _make_gradient(100, 80)
     bmp = convert(src, dither="atkinson")
     header = _parse_bmp_header(bmp)
@@ -80,17 +82,16 @@ def test_large_upload_scales_to_fit(tiny_panel):
     grayscale = img.convert("L")
     unique = set(grayscale.getdata())
     assert unique.issubset(set(PALETTE_LEVELS))
-    # Scale-fit preserves the full horizontal gradient (0..255), so we see the
-    # darkest and brightest palette levels in addition to a healthy mix.
     assert PALETTE_LEVELS[0] in unique, "expected darkest level from gradient origin"
     assert PALETTE_LEVELS[-1] in unique, "expected brightest level from gradient end"
     assert len(unique) >= 6, f"expected at least 6 levels, got {sorted(unique)}"
 
 
 def test_generated_image_center_crops_no_resampling(tiny_panel):
-    # is_generated=True: source was composed for a centered safe area at panel
-    # size, so we center-crop with zero resampling and the leftmost column
-    # carries the gradient value at x=20 (not the gradient origin x=0).
+    # is_generated=True: source was composed for the whole canvas at a size
+    # that exceeds the panel in both dims, so we center-crop with zero
+    # resampling and the leftmost column carries the gradient value at x=20
+    # (not the gradient origin x=0).
     src = _make_gradient(100, 80)
     bmp = convert(src, dither="atkinson", is_generated=True)
     header = _parse_bmp_header(bmp)
@@ -105,9 +106,11 @@ def test_generated_image_center_crops_no_resampling(tiny_panel):
     assert len(unique) >= 4, f"expected variety, got {sorted(unique)}"
 
 
-def test_small_image_scales_and_pads(tiny_panel):
-    # Smaller than panel in both dims → scale-fit + white pad.
-    src = _make_gradient(40, 20)  # panel is 60x40
+def test_small_image_scales_up_to_fill(tiny_panel):
+    # Smaller than panel in both dims → scale-fill (upsample), then center-crop
+    # the overflow. A solid mid-gray source must produce a solid mid-gray output
+    # with NO white padding (the giveaway for the old scale-fit behavior).
+    src = Image.new("RGB", (30, 20), (109, 109, 109))  # exact palette level
     bmp = convert(src, dither="atkinson")
     header = _parse_bmp_header(bmp)
     assert header["bpp"] == 8
@@ -117,9 +120,7 @@ def test_small_image_scales_and_pads(tiny_panel):
     img = Image.open(io.BytesIO(bmp))
     grayscale = img.convert("L")
     unique = set(grayscale.getdata())
-    assert unique.issubset(set(PALETTE_LEVELS))
-    # White padding plus the gradient guarantees at least the brightest level.
-    assert PALETTE_LEVELS[-1] in unique
+    assert unique == {109}, f"expected solid mid-gray (no white pad), got {sorted(unique)}"
 
 
 def test_both_dither_algorithms_produce_valid_output(tiny_panel):

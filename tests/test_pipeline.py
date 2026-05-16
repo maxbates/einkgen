@@ -89,8 +89,9 @@ def test_prompt_kind_runs_generate_convert_publish(monkeypatch):
     assert calls["generate"] == ["a foggy cliff at dawn"]
     assert len(calls["convert"]) == 1
     assert calls["convert"][0]["png"].startswith(b"fake-png-bytes-for-")
-    # Prompt-kind output is a `gpt-image-2` 1536x1024 with a centered safe
-    # area — convert can center-crop without resampling.
+    # Prompt-kind output is a `gpt-image-2` 1200x832 composed for the whole
+    # canvas — convert can center-crop the 7-pixel height overflow without
+    # resampling.
     assert calls["convert"][0]["is_generated"] is True
     assert len(calls["publish"]) == 1
     p = calls["publish"][0]
