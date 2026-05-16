@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.0.5] - 2026-05-16
+
+### Added
+- **`shortcuts/README.md` — iPhone / Siri shortcut walkthroughs.**
+  Two paths for submitting a prompt from the phone via *"Hey Siri,
+  einkgen."*: a 2-action email shortcut that targets the existing
+  inbound-email Lambda (recommended when [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel)
+  is set up), and a 4–8-action HTTP shortcut that performs the
+  `POST /admin/login` → `POST /admin/queue/prompt` admin API dance with
+  the password embedded in the shortcut. Includes a `curl` sanity check
+  so the endpoints can be verified before building the shortcut, plus
+  rotation, sharing, and troubleshooting notes. Docs only — no code or
+  CDK changes; no `cdk deploy` required.
+
 ## [0.4.0.4] - 2026-05-16
 
 ### Fixed

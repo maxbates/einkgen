@@ -61,6 +61,7 @@ src/einkgen/    Python: CLI + Lambda handlers + core image/queue/publish logic
 web/            React + Vite SPA (read-only public tabs + admin tab)
 firmware/       Inkplate 10 Arduino sketch
 infra/          AWS CDK (one stack, four Lambdas, one bucket, one CloudFront)
+shortcuts/      iPhone / Siri shortcut walkthroughs (email + HTTP paths)
 tests/          pytest suite, moto-backed
 ```
 

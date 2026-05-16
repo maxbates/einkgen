@@ -100,6 +100,9 @@ firmware/inkplate10/            Arduino sketch + own README
 ├── README.md                   build & flash instructions
 └── secrets.h.example           (real secrets.h is gitignored)
 
+shortcuts/                      iPhone / Siri integration (docs only)
+└── README.md                   email + HTTP shortcut walkthroughs for the iOS Shortcuts app
+
 infra/                          AWS CDK stack (TypeScript)
 ├── bin/einkgen.ts              CDK app entry (one stack per env)
 ├── lib/einkgen-stack.ts        top-level wiring
@@ -138,6 +141,7 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "Change the device poll interval" / "make it check more often" | Edit **both** `SLEEP_MAX_SECONDS` + `SLEEP_FALLBACK_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) **and** redeploy with `-c einkgenPollIntervalSeconds=<n>`. See [QUICKSTART §3.12](QUICKSTART.md#312-optional-device-poll-interval) for the battery-life table. Server-only change is silently clamped by firmware. Don't conflate with the auto-gen `rate(2 hours)` cron — that's the OpenAI-cost knob, separate concern. |
 | "It's broken / debug this" | `AWS_PROFILE=einkgen ./infra/scripts/check-errors.sh 24h` first, then `aws logs tail /aws/lambda/<fn> --follow` |
 | "QA the live SPA" | Use the deployed CloudFront URL and the browse tool (or `/qa-only` if gstack is loaded) |
+| "Set up an iPhone shortcut" / "Submit from Siri" / "Phone shortcut" | [shortcuts/README.md](shortcuts/README.md) — two paths: a 2-action email shortcut (if inbound email is set up) or a 4–8-action HTTP shortcut that calls the admin API. Both end with *"Hey Siri, einkgen."* |
 | "Cut a release" | Bump `VERSION`, prepend a `CHANGELOG.md` entry, then redeploy as in [QUICKSTART §3.6–§3.7](QUICKSTART.md#36-build-the-web-spa-against-the-deployed-urls) |
 | "Tear it all down" | `( cd infra && AWS_PROFILE=… npx cdk destroy -c env=<env> )` — **always confirm with the user first** |
 
