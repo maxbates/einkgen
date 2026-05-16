@@ -5,6 +5,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.0.3] - 2026-05-16
+
+### Changed
+- **CDK bumped from 2.170.0 to 2.254.0 to retire Node.js 20.x from the
+  stack's auto-generated Lambdas.** AWS is ending support for the
+  `nodejs20.x` Lambda runtime on April 30, 2026. Two CDK-managed
+  custom-resource Lambdas in this stack were running on `nodejs20.x`:
+  the `AwsCustomResource` singleton that seeds
+  `config/email_allowlist.txt` on first deploy of the inbound-email
+  construct, and the `LogRetention` provider that backs the
+  `logRetention` prop on the inbound-email Lambda. In aws-cdk-lib
+  2.254.0 both resolve via `Runtime.NODEJS_LATEST` (now
+  `nodejs22.x`), so the next `cdk deploy` migrates them off the
+  deprecated runtime with no source-level changes. The user-facing
+  Lambdas (generator / read-api / device-status / inbound-email /
+  admin-api) are Python 3.12 and unaffected. CLI bumped from 2.170.0
+  to 2.1122.0 to match.
+
 ## [0.4.0.2] - 2026-05-16
 
 ### Fixed
