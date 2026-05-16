@@ -5,6 +5,18 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.3.4.1] - 2026-05-15
+
+### Changed
+- **Email confirmation echoes the captured prompt back to the sender.** When
+  an inbound submission is accepted, the "submission queued" reply now
+  includes a `Prompt:` section quoting the cleaned prompt text (subject +
+  body merged, signature stripped). Lets the sender verify what the parser
+  actually captured before the generator runs, instead of waiting for the
+  resulting image to find out their subject line got dropped. Image-only
+  submissions are unchanged — no `Prompt:` section unless a restyle hint
+  was provided.
+
 ## [0.3.4.0] - 2026-05-15
 
 ### Added
