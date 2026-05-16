@@ -60,6 +60,47 @@ CLI required. Public viewers continue to see exactly what they saw before
 - Cookie path-scoped to `/admin` — never sent to the public read API or
   the `current/` / `history/` paths on the same origin.
 
+## [0.3.4.3] - 2026-05-15
+
+### Changed
+- **Test-suite bootstrap now uses `uv` instead of bare pip.** `CLAUDE.md`
+  documents `uv run --extra dev pytest` as the canonical way to run the
+  test suite, and warns away from `pip install -e ".[dev]"` + bare
+  `pytest`. Without this, every fresh worktree (and every Claude Code
+  session that landed in one) re-downloaded Pillow + moto + boto3 etc.
+  from PyPI because the system pip cache was empty and the system Python
+  on macOS dev boxes doesn't satisfy `requires-python >=3.11`. `uv`
+  auto-syncs `.venv/` from `pyproject.toml` and reuses a global wheel
+  cache, so a fresh worktree boots in seconds after the first install.
+  Lockfile (`uv.lock`) is now committed so the resolved dependency set
+  is reproducible across worktrees and machines.
+
+## [0.3.4.2] - 2026-05-15
+
+### Fixed
+- **Firmware now compiles.** `drawBatteryOverlay()` declared local
+  `const uint16_t BLACK = 0;` and `const uint16_t WHITE = 7;` for
+  INKPLATE_3BIT colour values, but the Inkplate Arduino library's
+  `defines.h` `#define`s `BLACK 1` and `WHITE 0` at the include level.
+  Those macros expanded inside the function before the constants were
+  parsed, producing `const uint16_t 1 = 0;` and a compile error.
+  Renamed the locals to `INK_BLACK` / `INK_WHITE`. Latent since
+  v0.3.2.0 — surfaced when the v0.3.4.0 WAKE-button work prompted a
+  hardware re-flash and the overlay code hit the preprocessor for the
+  first time.
+
+## [0.3.4.1] - 2026-05-15
+
+### Changed
+- **Email confirmation echoes the captured prompt back to the sender.** When
+  an inbound submission is accepted, the "submission queued" reply now
+  includes a `Prompt:` section quoting the cleaned prompt text (subject +
+  body merged, signature stripped). Lets the sender verify what the parser
+  actually captured before the generator runs, instead of waiting for the
+  resulting image to find out their subject line got dropped. Image-only
+  submissions are unchanged — no `Prompt:` section unless a restyle hint
+  was provided.
+
 ## [0.3.4.0] - 2026-05-15
 
 ### Added
