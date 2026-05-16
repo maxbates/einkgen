@@ -71,9 +71,11 @@ src/einkgen/
 │   ├── history.py              einkgen history
 │   ├── queue.py                einkgen queue {ls,rm,prompt,image} (image takes --prompt for restyle)
 │   ├── allowlist.py            einkgen allowlist {ls,add,rm} (inbound-email senders)
+│   ├── prompts.py              einkgen prompts {ls,edit,reset} (random-pick library)
 │   └── local.py                einkgen local {generate,convert,preview}
 ├── core/                       shared image/queue/publish logic (CLI ↔ Lambda)
-│   ├── generate.py             OpenAI gpt-image-2 generate + edit + BASE_PROMPT + PROMPT_LIBRARY (quality=medium)
+│   ├── generate.py             OpenAI gpt-image-2 generate + edit + BASE_PROMPT (quality=medium); random_prompt() → prompt_library
+│   ├── prompt_library.py       S3-backed random-pick bank (`config/prompt_library.txt`); operator-editable via Admin tab + CLI
 │   ├── convert.py              crop + grayscale + Atkinson dither + 8-bit BMP
 │   ├── publish.py              writes current/, archives history/, CF invalidate
 │   ├── manifest.py             manifest schema + next_check_after
@@ -88,7 +90,7 @@ src/einkgen/
     ├── read_api.py             GET /queue, /history, /status
     ├── device_status.py        POST / (X-Device-Token)
     ├── inbound_email.py        S3-triggered SES inbound parser → queue.enqueue
-    └── admin_api.py            POST /admin/{login,logout,queue/prompt,queue/image} + GET /admin/me
+    └── admin_api.py            POST /admin/{login,logout,queue/prompt,queue/image,prompts/reset} + GET/PUT /admin/prompts + GET /admin/me
 
 web/                            React + Vite SPA (read-only dashboard + admin tab)
 ├── src/api.ts                  typed client for read-api + admin-api Lambdas
@@ -136,6 +138,7 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "Run the tests" / "Run the test suite" | `uv run --extra dev pytest` from the repo (or worktree) root. `uv` syncs `.venv/` from `pyproject.toml` on demand and reuses a global wheel cache (`~/.cache/uv/`), so first run in a fresh worktree is one-time-slow and every subsequent run is seconds. Do **not** bootstrap with bare `pip install -e ".[dev]"` + `pytest` — pip has no shared cache and the system Python on macOS dev boxes often doesn't satisfy `requires-python >=3.11`, so it re-downloads everything every time and may pick the wrong interpreter. |
 | "Set up email submission" / "Enable inbound email" | Already on for the canonical `einkgen.link` deploy via [infra/cdk.json](infra/cdk.json) context. For a **new** domain, follow [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel) — pick path A (register a new domain via `infra/scripts/register-domain.sh`) or B (delegate an existing domain to Route 53), edit `einkgenInboundDomain` in `infra/cdk.json` to that domain (or pass `-c einkgenInboundDomain=<domain>` to override), redeploy. DKIM CNAMEs + MX are auto-created by CDK; **receipt-rule activation is one-time-manual** (`aws ses set-active-receipt-rule-set --rule-set-name einkgen-inbound`) — survives all future redeploys. |
 | "Add an allowed email sender" | `einkgen allowlist add <email>` (writes `config/email_allowlist.txt`). Comparison is case-insensitive. Never hardcode addresses in committed CDK — first-deploy seeding goes through the `einkgenAllowlistSeed` context flag instead. |
+| "Edit the random prompt bank" / "Change what the cron picks from" / "Add/remove a random prompt" | Edit from the SPA **Admin** tab (textarea, one prompt per line, Save / Reset to defaults) or via `einkgen prompts {ls,edit,reset}`. Persists to `s3://<bucket>/config/prompt_library.txt`; Lambda picks up changes within ~60 s (warm-container cache TTL). Missing/empty file → falls back to the 10 seed defaults baked into `core/prompt_library.py::DEFAULTS`. |
 | "Pick me a cheap domain" | `aws route53domains list-prices --region us-east-1` + filter where reg ≤ $10 *and* renew ≤ $10. Then `check-domain-availability` per candidate. Always surface renewal price — domain registration is a recurring cost. Don't autonomously register; have the human `cp register-domain.example.sh register-domain.sh` and fill in their PII (the live `.sh` is gitignored). |
 | "Change the dither algorithm" | `src/einkgen/core/convert.py`. **Read [TODOS.md](TODOS.md) §"Profile and replace pure-Python error-diffusion dither" first** — the current pure-Python Atkinson is the considered choice. Don't replace without re-measuring. |
 | "Change the device poll interval" / "make it check more often" | Edit **both** `SLEEP_MAX_SECONDS` + `SLEEP_FALLBACK_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) **and** redeploy with `-c einkgenPollIntervalSeconds=<n>`. See [QUICKSTART §3.12](QUICKSTART.md#312-optional-device-poll-interval) for the battery-life table. Server-only change is silently clamped by firmware. Don't conflate with the auto-gen `rate(2 hours)` cron — that's the OpenAI-cost knob, separate concern. |

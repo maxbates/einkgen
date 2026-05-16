@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.0.6] - 2026-05-16
+
+### Added
+- **Random-pick prompt library is now operator-editable at runtime.**
+  Previously the 10-entry `PROMPT_LIBRARY` was hardcoded in
+  `core/generate.py`; changing it required a redeploy. The bank now
+  lives at `s3://<bucket>/config/prompt_library.txt` (one prompt per
+  line, `#` comments ignored) and is edited from three places:
+  - the SPA **Admin** tab — a textarea with Save and "Reset to
+    defaults" buttons, behind the existing 90-day session cookie;
+  - the CLI: `einkgen prompts {ls,edit,reset}` — `edit` opens
+    `$EDITOR` on the current bank;
+  - directly via `aws s3 cp` or the AWS console for ad-hoc tweaks.
+  A 60-second in-Lambda cache amortises the fetch across warm
+  invocations, mirroring the email-allowlist pattern. Missing or
+  empty file falls back to the 10 seed defaults baked into
+  `core/prompt_library.py::DEFAULTS`, so a fresh deploy never picks
+  from an empty bank. New admin API routes: `GET /admin/prompts`,
+  `PUT /admin/prompts`, `POST /admin/prompts/reset`.
+
 ## [0.4.0.5] - 2026-05-16
 
 ### Added

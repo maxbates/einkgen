@@ -172,7 +172,7 @@ on invoke (S3 event or 2h cron):
     "prompt": img = model.generate(BASE_PROMPT + item.prompt)
     "image" if item.prompt: img = model.edit(item.image, BASE_PROMPT + item.prompt)
     "image":  img = s3.fetch(item.image_s3_key)
-    "random": img = model.generate(BASE_PROMPT + random_choice(PROMPT_LIBRARY))
+    "random": img = model.generate(BASE_PROMPT + prompt_library.random_prompt())
   processed = convert(img)
   publish(processed, source=item)
   archive(item)
@@ -246,9 +246,9 @@ not survive dithering. No text or watermarks. Subject:
 
 The user/random subject string is appended to this base.
 
-### Random-prompt library (`core/generate.py::PROMPT_LIBRARY`)
+### Random-prompt library (`core/prompt_library.py`)
 
-Used when cron fires with an empty queue. Ten entries: a mix of constrained styles and "model's choice" prompts so output stays varied.
+Used when cron fires with an empty queue. The bank is operator-editable at runtime: it lives as a plain text file at `s3://<bucket>/config/prompt_library.txt`, one prompt per line, edited from the SPA **Admin** tab, the `einkgen prompts {ls,edit,reset}` CLI, or `aws s3 cp`. A 60-second in-Lambda cache amortises the fetch across warm invocations. If the S3 file is missing or empty, `load()` falls back to the seed defaults below so a fresh deploy never picks from an empty bank. The seed is ten entries: a mix of constrained styles and "model's choice" prompts so output stays varied.
 
 1. **Geometric composition** — overlapping circles, squares, triangles; bold flat shapes; high contrast.
 2. **Botanical illustration** — pen-and-ink style; a single plant or flower; scientific-diagram aesthetic.
