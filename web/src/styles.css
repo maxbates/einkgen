@@ -179,6 +179,36 @@ button {
 }
 
 /* Queue */
+.submit-hint {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.submit-hint-heading {
+  margin: 0 0 6px;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.submit-hint-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--fg-muted);
+  font-size: 0.9rem;
+}
+.submit-hint-list code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: var(--chip-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--fg);
+}
+
 .queue-list {
   list-style: none;
   padding: 0;

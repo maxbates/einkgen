@@ -65,20 +65,24 @@ src/einkgen/
 │   ├── __init__.py             top-level dispatcher
 │   ├── status.py               einkgen status
 │   ├── history.py              einkgen history
-│   ├── queue.py                einkgen queue {ls,rm,prompt,image}
+│   ├── queue.py                einkgen queue {ls,rm,prompt,image} (image takes --prompt for restyle)
+│   ├── allowlist.py            einkgen allowlist {ls,add,rm} (inbound-email senders)
 │   └── local.py                einkgen local {generate,convert,preview}
 ├── core/                       shared image/queue/publish logic (CLI ↔ Lambda)
-│   ├── generate.py             OpenAI gpt-image-1 + BASE_PROMPT + PROMPT_LIBRARY
+│   ├── generate.py             OpenAI gpt-image-1 generate + edit + BASE_PROMPT + PROMPT_LIBRARY
 │   ├── convert.py              crop + grayscale + Atkinson dither + 8-bit BMP
 │   ├── publish.py              writes current/, archives history/, CF invalidate
 │   ├── manifest.py             manifest schema + next_check_after
 │   ├── queue.py                S3-prefix queue (enqueue/pop_head/list/cancel)
 │   ├── pipeline.py             one queue item → published frame
+│   ├── email_allowlist.py      S3-backed sender allowlist for inbound email
+│   ├── email_parse.py          MIME parse + SPF/DKIM check from SES auth headers
 │   └── s3.py                   thin boto3 wrapper
 └── lambdas/
     ├── generator.py            S3 event + cron handlers
     ├── read_api.py             GET /queue, /history, /status
-    └── device_status.py        POST / (X-Device-Token)
+    ├── device_status.py        POST / (X-Device-Token)
+    └── inbound_email.py        S3-triggered SES inbound parser → queue.enqueue
 
 web/                            React + Vite SPA (read-only dashboard)
 ├── src/api.ts                  typed client for read-api Lambda
@@ -93,13 +97,15 @@ firmware/inkplate10/            Arduino sketch + own README
 infra/                          AWS CDK stack (TypeScript)
 ├── bin/einkgen.ts              CDK app entry (one stack per env)
 ├── lib/einkgen-stack.ts        top-level wiring
-├── lib/lambdas.ts              3 Lambdas + 2 API Gateway HTTP APIs + EventBridge
+├── lib/lambdas.ts              3 base Lambdas + 2 API Gateway HTTP APIs + EventBridge
+├── lib/inbound-email.ts        opt-in SES inbound stack (gated by einkgenInboundDomain context)
 ├── lib/bucket.ts               S3 bucket (public access blocked, OAC for CDN)
 ├── lib/cloudfront.ts           distribution + viewer-request gate on history/*
 ├── lib/secrets.ts              openai_api_key + device_status_token
 ├── lib/observability.ts        log retention + ERROR metric filters + dashboard
 ├── lambda/                     per-Lambda requirements.txt + staged Python src
-├── scripts/check-errors.sh     24h ERROR sweep across all 3 Lambdas
+├── scripts/check-errors.sh     24h ERROR sweep across all Lambdas
+├── scripts/register-domain.example.sh  Route 53 domain registration template (copy to .sh, fill PII)
 └── README.md                   CDK-internal reference
 
 tests/                          pytest, moto-backed (boto3 is stubbed)
@@ -115,6 +121,9 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "What is this?" / "How does X work?" | [ARCHITECTURE.md](ARCHITECTURE.md) §1–§12 — pick the matching section |
 | "Add a CLI subcommand" | `src/einkgen/cli/<name>.py` + register in `cli/__init__.py` |
 | "Add a route on the read-api" | `src/einkgen/lambdas/read_api.py` + a test; CORS is pinned at API Gateway in `infra/lib/lambdas.ts` |
+| "Set up email submission" / "Enable inbound email" | [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel). Pick path A (register a new domain via `infra/scripts/register-domain.sh`) or B (delegate an existing domain to Route 53). Then `cdk deploy -c einkgenInboundDomain=<domain>`. DKIM CNAMEs + MX record + receipt-rule activation are still manual steps after the deploy. |
+| "Add an allowed email sender" | `einkgen allowlist add <email>` (writes `config/email_allowlist.txt`). Comparison is case-insensitive. Never hardcode addresses in committed CDK — first-deploy seeding goes through the `einkgenAllowlistSeed` context flag instead. |
+| "Pick me a cheap domain" | `aws route53domains list-prices --region us-east-1` + filter where reg ≤ $10 *and* renew ≤ $10. Then `check-domain-availability` per candidate. Always surface renewal price — domain registration is a recurring cost. Don't autonomously register; have the human `cp register-domain.example.sh register-domain.sh` and fill in their PII (the live `.sh` is gitignored). |
 | "Change the dither algorithm" | `src/einkgen/core/convert.py`. **Read [TODOS.md](TODOS.md) §"Profile and replace pure-Python error-diffusion dither" first** — the current pure-Python Atkinson is the considered choice. Don't replace without re-measuring. |
 | "It's broken / debug this" | `AWS_PROFILE=einkgen ./infra/scripts/check-errors.sh 24h` first, then `aws logs tail /aws/lambda/<fn> --follow` |
 | "QA the live SPA" | Use the deployed CloudFront URL and the browse tool (or `/qa-only` if gstack is loaded) |
@@ -130,10 +139,21 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
   Don't trigger cron faster than its 2 h rate. Don't "fix" things by
   running the generator in a loop. There is **no daily $ cap yet** (see
   [TODOS.md](TODOS.md)).
+- **Domain registration is a recurring cost.** Never auto-register a
+  domain via `route53domains register-domain`. Always present the
+  human with the renewal price and let them approve / pick the name
+  before they run their copy of `register-domain.sh`. ICANN-required
+  contact info goes in the script — never make it up.
 - **Secrets.** Never echo the OpenAI key or device-status token back to
   the user. When verifying, print *length only* (`wc -c`) or a SHA-256
   prefix. Never commit `.env`, `firmware/inkplate10/secrets.h`, or
   `infra/cdk-outputs.json` — all three are gitignored for a reason.
+- **PII / allowlist data stays out of git.** Don't hardcode email
+  addresses in committed CDK or Python — including in
+  `seedAllowlist`. First-deploy seeding goes through the
+  `einkgenAllowlistSeed` CDK context flag; the durable list lives in
+  `s3://<bucket>/config/email_allowlist.txt` and is edited via
+  `einkgen allowlist {add,rm}`. The S3 file is never committed.
 - **Destructive AWS ops require explicit human confirmation** in the
   current message, every time:
   - `cdk destroy`, `aws s3 rm --recursive`, `aws secretsmanager delete-secret`

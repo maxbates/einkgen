@@ -39,11 +39,21 @@ def test_enqueue_validates_kind_fields(s3_bucket):
     with pytest.raises(ValueError):
         q.enqueue("image")  # missing image_s3_key
     with pytest.raises(ValueError):
-        q.enqueue("image", image_s3_key="queue/staged/x", prompt="hi")
-    with pytest.raises(ValueError):
         q.enqueue("random", prompt="hi")
     with pytest.raises(ValueError):
         q.enqueue("weird")
+
+
+def test_enqueue_image_with_prompt_is_allowed(s3_bucket):
+    """kind='image' may carry an optional prompt that restyles the upload."""
+    item = q.enqueue("image", image_s3_key="queue/staged/x.jpg", prompt="watercolor")
+    assert item.kind == "image"
+    assert item.image_s3_key == "queue/staged/x.jpg"
+    assert item.prompt == "watercolor"
+
+    payload = json.loads(s3_bucket.get_object(Bucket=TEST_BUCKET, Key=item._s3_key)["Body"].read())
+    assert payload["prompt"] == "watercolor"
+    assert payload["image_s3_key"] == "queue/staged/x.jpg"
 
 
 def test_list_returns_items_in_fifo_order(s3_bucket):

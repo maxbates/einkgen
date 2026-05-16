@@ -11,6 +11,11 @@ dist/
 # Env
 .env
 
+# Per-operator domain registration script — contains ICANN registrant
+# contact info (name, address, phone). Copy register-domain.example.sh
+# to register-domain.sh and fill in the placeholders.
+infra/scripts/register-domain.sh
+
 # Local CLI scratch outputs
 out.png
 out.bmp

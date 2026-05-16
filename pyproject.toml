@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "einkgen"
-version = "0.2.0"
+version = "0.3.0"
 description = "Inkplate 10 e-paper image pipeline (CLI + Lambdas)"
 requires-python = ">=3.11"
 dependencies = [

@@ -34,7 +34,19 @@ def process_item(item: QueueItem) -> None:
     elif item.kind == "image":
         if not item.image_s3_key:
             raise ValueError(f"image item {item.id} has no image_s3_key")
-        original_png = s3.get_object(item.image_s3_key)
+        uploaded = s3.get_object(item.image_s3_key)
+        if item.prompt:
+            # Image + prompt: feed both to the edit endpoint so the prompt
+            # restyles the upload. Filename hint comes from the staged key
+            # so the SDK picks a sane MIME based on extension.
+            import os as _os
+
+            filename = _os.path.basename(item.image_s3_key) or "input.png"
+            original_png = generate.generate_from_image(
+                item.prompt, uploaded, image_filename=filename
+            )
+        else:
+            original_png = uploaded
     elif item.kind == "random":
         prompt = generate.random_prompt()
         item.prompt = prompt  # so publish/manifest can record the chosen subject
@@ -44,11 +56,17 @@ def process_item(item: QueueItem) -> None:
 
     processed_bmp = convert_mod.convert(original_png)
 
+    # "uploaded" means the published frame is the user's bytes (passed through
+    # B&W only). When an image is restyled via gpt-image-1, it's a generated
+    # frame — record it as such so history shows the model that touched it.
+    image_was_generated = item.kind != "image" or bool(item.prompt)
     source: dict[str, Any] = {
-        "kind": "generated" if item.kind != "image" else "uploaded",
+        "kind": "generated" if image_was_generated else "uploaded",
     }
-    # ARCHITECTURE §7 says model/prompt may be omitted for image-kind uploads.
-    if item.kind != "image":
+    # ARCHITECTURE §7 says model/prompt may be omitted for image-kind uploads
+    # that are passed through unchanged. A restyled image is a generated frame,
+    # so it does carry model/prompt.
+    if image_was_generated:
         source["model"] = "gpt-image-1"
     if item.prompt is not None:
         source["prompt"] = item.prompt

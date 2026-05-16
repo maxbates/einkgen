@@ -1,0 +1,7 @@
+# inbound-email uses only stdlib (email, hmac, hashlib, urllib) plus boto3,
+# which ships in the runtime. python-ulid is pulled in transitively by
+# einkgen.core.queue for enqueue(). typing_extensions is an unconditional
+# import inside python-ulid 3.1+ (`from typing_extensions import Self`), so
+# we have to ship it even on Python 3.12 where `Self` lives in stdlib.
+python-ulid>=3.0,<4.0
+typing_extensions>=4.0

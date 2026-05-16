@@ -30,6 +30,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
     im = qsub.add_parser("image", help="enqueue a local image file")
     im.add_argument("path")
+    im.add_argument(
+        "--prompt",
+        help="optional restyle prompt; if set, the image is fed to gpt-image-1's "
+        "edit endpoint instead of being passed through B&W only",
+    )
     im.set_defaults(func=_cmd_image)
 
 
@@ -79,6 +84,8 @@ def _cmd_image(args: argparse.Namespace) -> int:
     staged_key = f"{queue_core.STAGED_PREFIX}{sha8}-{path.name}"
     s3.put_object(staged_key, data)
 
-    item = queue_core.enqueue("image", image_s3_key=staged_key)
+    item = queue_core.enqueue(
+        "image", image_s3_key=staged_key, prompt=args.prompt or None
+    )
     print(item.id)
     return 0

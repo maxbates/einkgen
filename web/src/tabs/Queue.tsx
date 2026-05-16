@@ -26,25 +26,66 @@ export function Queue() {
   }, []);
 
   if (state.status === "loading") {
-    return <p className="muted">Loading queue…</p>;
+    return (
+      <>
+        <SubmissionHint />
+        <p className="muted">Loading queue…</p>
+      </>
+    );
   }
   if (state.status === "error") {
     return (
-      <div className="error">
-        <p>Could not load queue.</p>
-        <p className="muted small">{state.message}</p>
-      </div>
+      <>
+        <SubmissionHint />
+        <div className="error">
+          <p>Could not load queue.</p>
+          <p className="muted small">{state.message}</p>
+        </div>
+      </>
     );
   }
-  if (state.items.length === 0) {
-    return <p className="muted">Queue is empty.</p>;
-  }
   return (
-    <ol className="queue-list">
-      {state.items.map((item) => (
-        <QueueRow key={item.id} item={item} />
-      ))}
-    </ol>
+    <>
+      <SubmissionHint />
+      {state.items.length === 0 ? (
+        <p className="muted">Queue is empty.</p>
+      ) : (
+        <ol className="queue-list">
+          {state.items.map((item) => (
+            <QueueRow key={item.id} item={item} />
+          ))}
+        </ol>
+      )}
+    </>
+  );
+}
+
+/**
+ * Banner at the top of the Queue tab explaining how to submit. The inbound
+ * email domain is build-time config (``VITE_INBOUND_EMAIL_DOMAIN``); when
+ * unset, the email line is omitted and only the CLI route is shown.
+ */
+function SubmissionHint() {
+  const emailDomain = import.meta.env.VITE_INBOUND_EMAIL_DOMAIN as
+    | string
+    | undefined;
+  return (
+    <aside className="submit-hint">
+      <p className="submit-hint-heading">Add to the queue</p>
+      <ul className="submit-hint-list">
+        <li>
+          From your laptop:{" "}
+          <code>einkgen queue prompt "&lt;text&gt;"</code> or{" "}
+          <code>einkgen queue image &lt;path&gt;</code>
+        </li>
+        {emailDomain ? (
+          <li>
+            From anywhere: email anything <code>@{emailDomain}</code> (subject
+            becomes the prompt; attach an image to upload it).
+          </li>
+        ) : null}
+      </ul>
+    </aside>
   );
 }
 
