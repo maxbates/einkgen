@@ -186,6 +186,23 @@ def test_publish_falls_back_when_poll_interval_env_unparseable(s3_bucket, monkey
     assert m.next_check_after == "2026-05-13T15:05:00Z"
 
 
+@pytest.mark.parametrize("bad_value", ["0", "-5"])
+def test_publish_falls_back_when_poll_interval_env_nonpositive(
+    s3_bucket, monkeypatch, bad_value
+):
+    # The ``seconds <= 0`` guard in _poll_interval must also fall back to
+    # the 1 h default — a zero or negative interval would otherwise round
+    # the next-check to "right now" and DoS the device.
+    monkeypatch.setenv("EINKGEN_POLL_INTERVAL_SECONDS", bad_value)
+    m = publish.publish(
+        PROCESSED,
+        source={"kind": "generated"},
+        item_id=f"id-poll-{bad_value.replace('-', 'neg')}",
+        now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),
+    )
+    assert m.next_check_after == "2026-05-13T15:05:00Z"
+
+
 def test_publish_prompt_kwarg_overrides_source(s3_bucket):
     m = publish.publish(
         PROCESSED,
