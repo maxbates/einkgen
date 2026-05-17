@@ -31,8 +31,11 @@ BASE_PROMPT = (
     "Compose a single image at 1200×832 (landscape, ~1.44:1). It will be displayed on\n"
     "a 1200×825 e-paper panel (a 7-pixel sliver trimmed off the height) and dithered\n"
     "to 8 grayscale levels. The whole canvas is visible — there is no safe-area inset.\n"
-    "Use high-contrast tones, bold shapes, and clean edges — subtle gradients and fine\n"
-    "textures will not survive dithering. No text or watermarks. Subject:"
+    "Favor a bright, paper-white background with the subject rendered in strong darks\n"
+    "against it — e-ink looks best when most of the canvas is light. Avoid flooding\n"
+    "large areas with dark or muddy mid-grays. Use high-contrast tones, bold shapes,\n"
+    "and clean edges — subtle gradients and fine textures will not survive dithering.\n"
+    "No text or watermarks. Subject:"
 )
 
 # Re-export the seed library so callers that want the unedited bank (tests,

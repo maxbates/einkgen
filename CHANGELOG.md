@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.1.2] - 2026-05-16
+
+### Changed
+- **BASE_PROMPT** now nudges the model toward bright, paper-white
+  backgrounds with the subject rendered in strong darks against them,
+  and explicitly discourages flooding large areas with dark or muddy
+  mid-grays. E-ink panels look best when most of the canvas is light;
+  the previous "high contrast, bold shapes" guidance didn't prevent
+  generations from filling the frame with heavy gray fields that
+  dithered into a muddy wash. The new wording is additive — the
+  existing 8-grayscale / no-text / no-gradients guidance is preserved
+  — so the change is a tone shift, not a style override. Mirrored in
+  [ARCHITECTURE.md §6](ARCHITECTURE.md#base-prompt-prepended-to-every-generation).
+
 ## [0.4.1.1] - 2026-05-16
 
 ### Fixed
