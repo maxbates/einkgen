@@ -241,8 +241,11 @@ Profiled cost on Lambda ARM64 1024 MB: dither ~2–3 s, OpenAI call ~52–55 s, 
 Compose a single image at 1200×832 (landscape, ~1.44:1). It will be displayed on
 a 1200×825 e-paper panel (a 7-pixel sliver trimmed off the height) and dithered
 to 8 grayscale levels. The whole canvas is visible — there is no safe-area inset.
-Use high-contrast tones, bold shapes, and clean edges — subtle gradients and fine
-textures will not survive dithering. No text or watermarks. Subject:
+Favor a bright, paper-white background with the subject rendered in strong darks
+against it — e-ink looks best when most of the canvas is light. Avoid flooding
+large areas with dark or muddy mid-grays. Use high-contrast tones, bold shapes,
+and clean edges — subtle gradients and fine textures will not survive dithering.
+No text or watermarks. Subject:
 ```
 
 The user/random subject string is appended to this base.
