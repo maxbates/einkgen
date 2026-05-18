@@ -5,6 +5,160 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.5.1.0] - 2026-05-17
+
+### Changed
+- **Single cadence knob: ``einkgenPollIntervalSeconds`` in
+  [infra/cdk.json](infra/cdk.json) (default ``"1800"`` = 30 min).**
+  This one value now drives BOTH the EventBridge cron rate that
+  fires the generator AND the manifest's ``next_check_after`` hint
+  for the device. Before this change the two were independent — the
+  cron rate was hardcoded as ``Duration.hours(2)`` in
+  ``infra/lib/lambdas.ts`` and the device hint was a separate
+  optional CDK context flag — which made it easy to push one without
+  the other and end up rendering 4× faster than the device polled
+  (or vice versa, polling 4× faster than cron rendered). Coupling
+  them at construction time removes that footgun.
+
+  Cost at 30 min: ~48 renders/day ≈ $55/mo at gpt-image-2 medium
+  pricing (vs the original ~$15/mo at 2 h). Battery life on the
+  Inkplate ~3–4 months (vs ~6–9 months at 1 h). The full table is
+  in [QUICKSTART §1.7](QUICKSTART.md#17-pick-a-render-cadence-optional-but-think-about-it-now).
+
+  To change after deploy: edit ``cdk.json`` + redeploy. ``cdk synth``
+  rejects values < 60 or not divisible by 60 (EventBridge ``rate()``
+  only accepts whole-minute schedules). Values > 3600 also need
+  ``SLEEP_MAX_SECONDS`` raised in
+  [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino)
+  in lockstep — see [QUICKSTART §3.12](QUICKSTART.md#312-change-the-render--poll-cadence-later).
+
+- **Queue reorderability dropped.** The ``position: float`` field on
+  every ``QueueItem`` and the ``move_to_top`` / ``POST /admin/queue/<id>/top``
+  routes are gone. The queue is now a fixed two-priority buffer:
+  ``"top"`` queue items always drain before ``"bottom"`` queue items;
+  FIFO within each. **No S3 object is mutated after it's written** —
+  the priority is encoded in the key (``queue/0-<…>.json`` for top,
+  ``queue/1-<…>.json`` for bottom). The user-facing **Top** / **Bottom**
+  / **Now** placement buttons on the Admin form still work exactly the
+  same; only the per-row "move-to-top" affordance on the Queue tab is
+  removed.
+
+- **Per-row "Run" no longer reorders.** Instead of "promote item to head
+  and render", it async-invokes the generator with a new
+  ``{"action": "render_item", "item_id": "..."}`` payload that renders
+  that specific item out of queue order, without touching anything else
+  on disk. The item is finalized (deleted) on success.
+
+### Added
+- **Generator action ``render_item``** — direct-invoke payload
+  ``{"action": "render_item", "item_id": "..."}``. Fetches the named
+  item by id, renders it, and finalizes. No-op (with INFO log) if the
+  id has already been drained. Used by the Queue tab's per-row **Run**
+  button.
+
+### Removed
+- ``QueueItem.position`` field. Items still load if S3 has stale JSON
+  carrying the field — it's just ignored.
+- ``queue.move_to_top(id)`` helper.
+- ``POST /admin/queue/<id>/top`` route (returns 404 now).
+- ``adminMoveQueueToTop()`` from the typed SPA client.
+- Per-row **Top** button on the SPA Queue tab.
+
+### Migration
+- **Items already on the queue at the time of deploy** keep their old
+  keys (``queue/<iso_ts>-<ulid>.json``, no priority prefix). Lex sort
+  puts them *after* both new priorities — ``"2026-…"`` > ``"1-…"`` >
+  ``"0-…"`` — so they drain naturally as the queue tail over a handful
+  of cron ticks. No migration script.
+- **In-flight 0.5.0.0 items** with a ``position`` field in their JSON
+  body load fine — the field is dropped on read; ordering comes from
+  the key prefix instead.
+
+## [0.5.0.0] - 2026-05-17
+
+### Changed
+- **Queue redesign — the queue is now a curated buffer, not a fire-and-forget
+  pipe.** The S3 ObjectCreated trigger on `queue/` is gone; items enqueued
+  by CLI, email, admin, or cron sit on the queue until either the cron
+  tick or an explicit admin action renders them. This was the central
+  request of the redesign: long queue, only render when needed.
+  - **`queue.QueueItem`** gains a `position: float` field. `list()` and
+    `peek_head()` sort by `(position, enqueued_at)`. New items at the
+    bottom get `max + 1`; at the top, `min - 1`. Reorder is in-place —
+    the S3 key never changes, so `cancel(id)` and enqueue timestamps
+    survive moves. Items written before this field existed default to
+    `position=0.0` so the rollout doesn't strand any in-flight item.
+  - **`queue.enqueue(..., at="top"|"bottom")`** — new keyword.
+    `"bottom"` is the default.
+  - **`queue.move_to_top(id)`**, **`queue.get(id)`**, **`queue.count()`**
+    — new helpers used by the admin API and SPA.
+
+- **Generator Lambda — cron tick now does two things.** Every 2 h:
+  1. Top up the queue to at least 5 pending items by picking a topic
+     from the operator-editable prompt library and asking a text LLM
+     (default `gpt-5-mini`, override via `EINKGEN_TEXT_MODEL`) to expand
+     it into a concrete image prompt. The expansion is the queue item;
+     image generation happens later when the item reaches the head.
+     Text-generation variance is much higher than image-generation
+     variance, so expanding once per item yields more diverse frames
+     from the same topic list.
+  2. Render the current head.
+
+  A new direct-invoke path — payload `{"action": "render_now"}` — lets
+  the admin API ask the generator to render the head immediately (used
+  by the **Now** and **Run** buttons). Reserved concurrency = 1 keeps
+  everything serial: a Now request fired mid-cron queues behind it and
+  runs as soon as the tick returns.
+
+- **Random prompt library is now a *topic* bank, not a *prompt* bank.**
+  Behaviorally identical — entries are still one line each, still
+  edited from the SPA Admin tab — but the description and seed
+  examples are framed as topics (the cron expands each pick before
+  enqueueing). The seed defaults still load the original 10 entries
+  for the first deploy.
+
+### Added
+- **Admin API — `at` field on enqueue and three per-item routes.**
+  - `POST /admin/queue/prompt` / `/image` accept `at: "top" | "bottom"
+    | "now"` (default `"bottom"`). `"now"` enqueues at the top AND
+    async-invokes the generator so the new item renders immediately.
+  - `POST /admin/queue/<id>/top` — move an existing item to the head.
+  - `POST /admin/queue/<id>/run` — move to head + invoke generator.
+  - `DELETE /admin/queue/<id>` — remove a pending item.
+  - New env var: **`EINKGEN_GENERATOR_FUNCTION_NAME`**, used by `now`
+    and `/run` to target the generator Lambda. Without it, those routes
+    still enqueue but skip the immediate render; the next cron tick
+    picks the item up.
+
+- **SPA Admin tab — three-button enqueue.** The single "Enqueue prompt"
+  / "Upload image" buttons are replaced with **Top** / **Bottom** /
+  **Now** clusters with Apple Music–style icons (insert-at-top,
+  insert-at-bottom, play).
+- **SPA Queue tab — per-row admin actions.** When logged in as admin,
+  each queued item gets **Top** / **Run** / **Remove** buttons. The
+  head item shows an `up next` chip.
+- **`einkgen queue prompt --top`** and **`einkgen queue image --top`** —
+  CLI parity with the Admin "Top" button.
+- **`einkgen.core.generate.expand_topic(topic)`** — the text-LLM
+  topic→prompt expansion used by the cron's top-up step.
+
+### Removed
+- **S3 ObjectCreated trigger on `queue/`.** The generator no longer
+  auto-drains on enqueue. Items wait for cron, `render_now`, or the
+  admin "Run" button. Lambda already-in-flight S3 notifications fired
+  before the trigger was removed are explicitly ignored by the new
+  handler (logged at INFO and dropped) so they can't accidentally
+  drain items.
+
+### Migration
+- **Items already on the queue at the moment of deploy** lack a
+  `position` field. They load with `position=0.0`, so they stay in
+  the middle when mixed with new entries (new tops go negative, new
+  bottoms go positive). They will render on the next cron tick or the
+  first admin "Run" — no data loss, just a brief delay relative to the
+  old auto-drain behaviour. If you want to drain them faster, hit the
+  **Run** button on each from the Queue tab.
+
 ## [0.4.1.4] - 2026-05-17
 
 ### Added

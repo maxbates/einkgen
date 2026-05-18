@@ -31,28 +31,39 @@ Sources: [Inkplate 10 overview](https://docs.soldered.com/inkplate/10/overview/)
 ## 2. How the system works
 
 ```
-   CLI ──┐            ┌────────────────────┐                     ┌──────────────────┐
-  cron ──┤  enqueue ─▶│  queue (S3 prefix) │── S3 ObjectCreated ▶│ generator Lambda │──┐
- future ─┘            └────────────────────┘    (concurrency=1)  └──────────────────┘  │
-                              ▲                                                        │
-                              │                                                        ▼
-                              │                                              ┌────────────────┐
-                              │   read-only                                  │   S3 bucket    │
-                       ┌─────────────────┐    ◀── public reads ──            │   + manifest   │
-                       │  web app (SPA)  │    via read-api Lambda            └────────┬───────┘
-                       │  3 tabs, public │                                            │
-                       └─────────────────┘                                            │ CloudFront
-                                                                                      ▼ HTTPS GET
-                                                                              ┌──────────────┐
-                                                                              │ Inkplate 10  │   wakes ≤ every 1h,
-                                                                              │   firmware   │   pulls manifest,
-                                                                              └──────────────┘   redraws if changed,
-                                                                                                 POSTs status, sleeps
+   CLI ───┐
+   admin ─┤   enqueue
+   email ─┤  ───────▶  ┌────────────────────┐      cron tick (2 h)   ┌──────────────────┐
+   cron ──┘            │  queue (S3 prefix) │  + admin "Now"/"Run"  ▶│ generator Lambda │──┐
+                       │  reorderable buffer│  (lambda.invoke async)│  (concurrency=1) │  │
+                       └────────────────────┘                       └──────────────────┘  │
+                              ▲                                                           │
+                              │                                                           ▼
+                              │                                                 ┌────────────────┐
+                              │   read-only                                     │   S3 bucket    │
+                       ┌─────────────────┐    ◀── public reads ──               │   + manifest   │
+                       │  web app (SPA)  │    via read-api Lambda               └────────┬───────┘
+                       │  3 tabs, public │                                               │
+                       │  + Admin tab    │  ◀── writes through admin-api Lambda          │ CloudFront
+                       └─────────────────┘                                               ▼ HTTPS GET
+                                                                                 ┌──────────────┐
+                                                                                 │ Inkplate 10  │  wakes ≤ every 1h,
+                                                                                 │   firmware   │  pulls manifest,
+                                                                                 └──────────────┘  redraws if changed,
+                                                                                                   POSTs status, sleeps
 ```
 
-Writes (enqueue, generate, publish) come only from the CLI today; cron handles the empty-queue case. The web app is strictly read-only — three tabs that show the queue, the history, and the device's status — so a leaked URL can't burn any money. Future input channels (text, email, etc.) are deliberately deferred but the queue is the single contract they'll plug into.
+The queue is now a curated buffer. The cron tick — every 2 h — keeps it
+topped up (≥ 5 pending items, each a text-LLM expansion of a topic from
+the prompt library) and renders the current head. There is **no S3
+ObjectCreated auto-drain**: items enqueued by CLI / email / admin sit on
+the queue until the next cron tick or an explicit admin **Run** / **Now**
+button async-invokes the generator with `{"action":"render_now"}`.
 
-A single generator Lambda drains the queue one item at a time (reserved concurrency = 1). Each new queue object fires an S3 `ObjectCreated` event that invokes the Lambda; cron is just another writer that drops a `random` item into the queue when nothing is pending.
+A single generator Lambda renders one item at a time (reserved
+concurrency = 1). Cron, async invokes, and any future trigger all
+funnel through that one serialised worker, so cost is bounded by the
+slowest caller and head reads are race-free.
 
 The Inkplate runs a small sketch that, on every wake:
 1. Joins Wi-Fi.
@@ -94,11 +105,31 @@ einkgen local preview  "<text>"               # generate + convert, save preview
 
 `local *` never touches the bucket — pure dev/debug. Everything under `queue *` writes to S3 with the operator's IAM creds.
 
-### Cron (only other writer)
+### Cron (top up + render)
 
-- An EventBridge rule fires a thin entry in the generator Lambda **every 2 hours**.
-- If the queue is empty, the Lambda enqueues a `{kind: "random"}` item; that drop triggers the normal S3-event path and the same Lambda invocation drains it.
-- If the queue is non-empty, the Lambda processes **exactly one** head item per tick. This is a backstop for items stranded by a prior failed S3 delivery (e.g. a Lambda init crash that exhausted async retries). Steady-state, the S3 event has already drained them and the queue is empty by the time cron fires; one-per-tick keeps OpenAI cost bounded even if a real backlog builds up.
+- An EventBridge rule fires the generator Lambda **every 30 minutes**.
+- Each tick does two things, in order:
+  1. **Top up.** If the queue holds fewer than `TARGET_QUEUE_LENGTH`
+     (= 5) pending items, pick that many topics at random from
+     `config/prompt_library.txt`, run each through a text-LLM
+     expansion step (`generate.expand_topic`, default `gpt-5-mini`)
+     to turn the short topic into a concrete image prompt, and
+     enqueue the expansions at the bottom with `kind="prompt",
+     source="cron"`. Text-LLM cost per expansion is a rounding error
+     against one `gpt-image-2` call, so keeping the queue full is
+     effectively free. A failed expansion falls back to enqueueing
+     the raw topic — the queue still fills.
+  2. **Render head.** Pop the head item (top queue first, then bottom),
+     generate the image, publish.
+- Cost is bounded by cadence: one image per tick = ~48 renders per
+  day = ~$55/mo at gpt-image-2 medium pricing. A bigger queue doesn't
+  change the rate; it just gives the operator more items to inspect /
+  drop / run-now between ticks. Dialling up (`rate(15 minutes)`)
+  costs ~$115/mo; going back to `rate(1 hour)` is ~$30/mo. The
+  firmware doesn't need to be re-flashed for any of these — the
+  manifest's `next_check_after` hint is what tells the device how
+  often to poll, capped only when it would exceed
+  `SLEEP_MAX_SECONDS = 1 h`.
 
 ### Web app (read-only)
 
@@ -128,13 +159,45 @@ The queue API in `core/queue.py` is the seam: any future channel becomes a small
 
 ## 4. Queue
 
-The queue is the single source of truth for "what image should appear next." Items are processed strictly FIFO, one at a time. No coalescing — if you enqueue three prompts in a row, the generator runs all three and the device shows the latest each time it wakes.
+The queue is a **two-priority buffer**: cron / CLI / email / admin all
+write to it; nothing renders until cron, `render_now`, or the admin
+**Run** button explicitly says so. Items in the **top** queue always
+drain before any item in the **bottom** queue; FIFO within each. No
+coalescing.
 
-**Backing store: S3 prefix.** Each item is a JSON object at `s3://<bucket>/queue/<iso8601>-<ulid>.json`. The ULID is monotonic so lex-sorted keys = FIFO. Pop = `ListObjectsV2` (sorted) → `GetObject` → `DeleteObject`. No queue infra to provision.
+**Backing store: S3 prefix.** Each item is a JSON object at
+`s3://<bucket>/queue/<priority>-<iso8601>-<ulid>.json` where
+`<priority>` is the literal character `"0"` (top) or `"1"` (bottom).
+Lex-sorted `ListObjectsV2` is the queue order: all `0-…` items
+precede all `1-…` items, ordered by their enqueue timestamp within
+each priority. **S3 objects are never mutated after they're written.**
+The earlier design used a `position: float` field and supported
+arbitrary reordering, which required reading + rewriting individual
+objects to move them; the user found that brittle for a buffer that
+might be tweaked from a phone, so the redesign in [CHANGELOG 0.5.1.0]
+swapped to fixed priorities encoded in the key.
 
-**Trigger.** An S3 `ObjectCreated` notification on the `queue/` prefix fans into the generator Lambda. Lambda **reserved concurrency = 1** serialises drains so two events can't race on the same head.
+Lambda **reserved concurrency = 1** on the generator serialises every
+render (cron, async invokes, future wake-button hits) so two callers
+can't race on the head.
 
-If we ever outgrow the S3-prefix queue (multi-producer races, very high write rate), swap `core/queue.py` for an SQS FIFO or DynamoDB backing without touching anything else.
+If we ever outgrow the S3-prefix queue (multi-producer races, very high
+write rate), swap `core/queue.py` for an SQS FIFO or DynamoDB backing
+without touching anything else.
+
+### Placement
+
+- **Bottom insert** (`at="bottom"`, default): key prefix `queue/1-…`.
+- **Top insert** (`at="top"`): key prefix `queue/0-…`.
+- **No move-to-top.** Pick the right placement at enqueue time. If
+  you need to render a specific pending item without waiting for it
+  to reach the head, async-invoke the generator with
+  `{"action": "render_item", "item_id": "..."}` (which is what the
+  per-row **Run** button on the SPA Queue tab does).
+- Items written before this key format existed (`queue/<iso_ts>-<ulid>.json`,
+  no priority prefix) lex-sort *after* both new priorities — `"2026-…"`
+  > `"1-…"` > `"0-…"` — so they drain as the queue tail. No migration
+  needed.
 
 ### Queue item schema
 
@@ -142,7 +205,7 @@ If we ever outgrow the S3-prefix queue (multi-producer races, very high write ra
 {
   "id": "01HF7Z…",
   "enqueued_at": "2026-05-13T14:05:12Z",
-  "source": "cli" | "cron" | "email" | "<future-channel>",
+  "source": "cli" | "cron" | "email" | "admin" | "<future-channel>",
   "kind": "prompt" | "image" | "random",
   "prompt": "a foggy cliff at dawn",
   "image_s3_key": "queue/staged/abc123.jpg"
@@ -153,21 +216,40 @@ Field constraints by kind:
 
 - **`prompt`** — `prompt` required, `image_s3_key` forbidden.
 - **`image`** — `image_s3_key` required; `prompt` optional. With no prompt the upload is converted to B&W and published. With a prompt, the upload is fed to `gpt-image-2`'s edit endpoint, restyled per the prompt, then dithered and published.
-- **`random`** — both forbidden; the generator picks from the prompt library and patches `prompt` in-place before publishing.
+- **`random`** — legacy kind, kept so items enqueued by older code still
+  drain. New code paths never emit it: cron picks a topic from the
+  prompt library, expands it via the text LLM, and enqueues
+  `kind="prompt"` with the expansion baked in.
 
 ### Generator loop
 
 ```
-on invoke (S3 event or 2h cron):
-  if cron:
-    if queue.empty():
-      queue.enqueue({kind: "random"})  # falls through to the S3-event path
-      return
-    item = queue.pop_head()            # one item per tick, self-heal backstop
-    if item is None: return
-    process(item); return
-  item = queue.pop_head()              # atomic via reserved concurrency = 1
-  if item is None: return
+on invoke:
+  if event["action"] == "render_now":          # admin Now via lambda.invoke
+    render_head()
+    return
+  if event["action"] == "render_item":         # admin per-row Run
+    render_item_by_id(event["item_id"])
+    return
+  if cron (source=aws.events):
+    top_up_queue(target=TARGET_QUEUE_LENGTH)   # text-LLM expansions to ≥5 items
+    render_head()
+    return
+  # anything else (stray S3 event from the old trigger): log and ignore
+
+render_head():
+  head = queue.peek_head()
+  if head is None: return
+  render_one(head)
+  queue.finalize(head)
+
+render_item_by_id(item_id):
+  item = queue.get(item_id)
+  if item is None: return                      # already drained — log + noop
+  render_one(item)
+  queue.finalize(item)
+
+render_one(item):
   match item.kind:
     "prompt": img = model.generate(BASE_PROMPT + item.prompt)
     "image" if item.prompt: img = model.edit(item.image, BASE_PROMPT + item.prompt)
@@ -175,13 +257,23 @@ on invoke (S3 event or 2h cron):
     "random": img = model.generate(BASE_PROMPT + prompt_library.random_prompt())
   processed = convert(img)
   publish(processed, source=item)
-  archive(item)
 ```
 
-### Cancel & idempotency
+### Cancel, run, idempotency
 
-- `einkgen queue rm <id>` deletes the queue object before the generator picks it up.
-- Each item has a stable `id`; archive on `history/<id>/` is idempotent on re-delivery.
+- `einkgen queue rm <id>`, `DELETE /admin/queue/<id>`, and the Queue
+  tab's **Remove** button all call `queue.cancel(id)` — deletes the S3
+  object if it still exists, no-op otherwise.
+- `POST /admin/queue/<id>/run` and the per-row **Run** button
+  async-invoke the generator with `{"action": "render_item",
+  "item_id": "<id>"}`. The generator fetches that specific item,
+  renders, and finalizes — no reordering or in-place rewrite of any
+  other queue object. The HTTP request returns 202 immediately; the
+  render happens off the request path.
+- There is **no move-to-top route**. Placement is decided at enqueue
+  time (`at="top"` or `at="bottom"`).
+- Each item has a stable `id`; archive on `history/<id>/` is idempotent
+  on re-delivery.
 
 ---
 
@@ -191,10 +283,10 @@ A mostly-read-only dashboard. The public tabs have no buttons or forms — anyth
 
 ### Tabs
 
-- **Queue.** Ordered list of pending items: kind, prompt (or image thumbnail), submitted-at, source. Public.
+- **Queue.** Ordered list of pending items: kind, prompt (or image thumbnail), submitted-at, source. Public. Logged-in operators get per-row **Run** / **Remove** buttons (Apple-Music-style icons) so the queue is curatable from any phone or laptop; the head item is marked with an `up next` chip. **Run** doesn't reorder the queue — it asks the generator to render that one item next-up via `render_item`. There is no per-row "move-to-top" affordance; placement is decided at enqueue time (Top / Bottom / Now on the Admin form).
 - **History.** Grid of every published frame, newest first. Each tile shows the dithered BMP (browsers render 8-bit indexed BMP natively) + the prompt + timestamp. Click for full size and metadata. Public.
 - **Device.** Latest battery voltage and percent, Wi-Fi RSSI, last-seen timestamp, current `image_sha256` the device confirmed drawing, firmware version. Public.
-- **Admin.** Password-gated form for submitting text prompts and image uploads to the queue. Sets an HMAC-signed `einkgen_admin` session cookie (HttpOnly, Secure, SameSite=Lax, Path=`/admin`, 90-day expiry) on successful login. Public viewers see only the password prompt.
+- **Admin.** Password-gated form for submitting text prompts and image uploads to the queue. Each form has three submit buttons — **Top** (insert at head of queue), **Bottom** (default — append), **Now** (insert at head + immediately render). Sets an HMAC-signed `einkgen_admin` session cookie (HttpOnly, Secure, SameSite=Lax, Path=`/admin`, 90-day expiry) on successful login. Public viewers see only the password prompt.
 
 ### Stack
 
@@ -208,10 +300,12 @@ A mostly-read-only dashboard. The public tabs have no buttons or forms — anyth
   - `POST /admin/login`        — body `{"password": ...}`; on success returns 204 + a `Set-Cookie` HMAC-signed session token.
   - `GET  /admin/me`           — 200 if cookie is valid, 401 otherwise.
   - `POST /admin/logout`       — clears the cookie.
-  - `POST /admin/queue/prompt` — `{"prompt": "..."}` → enqueues a text prompt (`source="admin"`).
-  - `POST /admin/queue/image`  — `{"filename":..., "image_b64":..., "prompt":?}` → stages the image to `queue/staged/` and enqueues. Base64 keeps the Lambda multipart-free; API Gateway's 10 MB payload cap yields ~8 MB of decoded image.
+  - `POST /admin/queue/prompt` — `{"prompt": "...", "at": "top"|"bottom"|"now"}` → enqueues a text prompt (`source="admin"`). `at` defaults to `"bottom"`; `"top"` jumps to head; `"now"` enqueues at top **and** async-invokes the generator so the new item renders immediately.
+  - `POST /admin/queue/image`  — `{"filename":..., "image_b64":..., "prompt":?, "at":?}` → stages the image to `queue/staged/` and enqueues. Base64 keeps the Lambda multipart-free; API Gateway's 10 MB payload cap yields ~8 MB of decoded image. Same `at` semantics.
+  - `POST /admin/queue/<id>/run` — async-invoke the generator with `{"action": "render_item", "item_id": "<id>"}` so that specific item renders next, without any reordering or in-place rewrite of S3 objects. The HTTP request returns 202; render runs off-request.
+  - `DELETE /admin/queue/<id>` — cancel a pending item.
   - `POST /admin/show`         — `{"history_id": "..."}` → re-publishes an existing history frame as current. Reads `history/<id>/manifest.json`, then writes a new `current/manifest.json` whose `image_url` points back at `history/<id>/processed.bmp` and whose `image_sha256`/`image_bytes` carry over. No byte copy, no regenerate, no queue item, no OpenAI call. The next normal generation overwrites the manifest back to `current/image.bmp`. The manifest's `source.replayed_from` field carries the history id so the SPA can mark the "now showing" tile unambiguously even when two history items share a SHA-256.
-  The Lambda has read access to `einkgen/admin_password` + `einkgen/admin_cookie_signing_key`, write access to `queue/*`, read access to `history/*`, read+write access to `current/*`, and `cloudfront:CreateInvalidation` on the distribution. Reserved concurrency = 5.
+  The Lambda has read access to `einkgen/admin_password` + `einkgen/admin_cookie_signing_key`, read+write+delete on `queue/*` (writes for enqueue, reads for `get(id)` + `move_to_top`, deletes for `cancel`), `ListBucket` scoped to `queue/*`, read access to `history/*`, read+write access to `current/*`, `cloudfront:CreateInvalidation`, and `lambda:InvokeFunction` on the generator (used by `at="now"` and `/run`). Reserved concurrency = 5.
 
 ---
 
@@ -250,9 +344,29 @@ No text or watermarks. Subject:
 
 The user/random subject string is appended to this base.
 
-### Random-prompt library (`core/prompt_library.py`)
+### Topic library (`core/prompt_library.py`)
 
-Used when cron fires with an empty queue. The bank is operator-editable at runtime: it lives as a plain text file at `s3://<bucket>/config/prompt_library.txt`, one prompt per line, edited from the SPA **Admin** tab, the `einkgen prompts {ls,edit,reset}` CLI, or `aws s3 cp`. A 60-second in-Lambda cache amortises the fetch across warm invocations. If the S3 file is missing or empty, `load()` falls back to the seed defaults below so a fresh deploy never picks from an empty bank. The seed is ten entries: a mix of constrained styles and "model's choice" prompts so output stays varied.
+Used by cron's top-up step: each tick, if the queue is short of
+`TARGET_QUEUE_LENGTH` pending items, the cron picks a topic at random
+from the library, runs it through `generate.expand_topic(topic)` (a
+text-LLM call — default `gpt-5-mini`, override via `EINKGEN_TEXT_MODEL`),
+and enqueues the expansion as `kind="prompt", source="cron"`. The
+expansion is concrete enough to drive the image model directly. We
+expand at top-up time rather than at render time so the queue holds
+human-readable prompts the operator can preview / reorder / drop, and
+so text-generation variance can do its job (the same topic produces
+different prompts each pick, which then yield different images).
+
+The bank itself is operator-editable at runtime: it lives as a plain
+text file at `s3://<bucket>/config/prompt_library.txt`, one **topic**
+per line (the historical "one prompt per line" still works — the file
+shape didn't change), edited from the SPA **Admin** tab, the
+`einkgen prompts {ls,edit,reset}` CLI, or `aws s3 cp`. A 60-second
+in-Lambda cache amortises the fetch across warm invocations. If the S3
+file is missing or empty, `load()` falls back to the seed defaults
+below so a fresh deploy never picks from an empty bank. The seed is
+ten entries — a mix of constrained styles and "model's choice" so
+output stays varied, even before the expansion step runs:
 
 1. **Geometric composition** — overlapping circles, squares, triangles; bold flat shapes; high contrast.
 2. **Botanical illustration** — pen-and-ink style; a single plant or flower; scientific-diagram aesthetic.
@@ -288,7 +402,7 @@ Used when cron fires with an empty queue. The bank is operator-editable at runti
 
 `next_check_after = (time of next device-poll tick) + 5 min buffer`. The buffer covers the seconds-to-a-minute it takes to call the model and publish, so a device that exactly hits the hint won't arrive before the next image has landed. Firmware caps actual sleep at **1 hour by default** (`SLEEP_MAX_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino)), so even if the server says "no need to check for 4 hours" the device still polls every hour. That cap is what bounds worst-case latency between an enqueue and the panel actually updating.
 
-The device-poll tick is independent of the **EventBridge auto-gen cron** (still 2 h — §3). To change device polling, set `EINKGEN_POLL_INTERVAL_SECONDS` on the generator + inbound-email Lambdas (CDK context flag: `-c einkgenPollIntervalSeconds=...`) **and** edit the firmware's `SLEEP_MAX_SECONDS` so the sleep cap matches. Server-only changes get clamped; firmware-only changes are honoured but the manifest hint is wrong. See [QUICKSTART §3.12](QUICKSTART.md#312-optional-device-poll-interval) for the trade-off table.
+The device-poll tick and the **EventBridge auto-gen cron** are driven by the same value — `einkgenPollIntervalSeconds` in [infra/cdk.json](infra/cdk.json) (default `1800` = 30 min). One knob, one redeploy, no drift. Values ≤ 3600 are honoured by the firmware directly (its `SLEEP_MAX_SECONDS` is a cap on long sleeps, not a target); values > 3600 also need `SLEEP_MAX_SECONDS` raised in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) before re-flash. See [QUICKSTART §3.12](QUICKSTART.md#312-change-the-render--poll-cadence-later) for the trade-off table.
 
 ---
 
@@ -341,16 +455,16 @@ Four Lambdas (five with inbound email), one bucket, one CloudFront distribution,
 - **S3 bucket `einkgen-<env>`** — single store: `current/`, `queue/`, `history/`, `status/`, `firmware/`, `web/`.
 - **CloudFront distribution** — fronts the bucket via an Origin Access Control. `current/*`, `history/<id>/processed.bmp`, and `web/*` are publicly readable; the rest of the bucket is locked down at the bucket-policy level and accessed only via Lambdas with IAM.
 - **Lambda `einkgen-generator`** — only writer of `current/` and `history/`. Triggered by:
-  - **S3 ObjectCreated** on `queue/` (suffix `.json`) → drains head item.
-  - **EventBridge** `rate(2 hours)` → enqueues a `random` if queue is empty (the resulting S3 event triggers the same Lambda).
+  - **EventBridge** `rate(30 minutes)` → top up the queue to ≥5 items (text-LLM expansion of random library topics), then render the head.
+  - **`lambda.invoke`** from the admin Lambda with `{"action": "render_now"}` (Admin "Now" button) or `{"action": "render_item", "item_id": "..."}` (per-row "Run" button).
 
-  Reserved concurrency = **1** (serial drain). Async retries = **0** on both the function and the EventBridge target (caps OpenAI cost-amplification from transient failures). Reads `OPENAI_API_KEY` from Secrets Manager. ARM64 Graviton2, 1024 MB. Pillow is bundled into the function zip (no third-party Lambda layer).
+  No S3 ObjectCreated trigger — see §4. Reserved concurrency = **1** (serial drain across all triggers). Async retries = **0** on both the function and the EventBridge target (caps OpenAI cost-amplification from transient failures). Reads `OPENAI_API_KEY` from Secrets Manager. ARM64 Graviton2, 1024 MB. Pillow is bundled into the function zip (no third-party Lambda layer).
 - **Lambda `einkgen-read-api`** — public API Gateway HTTP API with CORS pinned to the CloudFront origin (plus `http://localhost:5173` for dev). Read-only IAM on the bucket. Routes: `GET /queue`, `GET /history`, `GET /status`. The web app's only backend.
 - **Lambda `einkgen-device-status`** — API Gateway HTTP API with **no CORS** (firmware-only). Accepts `POST /` with an `X-Device-Token` header (validated against Secrets Manager). Writes `status/device-<id>.json`. Write-only IAM on the `status/` prefix. Reserved concurrency caps blast radius from abuse.
 - **Lambda `einkgen-admin-api`** — API Gateway HTTP API attached to CloudFront as the `/admin/*` behavior (same origin as the SPA, so the session cookie can be SameSite=Lax). All routes live under `/admin/`. Validates the operator password against `einkgen/admin_password` on login (constant-time compare), mints an HMAC-SHA256-signed session cookie keyed by `einkgen/admin_cookie_signing_key`, and writes to `queue/*` (text prompt) or `queue/staged/*` (image) on success. Reserved concurrency = 5.
 - **Lambda `einkgen-inbound-email`** *(opt-in, gated by the `einkgenInboundDomain` CDK context flag)*. S3 ObjectCreated on `inbound/*` triggers it; SES's receipt rule for the configured domain writes raw RFC 5322 messages there. Parses MIME, checks SES `Authentication-Results` for SPF/DKIM pass aligned with the From: domain, validates the sender against `config/email_allowlist.txt`, stages any image attachment under `queue/staged/`, calls `queue.enqueue(source="email")`, and sends a confirmation or rejection reply via SES. Scoped IAM: read+delete `inbound/*`, read `config/email_allowlist.txt`, write `queue/*`, `ses:SendEmail` constrained to the configured reply-From address. Reserved concurrency = 5.
 - **Secrets Manager** — `einkgen/openai_api_key`, `einkgen/device_status_token`, `einkgen/admin_password`, `einkgen/admin_cookie_signing_key` (auto-generated by CDK on first deploy). Lambdas get scoped read.
-- **EventBridge rule** — `rate(2 hours)` → `einkgen-generator` (cron entrypoint).
+- **EventBridge rule** `einkgen-generator-cron` — `rate(...)` driven by `einkgenPollIntervalSeconds` in [infra/cdk.json](infra/cdk.json) (default `rate(30 minutes)`). The same value also flows to the Lambda env var `EINKGEN_POLL_INTERVAL_SECONDS` so the device polls in step.
 - **CloudWatch Logs** — 14-day retention per Lambda. One `MetricFilter` per Lambda emits an `ErrorLogCount-{name}` metric on the literal token `ERROR`. A CloudWatch dashboard (`einkgen-<env>`) plots invocations, errors, and duration p50/p99.
 
 Everything is in a single CDK stack under [infra/](infra/).

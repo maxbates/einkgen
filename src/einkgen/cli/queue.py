@@ -26,6 +26,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
     pr = qsub.add_parser("prompt", help="enqueue a text prompt")
     pr.add_argument("text")
+    pr.add_argument(
+        "--top",
+        action="store_true",
+        help="jump to the head of the queue (default: append to tail)",
+    )
     pr.set_defaults(func=_cmd_prompt)
 
     im = qsub.add_parser("image", help="enqueue a local image file")
@@ -34,6 +39,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--prompt",
         help="optional restyle prompt; if set, the image is fed to gpt-image-2's "
         "edit endpoint instead of being passed through B&W only",
+    )
+    im.add_argument(
+        "--top",
+        action="store_true",
+        help="jump to the head of the queue (default: append to tail)",
     )
     im.set_defaults(func=_cmd_image)
 
@@ -69,7 +79,8 @@ def _cmd_rm(args: argparse.Namespace) -> int:
 
 
 def _cmd_prompt(args: argparse.Namespace) -> int:
-    item = queue_core.enqueue("prompt", prompt=args.text)
+    at = "top" if getattr(args, "top", False) else "bottom"
+    item = queue_core.enqueue("prompt", prompt=args.text, at=at)
     print(item.id)
     return 0
 
@@ -84,8 +95,9 @@ def _cmd_image(args: argparse.Namespace) -> int:
     staged_key = f"{queue_core.STAGED_PREFIX}{sha8}-{path.name}"
     s3.put_object(staged_key, data)
 
+    at = "top" if getattr(args, "top", False) else "bottom"
     item = queue_core.enqueue(
-        "image", image_s3_key=staged_key, prompt=args.prompt or None
+        "image", image_s3_key=staged_key, prompt=args.prompt or None, at=at
     )
     print(item.id)
     return 0

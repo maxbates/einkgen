@@ -48,6 +48,28 @@ MODEL = "gpt-image-2"
 IMAGE_SIZE = "1200x832"
 QUALITY = "medium"
 
+# Text-completion model used by ``expand_topic`` — the cron picks a topic
+# from the prompt library, runs it through this model to produce a more
+# concrete image prompt, and enqueues the expansion. Text-generation is
+# more varied than image-generation, so expanding before the image step
+# yields more diverse frames from the same topic list. Cheap enough that
+# topping the queue up to 5+ items per tick is a rounding error next to
+# one gpt-image-2 call.
+TEXT_MODEL = os.environ.get("EINKGEN_TEXT_MODEL", "gpt-5-mini")
+
+EXPAND_TOPIC_SYSTEM_PROMPT = (
+    "You design concrete image prompts for an e-paper display. The user "
+    "gives you a topic. Reply with a single concrete image prompt "
+    "(1–3 sentences, no preamble, no quotes, no markdown) that describes "
+    "one specific scene or composition fitting that topic. Be concrete: "
+    "name a clear focal subject, a specific composition, and any "
+    "supporting detail. The image will be dithered to 8 grays on a "
+    "1200×825 panel, so favor strong contrast, bold shapes, and a "
+    "paper-white background with the subject in strong darks. Do not "
+    "include the words 'e-paper', 'e-ink', 'dither', or 'grayscale' — "
+    "those are handled separately. Output ONLY the prompt text."
+)
+
 
 def _resolve_api_key() -> str | None:
     """Resolve the OpenAI API key from env or Secrets Manager.
@@ -158,3 +180,36 @@ def random_prompt() -> str:
     (the seed defaults) if the file is missing.
     """
     return _prompt_library.random_prompt()
+
+
+def expand_topic(topic: str, *, client: Any = None) -> str:
+    """Turn a short topic into a concrete image-generation prompt.
+
+    The prompt library is a list of *topics* (one line each). The cron
+    runs each picked topic through this function so the queued item
+    holds a specific scene description, not just the topic. We rely on
+    text-generation variance for diversity instead of asking the image
+    model to interpret a high-level brief 100 times.
+
+    Returns the expanded prompt with surrounding whitespace stripped.
+    Raises whatever the OpenAI SDK raises on failure — callers decide
+    whether to fall back to the raw topic.
+    """
+    if not topic or not topic.strip():
+        raise ValueError("topic must be a non-empty string")
+    if client is None:
+        client = _default_client()
+    response = client.chat.completions.create(
+        model=TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": EXPAND_TOPIC_SYSTEM_PROMPT},
+            {"role": "user", "content": topic.strip()},
+        ],
+    )
+    choice = response.choices[0]
+    content = getattr(choice.message, "content", None)
+    if content is None and isinstance(choice, dict):
+        content = choice.get("message", {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("OpenAI text response missing content")
+    return content.strip()

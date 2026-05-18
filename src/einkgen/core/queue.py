@@ -1,12 +1,41 @@
-"""S3-prefix-backed FIFO queue.
+"""Two-priority S3-prefix queue.
 
-Items live at ``s3://<bucket>/queue/<iso8601>-<ulid>.json``. ULIDs are
-lex-monotonic, so a sorted ``ListObjectsV2`` is FIFO order. The generator
-Lambda runs with reserved concurrency = 1, which is what makes head reads
-race-free — see ARCHITECTURE §4.
+Items live at:
 
-If we ever need multi-producer races, swap the implementation for SQS FIFO
-or DynamoDB without changing this module's public API.
+    s3://<bucket>/queue/<priority>-<iso8601>-<ulid>.json
+
+``<priority>`` is the literal character ``"0"`` (top queue) or ``"1"``
+(bottom queue). Lex-sorted ``ListObjectsV2`` is the queue order: all
+top-priority items drain before any bottom-priority item, oldest-first
+within each priority.
+
+There is no in-place mutation of queue objects. To "promote" an item to
+the top, callers don't reorder — instead, the generator can be invoked
+with ``{"action": "render_item", "item_id": ...}`` to render that
+specific item out of order. Removal stays the same suffix-match cancel.
+
+Why two queues, not a single ordered list?
+------------------------------------------
+The earlier design used a ``position: float`` field inside each JSON
+body and supported arbitrary reordering. Operating it required reading
++ rewriting individual queue objects to move them around, which the
+user found brittle for a buffer that an operator might tweak from a
+phone. Two priorities give the SPA the **Top** / **Bottom** / **Now**
+UX (same as Apple Music's Play Next / Play Last / Play Now) without
+any S3 object ever being mutated after it's written.
+
+Legacy item handling
+--------------------
+Items enqueued by code older than this rewrite have keys of the form
+``queue/<iso8601>-<ulid>.json`` (no priority prefix). They lex-sort
+*after* both new priorities — ``"2026-…"`` is greater than both
+``"0-…"`` and ``"1-…"`` — so they get drained as the tail of the queue
+over a handful of cron ticks. No migration needed; they just trickle
+out.
+
+If we ever outgrow S3-prefix queues (multi-producer races, high write
+rate), swap this module for SQS FIFO or DynamoDB without changing the
+public API.
 """
 
 from __future__ import annotations
@@ -23,10 +52,27 @@ from einkgen.core import s3
 
 QUEUE_PREFIX = "queue/"
 STAGED_PREFIX = "queue/staged/"
+# Operator-visible breadcrumbs for permanently-failed items live under
+# this prefix. Excluded from queue listing so the public Queue tab never
+# shows dropped items. See ``einkgen.core.failures`` (introduced in
+# [0.4.1.4]).
+FAILED_PREFIX = "queue/failed/"
 # Operator-visible breadcrumbs for permanently-failed items live under this
 # prefix. Excluded from queue listing so the public Queue tab never shows
 # dropped items. See ``einkgen.core.failures``.
 FAILED_PREFIX = "queue/failed/"
+
+# Priority characters. Single ASCII digits so the lex sort of the
+# concatenated key is the queue order: "0-..." < "1-...".
+PRIORITY_TOP = "0"
+PRIORITY_BOTTOM = "1"
+_VALID_PRIORITIES = (PRIORITY_TOP, PRIORITY_BOTTOM)
+
+# Map the user-facing placement words to the on-disk priority chars.
+_PRIORITY_FOR_AT = {
+    "top": PRIORITY_TOP,
+    "bottom": PRIORITY_BOTTOM,
+}
 
 
 @dataclass
@@ -68,6 +114,9 @@ def _validate(kind: str, prompt: str | None, image_s3_key: str | None) -> None:
         if not image_s3_key:
             raise ValueError("kind='image' requires image_s3_key")
     elif kind == "random":
+        # Legacy kind kept for back-compat with items already on the queue.
+        # New code paths (cron, admin) emit kind="prompt" with an
+        # LLM-expanded subject instead — see einkgen.lambdas.generator.
         if prompt is not None or image_s3_key is not None:
             raise ValueError("kind='random' must not set prompt or image_s3_key")
     else:
@@ -80,9 +129,19 @@ def enqueue(
     prompt: str | None = None,
     image_s3_key: str | None = None,
     source: str = "cli",
+    at: str = "bottom",
 ) -> QueueItem:
-    """Write a new queue item to S3 and return it."""
+    """Write a new queue item to S3 and return it.
+
+    ``at`` selects which priority queue the item lands in:
+    ``"bottom"`` (default) or ``"top"``. There is no reordering after
+    the fact — pick the right placement at enqueue time.
+    """
     _validate(kind, prompt, image_s3_key)
+    if at not in _PRIORITY_FOR_AT:
+        raise ValueError(f"at must be 'top' or 'bottom', got {at!r}")
+    priority = _PRIORITY_FOR_AT[at]
+
     item_id = str(ULID())
     enqueued_at = _iso_now()
     item = QueueItem(
@@ -93,7 +152,7 @@ def enqueue(
         prompt=prompt,
         image_s3_key=image_s3_key,
     )
-    key = f"{QUEUE_PREFIX}{_key_timestamp(enqueued_at)}-{item_id}.json"
+    key = f"{QUEUE_PREFIX}{priority}-{_key_timestamp(enqueued_at)}-{item_id}.json"
     item._s3_key = key
     s3.put_object(
         key,
@@ -106,10 +165,14 @@ def enqueue(
 def _iter_pending_keys() -> list[str]:
     """Return lex-sorted queue object keys.
 
-    Excludes ``queue/staged/`` (raw uploads waiting for a queue item) and
-    ``queue/failed/`` (operator-visible drop breadcrumbs) — both share the
-    ``queue/`` prefix for IAM/lifecycle simplicity but are not pending
-    work.
+    Lex sort happens to be queue order: "0-..." < "1-..." < "2026-..."
+    (legacy items lacking a priority prefix sort after both priorities,
+    so they drain last). No need to parse the key for ordering.
+
+    Excludes ``queue/staged/`` (raw uploads waiting for a queue item)
+    and ``queue/failed/`` (operator-visible drop breadcrumbs) — both
+    share the ``queue/`` prefix for IAM/lifecycle simplicity but are
+    not pending work.
     """
     keys: list[str] = []
     for obj in s3.list_objects(QUEUE_PREFIX):
@@ -140,21 +203,36 @@ def _read_item(key: str) -> QueueItem:
 
 
 def list() -> builtins.list[QueueItem]:  # noqa: A001 — name dictated by spec
-    """Return all pending queue items in FIFO order."""
+    """Return all pending queue items in queue order (top first, then bottom)."""
     return [_read_item(k) for k in _iter_pending_keys()]
 
 
 def peek_head() -> QueueItem | None:
-    """Return the FIFO head without deleting it.
+    """Return the queue head without deleting it.
+
+    Top-priority items always come before bottom-priority items;
+    within each priority, FIFO by enqueue timestamp.
 
     Pair with ``finalize(item)`` after the item has been processed
-    successfully. If processing raises, the item stays on the queue and
-    Lambda's async-invocation retry will redeliver the S3 event.
+    successfully. If processing raises, the item stays on the queue.
     """
     keys = _iter_pending_keys()
     if not keys:
         return None
     return _read_item(keys[0])
+
+
+def get(item_id: str) -> QueueItem | None:
+    """Fetch a single item by id, or ``None`` if not found.
+
+    Matches on the trailing ``-<id>.json`` suffix so a stray partial
+    id can't accidentally match an unrelated item.
+    """
+    suffix = f"-{item_id}.json"
+    for key in _iter_pending_keys():
+        if key.endswith(suffix):
+            return _read_item(key)
+    return None
 
 
 def finalize(item: QueueItem) -> None:
@@ -185,3 +263,8 @@ def cancel(item_id: str) -> bool:
 
 def empty() -> bool:
     return not _iter_pending_keys()
+
+
+def count() -> int:
+    """How many pending items the queue currently holds."""
+    return len(_iter_pending_keys())

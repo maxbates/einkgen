@@ -59,7 +59,7 @@ def test_write_round_trip_and_cache_invalidation(s3_bucket, reset_cache):
     body = s3_bucket.get_object(Bucket=TEST_BUCKET, Key=pl.PROMPT_LIBRARY_KEY)[
         "Body"
     ].read().decode()
-    assert body.startswith("# einkgen prompt library")
+    assert body.startswith("# einkgen topic library")
     # Entries are persisted in input order — operator can group related prompts.
     payload_lines = [l for l in body.splitlines() if l and not l.startswith("#")]
     assert payload_lines == ["one", "two", "three"]

@@ -47,12 +47,14 @@ export interface EinkgenInboundEmailProps {
   seedAllowlist?: string[];
 
   /**
-   * Override the manifest's ``next_check_after`` cadence (seconds). Set on
-   * this Lambda as ``EINKGEN_POLL_INTERVAL_SECONDS`` so email-driven
-   * publishes embed the same hint as cron/queue-driven ones. Mirrors
-   * ``EinkgenLambdasProps.pollIntervalSeconds``.
+   * Cadence (in seconds) for the manifest's ``next_check_after`` hint.
+   * Set on this Lambda as ``EINKGEN_POLL_INTERVAL_SECONDS`` so
+   * email-driven publishes embed the same hint as cron/queue-driven
+   * ones. Mirrors ``EinkgenLambdasProps.pollIntervalSeconds`` and is
+   * passed down from the same single knob in
+   * ``infra/cdk.json:einkgenPollIntervalSeconds``.
    */
-  pollIntervalSeconds?: string;
+  pollIntervalSeconds: number;
 }
 
 const INBOUND_PREFIX = 'inbound/';
@@ -136,9 +138,7 @@ export class EinkgenInboundEmail extends Construct {
         // that the operational story benefits from the extra line per call.
         AWS_LAMBDA_LOG_LEVEL: 'INFO',
         ...(props.projectUrl ? { EINKGEN_PROJECT_URL: props.projectUrl } : {}),
-        ...(props.pollIntervalSeconds
-          ? { EINKGEN_POLL_INTERVAL_SECONDS: props.pollIntervalSeconds }
-          : {}),
+        EINKGEN_POLL_INTERVAL_SECONDS: `${props.pollIntervalSeconds}`,
       },
     });
 

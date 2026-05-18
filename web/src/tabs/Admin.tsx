@@ -10,7 +10,9 @@ import {
   adminPutPrompts,
   adminResetPrompts,
   type AdminFailureItem,
+  type EnqueueAt,
 } from "../api";
+import { IconAddToTop, IconAddToBottom, IconPlayNow } from "../icons";
 
 type SessionState =
   | { kind: "loading" }
@@ -145,8 +147,8 @@ function LoginForm({
 
 type EnqueueState =
   | { kind: "idle" }
-  | { kind: "sending" }
-  | { kind: "ok"; id: string; what: string }
+  | { kind: "sending"; at: EnqueueAt }
+  | { kind: "ok"; id: string; what: string; at: EnqueueAt }
   | { kind: "error"; message: string };
 
 function AdminPanel({
@@ -161,13 +163,12 @@ function AdminPanel({
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [state, setState] = useState<EnqueueState>({ kind: "idle" });
 
-  async function submitPrompt(e: FormEvent) {
-    e.preventDefault();
+  async function submitPrompt(at: EnqueueAt) {
     if (!prompt.trim()) return;
-    setState({ kind: "sending" });
+    setState({ kind: "sending", at });
     try {
-      const res = await adminEnqueuePrompt(prompt.trim());
-      setState({ kind: "ok", id: res.id, what: "prompt" });
+      const res = await adminEnqueuePrompt(prompt.trim(), at);
+      setState({ kind: "ok", id: res.id, what: "prompt", at });
       setPrompt("");
     } catch (err) {
       setState({
@@ -177,16 +178,16 @@ function AdminPanel({
     }
   }
 
-  async function submitImage(e: FormEvent) {
-    e.preventDefault();
+  async function submitImage(at: EnqueueAt) {
     if (!imageFile) return;
-    setState({ kind: "sending" });
+    setState({ kind: "sending", at });
     try {
       const res = await adminEnqueueImage(
         imageFile,
         imagePrompt.trim() || null,
+        at,
       );
-      setState({ kind: "ok", id: res.id, what: "image" });
+      setState({ kind: "ok", id: res.id, what: "image", at });
       setImageFile(null);
       setImagePrompt("");
       // Reset the file input so the same file can be re-selected.
@@ -224,7 +225,15 @@ function AdminPanel({
         </button>
       </div>
 
-      <form className="admin-card" onSubmit={submitPrompt}>
+      <form
+        className="admin-card"
+        onSubmit={(e) => {
+          // Enter in the textarea defaults to "Add to bottom" so the form
+          // is keyboard-usable without picking a button.
+          e.preventDefault();
+          void submitPrompt("bottom");
+        }}
+      >
         <label className="admin-field">
           <span className="admin-field-label">Text prompt</span>
           <textarea
@@ -235,16 +244,20 @@ function AdminPanel({
             placeholder="A bold geometric composition…"
           />
         </label>
-        <button
-          type="submit"
-          className="button"
-          disabled={state.kind === "sending" || !prompt.trim()}
-        >
-          Enqueue prompt
-        </button>
+        <EnqueueActions
+          disabled={!prompt.trim() || state.kind === "sending"}
+          activeAt={state.kind === "sending" ? state.at : null}
+          onClick={(at) => void submitPrompt(at)}
+        />
       </form>
 
-      <form className="admin-card" onSubmit={submitImage}>
+      <form
+        className="admin-card"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submitImage("bottom");
+        }}
+      >
         <label className="admin-field">
           <span className="admin-field-label">Image upload</span>
           <input
@@ -267,20 +280,21 @@ function AdminPanel({
             className="admin-input"
           />
         </label>
-        <button
-          type="submit"
-          className="button"
-          disabled={state.kind === "sending" || !imageFile}
-        >
-          Upload image
-        </button>
+        <EnqueueActions
+          disabled={!imageFile || state.kind === "sending"}
+          activeAt={state.kind === "sending" ? state.at : null}
+          onClick={(at) => void submitImage(at)}
+        />
       </form>
 
-      {state.kind === "sending" ? (
-        <p className="muted">Sending…</p>
-      ) : state.kind === "ok" ? (
+      {state.kind === "ok" ? (
         <p className="admin-success">
-          Queued {state.what}{" "}
+          {state.at === "now"
+            ? "Queued at top and rendering now: "
+            : state.at === "top"
+              ? "Queued at the top of the queue: "
+              : "Queued at the bottom of the queue: "}
+          {state.what}{" "}
           <code className="mono">{state.id}</code>.
         </p>
       ) : state.kind === "error" ? (
@@ -290,6 +304,51 @@ function AdminPanel({
       <RecentlyRejected refreshKey={state.kind === "ok" ? state.id : null} />
 
       <PromptLibraryEditor />
+    </div>
+  );
+}
+
+function EnqueueActions({
+  disabled,
+  activeAt,
+  onClick,
+}: {
+  disabled: boolean;
+  activeAt: EnqueueAt | null;
+  onClick: (at: EnqueueAt) => void;
+}) {
+  return (
+    <div className="enqueue-actions">
+      <button
+        type="button"
+        className="button enqueue-btn"
+        title="Add to top of queue (next up)"
+        disabled={disabled}
+        onClick={() => onClick("top")}
+      >
+        <IconAddToTop />
+        <span>{activeAt === "top" ? "Adding…" : "Top"}</span>
+      </button>
+      <button
+        type="button"
+        className="button enqueue-btn"
+        title="Add to bottom of queue"
+        disabled={disabled}
+        onClick={() => onClick("bottom")}
+      >
+        <IconAddToBottom />
+        <span>{activeAt === "bottom" ? "Adding…" : "Bottom"}</span>
+      </button>
+      <button
+        type="button"
+        className="button enqueue-btn enqueue-btn-now"
+        title="Render this image now"
+        disabled={disabled}
+        onClick={() => onClick("now")}
+      >
+        <IconPlayNow />
+        <span>{activeAt === "now" ? "Starting…" : "Now"}</span>
+      </button>
     </div>
   );
 }
@@ -500,14 +559,15 @@ function PromptLibraryEditor() {
       <div>
         <p className="submit-hint-heading">Random prompt library</p>
         <p className="muted small">
-          One prompt per line. The 2-hour cron picks from this bank when the
-          queue is empty. Blank lines and lines starting with <code>#</code>{" "}
-          are ignored.
+          One topic per line. The cron picks from this bank when the queue
+          drops below five pending items and expands each pick into a
+          concrete image prompt before enqueueing. Blank lines and lines
+          starting with <code>#</code> are ignored.
           {state.isDefault && !dirty ? " (Currently the seed defaults.)" : ""}
         </p>
       </div>
       <label className="admin-field">
-        <span className="admin-field-label">Prompts ({entryCount})</span>
+        <span className="admin-field-label">Topics ({entryCount})</span>
         <textarea
           className="admin-textarea"
           rows={12}

@@ -6,7 +6,6 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
@@ -27,12 +26,19 @@ export interface EinkgenLambdasProps {
   adminPassword: secretsmanager.Secret;
   adminCookieSigningKey: secretsmanager.Secret;
   /**
-   * Override the manifest's ``next_check_after`` cadence (seconds).
-   * Set on the generator Lambda as ``EINKGEN_POLL_INTERVAL_SECONDS``;
-   * ``publish.py`` reads it. Unset → built-in default (1 hour). Must be
-   * kept in sync with firmware ``SLEEP_MAX_SECONDS`` if raised above 3600.
+   * Single cadence knob, in seconds. Drives BOTH the EventBridge cron
+   * rate that fires the generator AND the manifest's
+   * ``next_check_after`` hint (via ``EINKGEN_POLL_INTERVAL_SECONDS`` on
+   * the generator + inbound-email Lambdas).
+   *
+   * Values ≤ 3600 are honoured by the firmware directly (its
+   * ``SLEEP_MAX_SECONDS = 1 h`` is a cap, not a target). Values > 3600
+   * require a firmware re-flash to raise that constant in lockstep —
+   * see QUICKSTART §3.12.
+   *
+   * Default lives in ``einkgen-stack.ts`` (`DEFAULT_POLL_INTERVAL_SECONDS`).
    */
-  pollIntervalSeconds?: string;
+  pollIntervalSeconds: number;
 }
 
 // Root of the Python package on disk. Bundling stages a copy under
@@ -179,9 +185,7 @@ export class EinkgenLambdas extends Construct {
         EINKGEN_CDN_BASE: props.cdnBase,
         EINKGEN_CF_DISTRIBUTION_ID: props.distribution.distributionId,
         OPENAI_API_KEY_SECRET_NAME: props.openaiApiKey.secretName,
-        ...(props.pollIntervalSeconds
-          ? { EINKGEN_POLL_INTERVAL_SECONDS: props.pollIntervalSeconds }
-          : {}),
+        EINKGEN_POLL_INTERVAL_SECONDS: `${props.pollIntervalSeconds}`,
       },
     });
     // ARCHITECTURE §8 access table — generator writes current/ and history/,
@@ -234,23 +238,36 @@ export class EinkgenLambdas extends Construct {
       maxEventAge: Duration.hours(1),
     });
 
-    // S3 ObjectCreated trigger. S3 notification filters support exactly one
-    // (prefix, suffix) pair per rule — prefix='queue/' + suffix='.json'
-    // excludes queue/staged/<hash>.jpg|png cleanly, even though those keys
-    // also begin with "queue/". Multi-filter combinations aren't needed.
-    props.bucket.addEventNotification(
-      s3.EventType.OBJECT_CREATED,
-      new s3n.LambdaDestination(this.generator),
-      { prefix: 'queue/', suffix: '.json' },
-    );
+    // No S3 ObjectCreated trigger any more. The queue is now a curated
+    // buffer (operator can reorder, run-now, drop items); items sit on
+    // the queue until a cron tick or admin "Run" / "Now" explicitly
+    // renders the head. See `src/einkgen/lambdas/generator.py` for the
+    // full design.
 
-    // EventBridge cron — rate(2 hours). The cron event payload sets
-    // source=aws.events which generator.py uses to branch. retryAttempts=0
-    // on the target matches the Lambda's async-invoke config — see comment
-    // above on cost amplification.
+    // EventBridge cron — fires the generator at the cadence configured
+    // by ``einkgenPollIntervalSeconds`` in cdk.json (default: 1800 s =
+    // 30 min). Each tick (1) tops the queue up to 5 items by expanding
+    // random topics from the prompt library via the text LLM, then
+    // (2) renders the current head. Event payload sets source=aws.events
+    // which generator.py uses to branch. retryAttempts=0 on the target
+    // matches the Lambda's async-invoke config — see comment above on
+    // cost amplification.
+    //
+    // Cost guide at gpt-image-2 medium pricing (~$0.04/render): 15 min
+    // ≈ $115/mo, 30 min ≈ $55/mo, 60 min ≈ $30/mo. The text-LLM
+    // top-up calls are a rounding error. Battery life on the Inkplate
+    // scales inversely (15 min → ~10–12 weeks, 30 min → ~3–4 months,
+    // 1 h → ~6–9 months on a 3 Ah cell).
+    //
+    // This rate AND the EINKGEN_POLL_INTERVAL_SECONDS env var above
+    // are both driven by the same `pollIntervalSeconds` prop so they
+    // can never drift — no point polling more often than cron renders,
+    // or rendering more often than the device picks up.
     new events.Rule(this, 'GeneratorCron', {
-      ruleName: 'einkgen-generator-2h',
-      schedule: events.Schedule.rate(Duration.hours(2)),
+      // Static name (no cadence embedded) so changing the interval
+      // doesn't churn the CloudFormation logical id every deploy.
+      ruleName: 'einkgen-generator-cron',
+      schedule: events.Schedule.rate(Duration.seconds(props.pollIntervalSeconds)),
       targets: [
         new targets.LambdaFunction(this.generator, {
           retryAttempts: 0,
@@ -375,16 +392,43 @@ export class EinkgenLambdas extends Construct {
         EINKGEN_CF_DISTRIBUTION_ID: props.distribution.distributionId,
         ADMIN_PASSWORD_SECRET_NAME: props.adminPassword.secretName,
         ADMIN_COOKIE_KEY_SECRET_NAME: props.adminCookieSigningKey.secretName,
+        // Used by the at="now" enqueue path and POST /admin/queue/<id>/run
+        // to async-invoke the generator (InvocationType=Event). Without
+        // this the routes still enqueue the item but skip the immediate
+        // render; the next cron tick picks it up.
+        EINKGEN_GENERATOR_FUNCTION_NAME: this.generator.functionName,
       },
     });
-    // Mirror the generator's queue/* access — admin-api writes both the
-    // staged image and the queue item.
+    // Mirror the generator's queue/* access — admin-api writes the
+    // staged image, the queue item, and also rewrites position on
+    // move-to-top and deletes on cancel.
     this.adminApi.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['s3:PutObject'],
+        actions: [
+          's3:PutObject',
+          's3:GetObject',
+          's3:DeleteObject',
+        ],
         resources: [`${props.bucket.bucketArn}/queue/*`],
       }),
     );
+    // ListBucket on queue/* so admin can enumerate keys when looking up
+    // an item by id (for move-to-top and the per-id /run, DELETE paths).
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:ListBucket'],
+        resources: [props.bucket.bucketArn],
+        conditions: {
+          StringLike: {
+            's3:prefix': ['queue/*'],
+          },
+        },
+      }),
+    );
+    // /admin/queue/.../{run,now} fires an async invoke at the generator
+    // so the rendering happens off the request path. Scope to the one
+    // function — there are no other generators we'd want to call.
+    this.generator.grantInvoke(this.adminApi);
     // Random-pick library: full read/write on the single config file so the
     // operator can edit the bank from the SPA Admin tab.
     this.adminApi.addToRolePolicy(

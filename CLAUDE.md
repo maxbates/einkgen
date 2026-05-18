@@ -75,22 +75,22 @@ src/einkgen/
 │   └── local.py                einkgen local {generate,convert,preview}
 ├── core/                       shared image/queue/publish logic (CLI ↔ Lambda)
 │   ├── generate.py             OpenAI gpt-image-2 generate + edit + BASE_PROMPT (quality=medium); random_prompt() → prompt_library
-│   ├── prompt_library.py       S3-backed random-pick bank (`config/prompt_library.txt`); operator-editable via Admin tab + CLI
+│   ├── prompt_library.py       S3-backed *topic* bank (`config/prompt_library.txt`); operator-editable via Admin tab + CLI. Cron picks topics + expands via expand_topic() before enqueueing
 │   ├── convert.py              crop + grayscale + Atkinson dither + 8-bit BMP
 │   ├── publish.py              writes current/, archives history/, CF invalidate; `set_current_from_history` re-points manifest at a past frame
 │   ├── manifest.py             manifest schema + next_check_after
-│   ├── queue.py                S3-prefix queue (enqueue/pop_head/list/cancel)
+│   ├── queue.py                S3-prefix two-priority buffer; key format `queue/<priority>-<iso_ts>-<ulid>.json` where priority is "0" (top) or "1" (bottom). No in-place mutation. enqueue(..., at="top|bottom") / peek_head / get / cancel / count. No move_to_top — see render_item action on the generator instead.
 │   ├── pipeline.py             one queue item → published frame
 │   ├── email_allowlist.py      S3-backed sender allowlist for inbound email
 │   ├── email_parse.py          MIME parse + SPF/DKIM check from SES auth headers
 │   ├── admin_cookie.py         HMAC-signed session cookie for the SPA Admin tab
 │   └── s3.py                   thin boto3 wrapper
 └── lambdas/
-    ├── generator.py            S3 event + cron handlers
+    ├── generator.py            cron (top up ≥5 items via expand_topic + render head) + direct-invoke `{"action":"render_now"}` (Admin Now) + `{"action":"render_item","item_id":...}` (per-row Run, renders a specific item out of queue order). NO S3 ObjectCreated trigger since [0.5.0.0].
     ├── read_api.py             GET /queue, /history, /status
     ├── device_status.py        POST / (X-Device-Token)
     ├── inbound_email.py        S3-triggered SES inbound parser → queue.enqueue
-    └── admin_api.py            POST /admin/{login,logout,queue/prompt,queue/image,prompts/reset} + GET/PUT /admin/prompts + GET /admin/me
+    └── admin_api.py            POST /admin/{login,logout,queue/prompt,queue/image,prompts/reset,show} + POST /admin/queue/<id>/run + DELETE /admin/queue/<id> + GET/PUT /admin/prompts + GET /admin/me. Enqueue accepts at="top|bottom|now". "now" async-invokes generator with render_now (renders head); /run async-invokes with render_item (renders that specific id, no reorder).
 
 web/                            React + Vite SPA (read-only dashboard + admin tab)
 ├── src/api.ts                  typed client for read-api + admin-api Lambdas
@@ -142,10 +142,14 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
 | "Run the tests" / "Run the test suite" | `uv run --extra dev pytest` from the repo (or worktree) root. `uv` syncs `.venv/` from `pyproject.toml` on demand and reuses a global wheel cache (`~/.cache/uv/`), so first run in a fresh worktree is one-time-slow and every subsequent run is seconds. Do **not** bootstrap with bare `pip install -e ".[dev]"` + `pytest` — pip has no shared cache and the system Python on macOS dev boxes often doesn't satisfy `requires-python >=3.11`, so it re-downloads everything every time and may pick the wrong interpreter. |
 | "Set up email submission" / "Enable inbound email" | Already on for the canonical `einkgen.link` deploy via [infra/cdk.json](infra/cdk.json) context. For a **new** domain, follow [QUICKSTART §3.10](QUICKSTART.md#310-optional-email-submission-channel) — pick path A (register a new domain via `infra/scripts/register-domain.sh`) or B (delegate an existing domain to Route 53), edit `einkgenInboundDomain` in `infra/cdk.json` to that domain (or pass `-c einkgenInboundDomain=<domain>` to override), redeploy. DKIM CNAMEs + MX are auto-created by CDK; **receipt-rule activation is one-time-manual** (`aws ses set-active-receipt-rule-set --rule-set-name einkgen-inbound`) — survives all future redeploys. |
 | "Add an allowed email sender" | `einkgen allowlist add <email>` (writes `config/email_allowlist.txt`). Comparison is case-insensitive. Never hardcode addresses in committed CDK — first-deploy seeding goes through the `einkgenAllowlistSeed` context flag instead. |
-| "Edit the random prompt bank" / "Change what the cron picks from" / "Add/remove a random prompt" | Edit from the SPA **Admin** tab (textarea, one prompt per line, Save / Reset to defaults) or via `einkgen prompts {ls,edit,reset}`. Persists to `s3://<bucket>/config/prompt_library.txt`; Lambda picks up changes within ~60 s (warm-container cache TTL). Missing/empty file → falls back to the 10 seed defaults baked into `core/prompt_library.py::DEFAULTS`. |
+| "Edit the random prompt bank" / "Change what the cron picks from" / "Add/remove a topic" | Edit from the SPA **Admin** tab (textarea, one topic per line, Save / Reset to defaults) or via `einkgen prompts {ls,edit,reset}`. Persists to `s3://<bucket>/config/prompt_library.txt`; Lambda picks up changes within ~60 s (warm-container cache TTL). Missing/empty file → falls back to the 10 seed defaults baked into `core/prompt_library.py::DEFAULTS`. Each line is a *topic*, not a finished prompt: the cron picks one and runs it through `generate.expand_topic()` (text LLM, default `gpt-5-mini`) before enqueueing the expansion as `kind="prompt"`. |
+| "Run this queue item now" / "Delete a pending item" | Use the SPA **Queue** tab while logged in as admin. Per-row buttons: **Run** (render this specific item next, regardless of queue order — calls `POST /admin/queue/<id>/run` which async-invokes the generator with `render_item`) and **Remove** (cancel — `DELETE /admin/queue/<id>`). There is **no per-row move-to-top** — the queue is two-priority (top / bottom) and items aren't reordered after enqueue. Pick the right placement at submit time (Top / Bottom / Now buttons on the Admin form), or use Run to bypass order for a specific item. |
+| "Change the text-expansion model" / "Use a different model for the prompt expansion" | Set the `EINKGEN_TEXT_MODEL` env var on the generator Lambda (default `gpt-5-mini`). Cheaper/older options: `gpt-4o-mini`. Don't put image-only model names here — `expand_topic` calls `chat.completions.create`. |
+| "Change how many items the queue keeps" / "Queue too short / too long" | `TARGET_QUEUE_LENGTH` in [src/einkgen/lambdas/generator.py](src/einkgen/lambdas/generator.py). Each cron tick tops up to this floor by text-LLM expansion of random library topics, then renders the head. Going up = more buffer for the operator to inspect, more text-LLM calls per first deploy (one-time). Going down = less buffer. The render cadence is the EventBridge `rate(30 minutes)` — separate knob. |
+| "Render faster / slower" / "Change cron cadence" / "Reduce OpenAI bill" | One knob: `einkgenPollIntervalSeconds` in [infra/cdk.json](infra/cdk.json) (default `"1800"` = 30 min). Drives BOTH the EventBridge cron rate AND the manifest's `next_check_after` hint. Edit + `AWS_PROFILE=einkgen ./infra/scripts/deploy.sh`. Values ≤3600 are server-only (firmware honours any sub-hour hint). Values >3600 also need `SLEEP_MAX_SECONDS` raised in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) before re-flash. Must be a multiple of 60. Rough OpenAI cost: 15 min → ~$115/mo, 30 min → ~$55/mo, 1 h → ~$30/mo, 2 h → ~$15/mo. Battery scales inversely (30 min → ~3–4 months, 1 h → ~6–9 months on a 3 Ah cell). |
 | "Pick me a cheap domain" | `aws route53domains list-prices --region us-east-1` + filter where reg ≤ $10 *and* renew ≤ $10. Then `check-domain-availability` per candidate. Always surface renewal price — domain registration is a recurring cost. Don't autonomously register; have the human `cp register-domain.example.sh register-domain.sh` and fill in their PII (the live `.sh` is gitignored). |
 | "Change the dither algorithm" | `src/einkgen/core/convert.py`. **Read [TODOS.md](TODOS.md) §"Profile and replace pure-Python error-diffusion dither" first** — the current pure-Python Atkinson is the considered choice. Don't replace without re-measuring. |
-| "Change the device poll interval" / "make it check more often" | Edit **both** `SLEEP_MAX_SECONDS` + `SLEEP_FALLBACK_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) **and** redeploy with `-c einkgenPollIntervalSeconds=<n>`. See [QUICKSTART §3.12](QUICKSTART.md#312-optional-device-poll-interval) for the battery-life table. Server-only change is silently clamped by firmware. Don't conflate with the auto-gen `rate(2 hours)` cron — that's the OpenAI-cost knob, separate concern. |
+| "Change the device poll interval" / "make it check more often" | Same knob as "Render faster / slower" above — `einkgenPollIntervalSeconds` drives both. There is no separate device-only knob since v0.5.1.0 (deliberately — no point polling more often than cron renders). |
 | "It's broken / debug this" / "Site is down" / "Tabs won't load" | **Run `AWS_PROFILE=einkgen ./infra/scripts/verify-deploy.sh` first.** It pinpoints which of {read-api, admin-api, manifest, image, SPA shell, SPA bundle env-vars, recent Lambda errors} is broken. Then `./infra/scripts/check-errors.sh 24h` for deeper log context, and `aws logs tail /aws/lambda/<fn> --follow` for live tail. If verify reports an SPA bundle regression (no `localhost:` check, etc.), fix is **`AWS_PROFILE=einkgen ./infra/scripts/deploy.sh`** — do not "fix" by editing the SPA. |
 | "QA the live SPA" | Use the deployed CloudFront URL and the browse tool (or `/qa-only` if gstack is loaded) |
 | "Set up an iPhone shortcut" / "Submit from Siri" / "Phone shortcut" | [shortcuts/README.md](shortcuts/README.md) — two paths: a 2-action email shortcut (if inbound email is set up) or a 4–8-action HTTP shortcut that calls the admin API. Both end with *"Hey Siri, einkgen."* |
@@ -194,7 +198,20 @@ tests/                          pytest, moto-backed (boto3 is stubbed)
   on top of the medium-quality drop), but still real per-call $. Don't
   enqueue more than 1–2 test prompts per session. Don't trigger cron
   faster than its 2 h rate. Don't "fix" things by running the generator
-  in a loop. There is **no daily $ cap yet** (see [TODOS.md](TODOS.md)).
+  in a loop. The cron's text-LLM top-up (default `gpt-5-mini` via
+  `expand_topic`) is a rounding error by comparison — those calls are
+  cheap and bounded per tick by `TARGET_QUEUE_LENGTH`. The image-gen
+  call is the one that costs. There is **no daily $ cap yet** (see
+  [TODOS.md](TODOS.md)).
+- **Don't re-introduce the S3 ObjectCreated trigger on `queue/`.** The
+  queue was redesigned in [0.5.0.0] to be a curated buffer: items wait
+  until cron or an admin **Run** / **Now** explicitly renders them. If
+  you wire the trigger back, every enqueue becomes a render, the
+  reorder UI stops mattering, and the OpenAI bill goes up. The
+  generator handler explicitly logs+ignores stray S3 events for the
+  same reason. New rendering triggers should be additional
+  `lambda.invoke` callers (e.g. the future wake-button endpoint —
+  PLAN §2 item 16), not S3 notifications.
 - **Domain registration is a recurring cost.** Never auto-register a
   domain via `route53domains register-domain`. Always present the
   human with the renewal price and let them approve / pick the name
