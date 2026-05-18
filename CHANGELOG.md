@@ -5,6 +5,50 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.1.0] - 2026-05-18
+
+### Added
+- **Email + CLI "render now" affordance — submissions no longer disappear
+  behind the 10-deep pre-rendered buffer.** Both non-SPA submission paths
+  now match what the Admin tab's **Now** button has always done: enqueue
+  at the top of the prompt queue AND async-invoke the generator with
+  ``{"action": "render_now"}`` so the frame renders into the buffer
+  immediately, not after cron drains the existing 10 items.
+
+  * **CLI:** ``einkgen queue prompt "<text>" --now`` and
+    ``einkgen queue image <path> --now``. Mutually exclusive with
+    ``--top``. Requires ``lambda:InvokeFunction`` on
+    ``einkgen-generator`` in the operator's IAM (the IAM the
+    ``einkgen`` AWS profile uses for the rest of the CLI). Without
+    the permission, the item still enqueues at the top — only the
+    immediate invoke is skipped, and the next cron tick picks it up.
+  * **Inbound email:** a subject prefix of ``NOW ``, ``NOW:``, or
+    ``[NOW]`` (case-insensitive) tags the submission as urgent. The
+    trigger word is **stripped from the prompt before it reaches
+    gpt-image-2**, so ``Subject: NOW watercolor mountains`` generates
+    "watercolor mountains" — not "NOW watercolor mountains". CDK
+    wires ``generator.grantInvoke`` on the inbound-email Lambda and
+    sets ``EINKGEN_GENERATOR_FUNCTION_NAME`` in its env so the new
+    trigger has the IAM it needs end-to-end.
+
+  Pre-0.6.0.0, an inbound email or ``einkgen queue prompt`` submission
+  rendered on the next cron tick (≤ 30 min). The 0.6.0.0 buffer
+  redesign pushed user-visible latency to ~5 h for non-SPA paths
+  ("Submissions via email / CLI shouldn't disappear behind the
+  buffer" in TODOS.md). This release closes that regression. Resolves
+  the P2 TODO of the same name.
+
+  Confirmation reply emails now mention the NOW trigger explicitly:
+  *"Queued your prompt for generation. (NOW: rendering immediately
+  into the buffer.)"* Without the trigger the reply stays as before.
+
+### Changed
+- ``einkgen.core.email_parse.ParsedEmail`` gained an ``urgent: bool``
+  field (defaulted to ``False``) so the inbound-email Lambda can act
+  on the NOW trigger without reparsing the subject. Callers that
+  construct ``ParsedEmail`` directly (none in this repo) are unaffected
+  thanks to the default.
+
 ## [0.6.0.0] - 2026-05-18
 
 ### Added
