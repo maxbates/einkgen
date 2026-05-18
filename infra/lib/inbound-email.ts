@@ -55,6 +55,16 @@ export interface EinkgenInboundEmailProps {
    * ``infra/cdk.json:einkgenPollIntervalSeconds``.
    */
   pollIntervalSeconds: number;
+
+  /**
+   * Generator Lambda this construct is allowed to async-invoke. Used by
+   * the NOW-subject trigger: inbound emails whose subject starts with
+   * ``NOW`` / ``[NOW]`` enqueue at the top and immediately invoke
+   * ``{"action":"render_now"}`` so the user-visible latency drops from
+   * "behind the 10-deep buffer" to "next cold start". Without this prop
+   * the Lambda still enqueues at the top but skips the immediate render.
+   */
+  generator?: lambda.IFunction;
 }
 
 const INBOUND_PREFIX = 'inbound/';
@@ -139,8 +149,22 @@ export class EinkgenInboundEmail extends Construct {
         AWS_LAMBDA_LOG_LEVEL: 'INFO',
         ...(props.projectUrl ? { EINKGEN_PROJECT_URL: props.projectUrl } : {}),
         EINKGEN_POLL_INTERVAL_SECONDS: `${props.pollIntervalSeconds}`,
+        // Used by the NOW-subject trigger to async-invoke the generator
+        // (InvocationType=Event). Without it the route still enqueues
+        // the item at the top of the queue; the immediate render is
+        // skipped and the next cron tick picks it up.
+        ...(props.generator
+          ? { EINKGEN_GENERATOR_FUNCTION_NAME: props.generator.functionName }
+          : {}),
       },
     });
+
+    // NOW-subject trigger fires render_now at the generator. Scope to
+    // the one function — there are no other generators we'd want to
+    // invoke. Skipped cleanly when the prop is absent.
+    if (props.generator) {
+      props.generator.grantInvoke(this.handler);
+    }
 
     // Scoped IAM — match the pattern used by generator/device-status: never
     // grantReadWrite on the whole bucket; spell out the prefix-level rights.
