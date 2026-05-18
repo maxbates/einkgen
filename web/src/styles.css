@@ -709,3 +709,75 @@ button {
   color: var(--error-fg);
   word-break: break-word;
 }
+
+/* ----- Queue sections (Generated / Pending prompts) -------------------- */
+
+.queue-section {
+  margin-top: 22px;
+}
+
+.queue-section:first-of-type {
+  margin-top: 12px;
+}
+
+.queue-section-heading {
+  margin: 0 0 4px;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.queue-section-heading .small {
+  font-weight: 400;
+  margin-left: 6px;
+}
+
+.queue-section-hint {
+  margin: 0 0 12px;
+}
+
+.generated-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.generated-row {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 12px;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.generated-thumb-wrap {
+  flex-shrink: 0;
+}
+
+.generated-thumb {
+  width: 120px;
+  height: 82px;
+  object-fit: cover;
+  border-radius: var(--radius);
+  background: var(--chip-bg);
+  display: block;
+}
+
+.generated-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+@media (max-width: 540px) {
+  .generated-thumb {
+    width: 80px;
+    height: 55px;
+  }
+}
