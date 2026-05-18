@@ -1,0 +1,67 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`EinkgenObservability — daily render cap snapshot — alarm + topic resources stay stable across changes 1`] = `
+{
+  "alarms": {
+    "ObservabilityGeneratorDailyRenderCap7E6E8FE1": {
+      "Properties": {
+        "AlarmActions": [
+          {
+            "Ref": "ObservabilityAlarmTopicF724909D",
+          },
+        ],
+        "AlarmDescription": "einkgen generator invocations exceeded 100 in a 24h window. At ~$0.04 per gpt-image-2 medium call this is a runaway cost signal — investigate /wake traffic, the device token, and the cron rule.",
+        "AlarmName": "einkgen-test-generator-daily-render-cap",
+        "ComparisonOperator": "GreaterThanThreshold",
+        "EvaluationPeriods": 1,
+        "Metrics": [
+          {
+            "Id": "m1",
+            "Label": "generator invocations (24h)",
+            "MetricStat": {
+              "Metric": {
+                "Dimensions": [
+                  {
+                    "Name": "FunctionName",
+                    "Value": {
+                      "Ref": "Generator170C31BE",
+                    },
+                  },
+                ],
+                "MetricName": "Invocations",
+                "Namespace": "AWS/Lambda",
+              },
+              "Period": 86400,
+              "Stat": "Sum",
+            },
+            "ReturnData": true,
+          },
+        ],
+        "Threshold": 100,
+        "TreatMissingData": "notBreaching",
+      },
+      "Type": "AWS::CloudWatch::Alarm",
+    },
+  },
+  "subscriptions": {
+    "ObservabilityAlarmTopicopsexamplecom0A4ADDC0": {
+      "Properties": {
+        "Endpoint": "ops@example.com",
+        "Protocol": "email",
+        "TopicArn": {
+          "Ref": "ObservabilityAlarmTopicF724909D",
+        },
+      },
+      "Type": "AWS::SNS::Subscription",
+    },
+  },
+  "topics": {
+    "ObservabilityAlarmTopicF724909D": {
+      "Properties": {
+        "DisplayName": "einkgen test alarms",
+      },
+      "Type": "AWS::SNS::Topic",
+    },
+  },
+}
+`;
