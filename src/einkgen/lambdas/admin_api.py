@@ -12,6 +12,7 @@ Routes (all under the ``/admin`` prefix, behind a single HTTP API):
 - ``PUT  /admin/prompts``       → ``{"prompts": [...]}``    → 200 ``{"prompts": [...]}``
 - ``POST /admin/prompts/reset`` → 200 ``{"prompts": [...]}`` (writes DEFAULTS)
 - ``POST /admin/show``          → ``{"history_id": "..."}`` → 200 ``{"version":...}``
+- ``GET  /admin/failures``      → 200 ``{"items": [...]}`` (last-hour drops)
 
 Auth
 ----
@@ -54,7 +55,7 @@ from typing import Any
 
 import boto3
 
-from einkgen.core import admin_cookie, prompt_library, publish, queue
+from einkgen.core import admin_cookie, failures, prompt_library, publish, queue
 from einkgen.core import s3 as s3mod
 
 log = logging.getLogger(__name__)
@@ -477,6 +478,19 @@ def _handle_prompts_reset(event: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _handle_failures_get(event: dict[str, Any]) -> dict[str, Any]:
+    """Last-hour breadcrumbs for permanently-dropped items.
+
+    Returns the same fields the SPA needs to render a "Recently rejected"
+    panel: id, timestamps, source, kind, the (truncated) prompt, and the
+    reason the pipeline gave up. See ``einkgen.core.failures``.
+    """
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    items = [rec.to_json() for rec in failures.list_recent()]
+    return _response(200, {"items": items})
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -492,6 +506,7 @@ _ROUTES: dict[tuple[str, str], Any] = {
     ("PUT", "/admin/prompts"): _handle_prompts_put,
     ("POST", "/admin/prompts/reset"): _handle_prompts_reset,
     ("POST", "/admin/show"): _handle_show,
+    ("GET", "/admin/failures"): _handle_failures_get,
 }
 
 

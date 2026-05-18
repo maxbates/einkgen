@@ -2,12 +2,14 @@ import { useEffect, useState, type FormEvent } from "react";
 import {
   adminEnqueueImage,
   adminEnqueuePrompt,
+  adminGetFailures,
   adminGetPrompts,
   adminLogin,
   adminLogout,
   adminMe,
   adminPutPrompts,
   adminResetPrompts,
+  type AdminFailureItem,
 } from "../api";
 
 type SessionState =
@@ -285,7 +287,91 @@ function AdminPanel({
         <p className="admin-inline-error">{state.message}</p>
       ) : null}
 
+      <RecentlyRejected refreshKey={state.kind === "ok" ? state.id : null} />
+
       <PromptLibraryEditor />
+    </div>
+  );
+}
+
+function RecentlyRejected({ refreshKey }: { refreshKey: string | null }) {
+  const [items, setItems] = useState<AdminFailureItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const res = await adminGetFailures(ctrl.signal);
+        if (cancelled) return;
+        setItems(res.items);
+        setError(null);
+      } catch (err) {
+        if (cancelled || ctrl.signal.aborted) return;
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    })();
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
+    // Refetch on demand (button) and whenever a new submit lands — a freshly
+    // queued prompt that's about to be rejected typically shows up within a
+    // minute or two, so the operator can hit refresh once they suspect.
+  }, [reloadTick, refreshKey]);
+
+  if (error) {
+    return (
+      <div className="admin-card">
+        <p className="submit-hint-heading">Recently rejected</p>
+        <p className="admin-inline-error">{error}</p>
+      </div>
+    );
+  }
+
+  // Hide the entire section while there's nothing to show — keeps the
+  // panel clean for the happy path.
+  if (items === null || items.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="admin-card">
+      <div className="admin-failures-header">
+        <div>
+          <p className="submit-hint-heading">Recently rejected</p>
+          <p className="muted small">
+            Items the pipeline dropped in the last hour (e.g. the image model
+            refused the prompt). Self-clearing — older entries disappear.
+          </p>
+        </div>
+        <button
+          type="button"
+          className="button"
+          onClick={() => setReloadTick((n) => n + 1)}
+        >
+          Refresh
+        </button>
+      </div>
+      <ul className="admin-failure-list">
+        {items.map((item) => (
+          <li key={item.id} className="admin-failure-item">
+            <div className="admin-failure-meta muted small">
+              <span>{new Date(item.recorded_at).toLocaleString()}</span>
+              <span>·</span>
+              <span>via {item.source}</span>
+              <span>·</span>
+              <span>{item.kind}</span>
+            </div>
+            {item.prompt ? (
+              <p className="admin-failure-prompt">{item.prompt}</p>
+            ) : null}
+            <p className="admin-failure-reason">{item.reason}</p>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

@@ -584,6 +584,53 @@ def test_show_missing_field_returns_400(secrets, s3_bucket):
 
 
 # ---------------------------------------------------------------------------
+# /admin/failures
+# ---------------------------------------------------------------------------
+
+
+def test_get_failures_requires_session(secrets, s3_bucket):
+    resp = admin_api.handler(_event("GET", "/admin/failures"))
+    assert resp["statusCode"] == 401
+
+
+def test_get_failures_returns_empty_when_none(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event("GET", "/admin/failures", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body == {"items": []}
+
+
+def test_get_failures_returns_recorded_breadcrumbs(secrets, s3_bucket):
+    from einkgen.core import failures
+    from einkgen.core.queue import QueueItem
+
+    failures.record(
+        QueueItem(
+            id="01KRVH4PD175X44VEGERG7547M",
+            enqueued_at="2026-05-17T17:53:30Z",
+            source="admin",
+            kind="prompt",
+            prompt="something the safety system blocked",
+        ),
+        "rejected by safety system: moderation_blocked",
+    )
+    resp = admin_api.handler(
+        _event("GET", "/admin/failures", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["id"] == "01KRVH4PD175X44VEGERG7547M"
+    assert item["source"] == "admin"
+    assert item["kind"] == "prompt"
+    assert item["prompt"] == "something the safety system blocked"
+    assert "moderation_blocked" in item["reason"]
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 

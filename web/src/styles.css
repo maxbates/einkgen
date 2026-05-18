@@ -601,3 +601,48 @@ button {
   gap: 8px;
   flex-wrap: wrap;
 }
+
+.admin-failures-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.admin-failure-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.admin-failure-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--chip-bg);
+  border-radius: var(--radius);
+}
+
+.admin-failure-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.admin-failure-prompt {
+  margin: 0;
+  font-size: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.admin-failure-reason {
+  margin: 0;
+  font-size: 13px;
+  color: var(--error-fg);
+  word-break: break-word;
+}
