@@ -6,25 +6,32 @@ where the device pulls the latest frame on its own schedule.
 
 **Live example:** <https://einkgen.link/> — three read-only public tabs
 (Queue, History, Device) plus a password-gated Admin tab for submitting
-prompts or photos from a phone or laptop. History fills in every 2 hours
-from the cron tick.
+prompts or photos from a phone or laptop. The Queue tab shows both the
+pending prompts and the pre-rendered **Up next** buffer. New frames land
+every 30 minutes from the cron tick, or on demand when the Inkplate's
+WAKE button is pressed.
 
 ```
-   CLI ──┐            ┌────────────────────┐                     ┌──────────────────┐
-  cron ──┤  enqueue ─▶│  queue (S3 prefix) │── S3 ObjectCreated ▶│ generator Lambda │──┐
- future ─┘            └────────────────────┘    (concurrency=1)  └──────────────────┘  │
-                              ▲                                                        │
-                              │   read-only                                            ▼
-                       ┌─────────────────┐    ◀── public reads ──            ┌────────────────┐
-                       │  web app (SPA)  │    via read-api Lambda            │   S3 bucket    │
-                       │  3 tabs, public │                                   │   + manifest   │
-                       └─────────────────┘                                   └────────┬───────┘
-                                                                                      │ CloudFront
-                                                                                      ▼ HTTPS GET
-                                                                              ┌──────────────┐
-                                                                              │ Inkplate 10  │
-                                                                              │   firmware   │
-                                                                              └──────────────┘
+   CLI ──┐       ┌──────────────┐ cron / render_one ┌──────────────────┐ buffer_item
+  email ─┤enqueue│ prompt queue │ ────────────────▶ │ generator Lambda │ ─────────┐
+  admin ─┘       │  (queue/*)   │                   │ (concurrency=1)  │           │
+  cron ─────────▶└──────────────┘                   └──────────────────┘           ▼
+                                                                       ┌────────────────────┐
+                                                advance / pop on  ◀── │  generated queue   │
+                                                POST /wake             │  (generated/*)     │
+                                                                       └────────┬───────────┘
+                                                                                │ set_current
+                                                                                ▼
+                                                                        ┌────────────────┐
+                          ┌─────────────────┐  reads via read-api      │   S3 bucket    │
+                          │  web app (SPA)  │ ◀──────────────────────  │   + manifest   │
+                          │  3 tabs + Admin │                          └────────┬───────┘
+                          └─────────────────┘                                   │ CloudFront
+                                                                                ▼ HTTPS GET
+                                                                        ┌──────────────┐
+                                                                        │ Inkplate 10  │ wake → POST /wake
+                                                                        │   firmware   │     → fetch manifest
+                                                                        └──────────────┘     → draw if changed
 ```
 
 ## Docs
