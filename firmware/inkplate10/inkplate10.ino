@@ -1,13 +1,21 @@
 // einkgen — Inkplate 10 firmware
 //
-// On every wake:
+// On every wake (timer or WAKE-button):
 //   1. Join Wi-Fi.
-//   2. GET manifest.json from CloudFront.
-//   3. If image_sha256 differs from NVS, OR battery has crossed the
+//   2. POST {current_sha256} to the device-status Lambda's /wake route.
+//      The server compares the reported sha against current/manifest.json.
+//      If the device has caught up, /wake pops the generated-queue head
+//      and re-points current at it (the next manifest fetch sees the new
+//      sha). If the device hasn't drawn the latest yet, /wake is a no-op
+//      and returns redraw. /wake is best-effort: any error is logged and
+//      the existing manifest-fetch path runs anyway, so a flaky network
+//      degrades to the legacy redraw-if-changed behavior.
+//   3. GET manifest.json from CloudFront.
+//   4. If image_sha256 differs from NVS, OR battery has crossed the
 //      low-battery threshold since last draw, redraw: drawBitmapFromBuffer()
 //      + (optionally) drawBatteryOverlay() + display() + persist.
-//   4. POST {battery, rssi, current_hash, fw_version} to device-status Lambda.
-//   5. Deep-sleep until min(next_check_after, now + 1h), floor 60 s — or
+//   5. POST {battery, rssi, current_hash, fw_version} to the status route.
+//   6. Deep-sleep until min(next_check_after, now + 1h), floor 60 s — or
 //      until the WAKE button is pressed, whichever comes first.
 //
 // loop() is empty — every wake is a fresh setup() run.
@@ -388,6 +396,66 @@ static void drawBatteryOverlay(int pct)
     display.print(label);
 }
 
+// Build the /wake URL from DEVICE_STATUS_URL by stripping any trailing
+// slash and appending "/wake". Avoids forcing a secrets.h change when
+// upgrading firmware on a device flashed before /wake existed.
+static String wakeUrl()
+{
+    String u = DEVICE_STATUS_URL;
+    while (u.length() > 0 && u.charAt(u.length() - 1) == '/') {
+        u.remove(u.length() - 1);
+    }
+    u += "/wake";
+    return u;
+}
+
+// Best-effort wake POST. Tells the server "the panel is currently
+// showing <sha>", which lets it pop the next pre-rendered image off the
+// generated queue (if the device is caught up) or send back a "redraw"
+// hint (if not). Returns true on HTTP 200 — but the caller never branches
+// on this: the subsequent manifest fetch is the authoritative source of
+// truth and a failed /wake just degrades to the legacy refresh-if-changed
+// path. Logs the parsed action for serial debugging.
+static bool postWake(const char *current_hash)
+{
+    String url = wakeUrl();
+    Serial.printf("[wake] POST %s\n", url.c_str());
+    WiFiClientSecure client;
+    client.setInsecure();  // TODO: pin cert.
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    if (!http.begin(client, url)) {
+        Serial.println("[wake] http.begin failed");
+        return false;
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Device-Token", DEVICE_STATUS_TOKEN);
+
+    JsonDocument body;
+    // Empty string is fine — server treats it as "unknown sha" and
+    // falls into the advance branch (helpful for fresh deploys where
+    // NVS hasn't seen anything yet).
+    body["current_sha256"] = current_hash ? current_hash : "";
+
+    String payload;
+    serializeJson(body, payload);
+
+    int code = http.POST(payload);
+    if (code != 200) {
+        Serial.printf("[wake] non-OK HTTP %d, body=%s\n", code,
+                      http.getString().c_str());
+        http.end();
+        return false;
+    }
+    // Best-effort response logging — we don't act on the body, but it
+    // makes serial debugging much easier ("did the server advance?").
+    String resp = http.getString();
+    Serial.printf("[wake] OK %s\n", resp.c_str());
+    http.end();
+    return true;
+}
+
 // Best-effort status POST. Logs but never throws.
 static void postStatus(float battery_v, int battery_pct, int rssi,
                        const char *current_hash)
@@ -448,8 +516,21 @@ void setup()
     // NTP first so we can interpret next_check_after.
     bool haveTime = syncTime();
 
+    // Hit /wake BEFORE fetching the manifest. The server uses the sha
+    // we report to decide whether to pop the next pre-rendered image
+    // (advance) or just leave the manifest as-is. The subsequent
+    // manifest fetch sees whatever /wake decided. A failed /wake call
+    // is OK — the manifest fetch path still works exactly as before.
+    Preferences nvs;
+    nvs.begin(NVS_NAMESPACE, /*readOnly=*/false);
+    String storedHash = nvs.getString(NVS_KEY_HASH, "");
+    bool   wasLow     = nvs.getBool(NVS_KEY_BATT_LOW, false);
+
+    (void)postWake(storedHash.c_str());
+
     String body;
     if (!fetchManifest(body)) {
+        nvs.end();
         deepSleepFor(SLEEP_FALLBACK_SECONDS);
         return;
     }
@@ -458,6 +539,7 @@ void setup()
     DeserializationError err = deserializeJson(doc, body);
     if (err) {
         Serial.printf("[manifest] parse error: %s\n", err.c_str());
+        nvs.end();
         deepSleepFor(SLEEP_FALLBACK_SECONDS);
         return;
     }
@@ -468,6 +550,7 @@ void setup()
 
     if (!imageUrl[0] || !imageHash[0]) {
         Serial.println("[manifest] missing image_url or image_sha256");
+        nvs.end();
         deepSleepFor(SLEEP_FALLBACK_SECONDS);
         return;
     }
@@ -482,10 +565,8 @@ void setup()
     int   battPct = batteryPercent(battV);
     bool  isLow   = (battPct < BATT_LOW_THRESHOLD_PCT);
 
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, /*readOnly=*/false);
-    String storedHash = prefs.getString(NVS_KEY_HASH, "");
-    bool   wasLow     = prefs.getBool(NVS_KEY_BATT_LOW, false);
+    // storedHash + wasLow were read into NVS already (before postWake);
+    // just compare against the manifest now.
     bool   hashChanged = (storedHash != imageHash);
     bool   battChanged = (isLow != wasLow);
     bool   needsRedraw = hashChanged || battChanged;
@@ -503,8 +584,8 @@ void setup()
     if (needsRedraw) {
         Serial.println("[draw] downloading and verifying image");
         if (downloadVerifyAndDraw(imageUrl, imageHash, isLow, battPct)) {
-            prefs.putString(NVS_KEY_HASH, imageHash);
-            prefs.putBool(NVS_KEY_BATT_LOW, isLow);
+            nvs.putString(NVS_KEY_HASH, imageHash);
+            nvs.putBool(NVS_KEY_BATT_LOW, isLow);
             currentHash = imageHash;
             Serial.println("[draw] OK, hash + battery state persisted");
         } else {
@@ -513,7 +594,7 @@ void setup()
     } else {
         Serial.println("[draw] hash + battery state unchanged, skipping redraw");
     }
-    prefs.end();
+    nvs.end();
 
     // RSSI + status POST. Report what we're actually showing.
     int rssi = WiFi.RSSI();
