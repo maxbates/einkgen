@@ -56,6 +56,7 @@ def _event(
     token: str | None = TEST_TOKEN,
     is_base64: bool = False,
     extra_headers: dict[str, str] | None = None,
+    path: str = "/",
 ) -> dict:
     headers: dict[str, str] = {"content-type": "application/json"}
     if token is not None:
@@ -64,8 +65,8 @@ def _event(
         headers.update(extra_headers)
     event: dict = {
         "version": "2.0",
-        "rawPath": "/",
-        "requestContext": {"http": {"method": method}},
+        "rawPath": path,
+        "requestContext": {"http": {"method": method, "path": path}},
         "headers": headers,
         "isBase64Encoded": is_base64,
     }
@@ -317,4 +318,217 @@ def test_uppercase_header_name_is_accepted(s3_bucket, secret):
     event["headers"]["X-Device-Token"] = TEST_TOKEN
 
     resp = device_status.handler(event)
+    assert resp["statusCode"] == 200
+
+
+# ---------------------------------------------------------------------------
+# POST /wake — sha-debounced advance from the generated buffer
+# ---------------------------------------------------------------------------
+
+import boto3 as _boto3  # noqa: E402
+
+from einkgen.core import generated_queue, publish  # noqa: E402
+
+# Realistic-looking sha256s for branch assertions. Length-64 lowercase hex.
+SHA_CURRENT = "f" * 64
+SHA_DEVICE_STALE = "e" * 64
+SHA_HISTORY = "abc1234" + "0" * 57
+
+
+def _wake_event(
+    body: str | None,
+    *,
+    token: str | None = TEST_TOKEN,
+    method: str = "POST",
+) -> dict:
+    return _event(body, token=token, method=method, path="/wake")
+
+
+def _seed_current_manifest(s3_bucket, sha: str = SHA_CURRENT) -> None:
+    """Write a minimal current/manifest.json that the /wake handler reads."""
+    body = json.dumps(
+        {
+            "version": 1,
+            "generated_at": "2026-05-18T00:00:00Z",
+            "image_url": "https://cdn.example.com/current/image.bmp",
+            "image_sha256": sha,
+            "image_bytes": 12345,
+            "display": {"width": 1200, "height": 825, "levels": 8},
+            "next_check_after": "2026-05-18T00:30:00Z",
+            "source": {"kind": "generated"},
+        }
+    ).encode("utf-8")
+    s3_bucket.put_object(
+        Bucket=TEST_BUCKET, Key=publish.CURRENT_MANIFEST_KEY, Body=body
+    )
+
+
+def _seed_history(s3_bucket, history_id: str, sha: str = SHA_HISTORY) -> None:
+    """Write history/<id>/manifest.json so set_current_from_history works."""
+    body = json.dumps(
+        {
+            "version": 1,
+            "generated_at": "2026-05-18T00:00:00Z",
+            "image_url": f"https://cdn.example.com/history/{history_id}/processed.bmp",
+            "image_sha256": sha,
+            "image_bytes": 999,
+            "display": {"width": 1200, "height": 825, "levels": 8},
+            "next_check_after": "2026-05-18T00:30:00Z",
+            "source": {"kind": "generated", "prompt": "a topic"},
+        }
+    ).encode("utf-8")
+    s3_bucket.put_object(
+        Bucket=TEST_BUCKET,
+        Key=f"history/{history_id}/manifest.json",
+        Body=body,
+    )
+
+
+def _enqueue_marker(history_id: str, sha: str = SHA_HISTORY) -> None:
+    generated_queue.enqueue(
+        history_id,
+        image_sha256=sha,
+        image_bytes=999,
+        source={"kind": "generated", "prompt": "a topic"},
+    )
+
+
+def _stub_replenish(monkeypatch):
+    """Capture replenish invokes without actually calling Lambda."""
+    calls: list[dict] = []
+
+    def fake_invoke(payload):
+        calls.append(payload)
+
+    monkeypatch.setattr(device_status, "_fire_replenish", lambda: fake_invoke({"action": "render_one"}))
+    return calls
+
+
+def test_wake_unauth_returns_401(s3_bucket, secret):
+    body = json.dumps({"current_sha256": SHA_CURRENT})
+    resp = device_status.handler(_wake_event(body, token=None))
+    assert resp["statusCode"] == 401
+
+
+def test_wake_get_method_rejected(s3_bucket, secret):
+    resp = device_status.handler(_wake_event(None, method="GET"))
+    assert resp["statusCode"] == 400
+
+
+def test_wake_malformed_sha_returns_400(s3_bucket, secret):
+    body = json.dumps({"current_sha256": "not-hex"})
+    resp = device_status.handler(_wake_event(body))
+    assert resp["statusCode"] == 400
+    assert json.loads(resp["body"])["error"] == "bad_request"
+
+
+def test_wake_redraw_when_device_sha_differs(s3_bucket, secret, monkeypatch):
+    """Mismatch → tell device to redraw existing manifest; don't pop buffer."""
+    _seed_current_manifest(s3_bucket, sha=SHA_CURRENT)
+    _enqueue_marker("01HHHHHHHHHHHHHHHHHHHHHHHH")
+    invokes = _stub_replenish(monkeypatch)
+
+    body = json.dumps({"current_sha256": SHA_DEVICE_STALE})
+    resp = device_status.handler(_wake_event(body))
+
+    assert resp["statusCode"] == 200
+    payload = json.loads(resp["body"])
+    assert payload["action"] == "redraw"
+    assert payload["manifest_sha256"] == SHA_CURRENT
+    # Buffer untouched.
+    assert generated_queue.count() == 1
+    # No replenish fired — we didn't advance.
+    assert invokes == []
+
+
+def test_wake_advance_pops_head_and_sets_current(s3_bucket, secret, monkeypatch):
+    """Match + non-empty buffer → pop, set_current_from_history, fire replenish."""
+    _seed_current_manifest(s3_bucket, sha=SHA_CURRENT)
+    history_id = "01HHHHHHHHHHHHHHHHHHHHHHHH"
+    history_sha = "1" + "a" * 63
+    _seed_history(s3_bucket, history_id, sha=history_sha)
+    _enqueue_marker(history_id, sha=history_sha)
+    invokes = _stub_replenish(monkeypatch)
+
+    body = json.dumps({"current_sha256": SHA_CURRENT})
+    resp = device_status.handler(_wake_event(body))
+
+    assert resp["statusCode"] == 200
+    payload = json.loads(resp["body"])
+    assert payload["action"] == "advance"
+    assert payload["history_id"] == history_id
+    assert payload["manifest_sha256"] == history_sha
+    # Marker was finalized; buffer is empty now.
+    assert generated_queue.empty()
+    # Replenish fired exactly once.
+    assert len(invokes) == 1
+    # current/manifest.json was rewritten with the new sha.
+    new_manifest = json.loads(
+        s3_bucket.get_object(Bucket=TEST_BUCKET, Key=publish.CURRENT_MANIFEST_KEY)[
+            "Body"
+        ].read()
+    )
+    assert new_manifest["image_sha256"] == history_sha
+    assert new_manifest["source"]["replayed_from"] == history_id
+
+
+def test_wake_queue_empty_when_buffer_drained(s3_bucket, secret, monkeypatch):
+    """Match + empty buffer → noop, don't burn a fresh OpenAI call."""
+    _seed_current_manifest(s3_bucket, sha=SHA_CURRENT)
+    invokes = _stub_replenish(monkeypatch)
+
+    body = json.dumps({"current_sha256": SHA_CURRENT})
+    resp = device_status.handler(_wake_event(body))
+
+    assert resp["statusCode"] == 200
+    payload = json.loads(resp["body"])
+    assert payload["action"] == "queue_empty"
+    assert payload["manifest_sha256"] == SHA_CURRENT
+    assert invokes == []
+
+
+def test_wake_first_deploy_no_current_manifest_advances(s3_bucket, secret, monkeypatch):
+    """No current manifest yet + non-empty buffer → advance."""
+    # Deliberately do NOT seed current/manifest.json.
+    history_id = "01HFRESHDEPLOYHFRESHDEPLOY"
+    history_sha = "2" + "b" * 63
+    _seed_history(s3_bucket, history_id, sha=history_sha)
+    _enqueue_marker(history_id, sha=history_sha)
+    invokes = _stub_replenish(monkeypatch)
+
+    body = json.dumps({"current_sha256": ""})  # firmware NVS is empty
+    resp = device_status.handler(_wake_event(body))
+
+    assert resp["statusCode"] == 200
+    payload = json.loads(resp["body"])
+    assert payload["action"] == "advance"
+    assert payload["history_id"] == history_id
+    assert generated_queue.empty()
+    assert len(invokes) == 1
+
+
+def test_wake_marker_pointing_at_missing_history_drops_marker(
+    s3_bucket, secret, monkeypatch
+):
+    """A stale marker (no history archive) advances the buffer without crashing."""
+    _seed_current_manifest(s3_bucket, sha=SHA_CURRENT)
+    _enqueue_marker("01HMISSINGHISTORY01HMISSING")  # no history archive seeded
+    invokes = _stub_replenish(monkeypatch)
+
+    body = json.dumps({"current_sha256": SHA_CURRENT})
+    resp = device_status.handler(_wake_event(body))
+
+    assert resp["statusCode"] == 200
+    payload = json.loads(resp["body"])
+    assert payload["action"] == "queue_empty"
+    # Marker was dropped so we don't hit the same fault on the next wake.
+    assert generated_queue.empty()
+    # No replenish fired — we didn't actually advance.
+    assert invokes == []
+
+
+def test_wake_status_route_still_works(s3_bucket, secret):
+    """Adding /wake didn't break the existing status heartbeat."""
+    body = json.dumps({"device_id": "kitchen", "battery_v": 4.0, "current_hash": "x"})
+    resp = device_status.handler(_event(body, path="/"))
     assert resp["statusCode"] == 200
