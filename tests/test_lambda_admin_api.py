@@ -855,3 +855,99 @@ def test_wrong_method_on_known_path_returns_404(secrets):
     # GET /admin/login isn't a route — dispatcher returns 404, not 405.
     resp = admin_api.handler(_event("GET", "/admin/login"))
     assert resp["statusCode"] == 404
+
+
+# ---------------------------------------------------------------------------
+# /admin/generated/<history_id> — skip a buffered render
+# ---------------------------------------------------------------------------
+
+
+def _enqueue_generated_marker(history_id: str = "01HMARKERAAAA") -> None:
+    from einkgen.core import generated_queue
+
+    generated_queue.enqueue(
+        history_id,
+        image_sha256="a" * 64,
+        image_bytes=42,
+        source={"kind": "generated", "prompt": "buffered"},
+    )
+
+
+def test_skip_generated_requires_session(secrets, s3_bucket):
+    _enqueue_generated_marker("01HMARKERAAAA")
+    resp = admin_api.handler(
+        _event("DELETE", "/admin/generated/01HMARKERAAAA")
+    )
+    assert resp["statusCode"] == 401
+
+
+def test_skip_generated_drops_only_named_marker(secrets, s3_bucket):
+    from einkgen.core import generated_queue
+
+    _enqueue_generated_marker("01HMARKERAAAA")
+    _enqueue_generated_marker("01HMARKERBBBB")
+
+    login = _login()
+    token = _session_cookie_value(login)
+    resp = admin_api.handler(
+        _event(
+            "DELETE",
+            "/admin/generated/01HMARKERAAAA",
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    assert resp["statusCode"] == 204
+    remaining = [it.history_id for it in generated_queue.list()]
+    assert remaining == ["01HMARKERBBBB"]
+
+
+def test_skip_generated_missing_returns_404(secrets, s3_bucket):
+    login = _login()
+    token = _session_cookie_value(login)
+    resp = admin_api.handler(
+        _event(
+            "DELETE",
+            "/admin/generated/01HABSENTAAAA",
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    assert resp["statusCode"] == 404
+
+
+def test_skip_generated_rejects_malformed_id(secrets, s3_bucket):
+    login = _login()
+    token = _session_cookie_value(login)
+    resp = admin_api.handler(
+        _event(
+            "DELETE",
+            "/admin/generated/..%2F..%2Fetc%2Fpasswd",
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    # The path lookup itself uses the raw rawPath; the dispatcher sees a
+    # non-ULID-shaped segment and returns 400.
+    assert resp["statusCode"] in (400, 404)
+
+
+def test_show_also_drops_generated_marker(secrets, s3_bucket):
+    """``POST /admin/show`` on a buffered item must also clear the marker.
+
+    Otherwise "Show this now" would leave a duplicate in the up-next list.
+    """
+    from einkgen.core import generated_queue
+
+    _seed_history("01HISTORYAA")
+    _enqueue_generated_marker("01HISTORYAA")
+
+    login = _login()
+    token = _session_cookie_value(login)
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/show",
+            body={"history_id": "01HISTORYAA"},
+            cookies=[f"einkgen_admin={token}"],
+        )
+    )
+    assert resp["statusCode"] == 200
+    assert generated_queue.empty()
