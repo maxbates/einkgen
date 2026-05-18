@@ -1,8 +1,21 @@
-"""Publish primitive.
+"""Publish + archive primitives.
 
-Writes `current/manifest.json` + `current/image.bmp`, archives the
-frame under `history/<id>/`, and (when configured) invalidates the
-matching CloudFront paths.
+Two distinct write paths:
+
+- ``archive_to_history`` writes a rendered frame to ``history/<id>/``
+  WITHOUT touching ``current/``. The cron-driven render path calls
+  this and then enqueues a marker into the generated queue
+  (``core.generated_queue``); the device only sees the frame after a
+  ``/wake`` advance pops the marker.
+
+- ``set_current_from_history`` and ``publish`` write ``current/manifest.json``
+  (the device's read target). ``set_current_from_history`` re-points
+  the manifest at an existing archive without copying bytes — used by
+  ``/wake`` and the admin **Show this now** button. ``publish`` is the
+  legacy combined "archive + set current in one shot" entrypoint, kept
+  for admin-driven "render now"/"render item" overrides (where the
+  operator wants the image on the panel immediately rather than via the
+  generated queue).
 """
 
 from __future__ import annotations
@@ -103,6 +116,81 @@ def _invalidate_cloudfront(paths: list[str]) -> None:
     )
 
 
+def archive_to_history(
+    processed_bmp: bytes,
+    *,
+    source: dict[str, Any],
+    item_id: str,
+    original: bytes | None = None,
+    prompt: str | None = None,
+    now: datetime | None = None,
+) -> Manifest:
+    """Write a rendered frame under ``history/<item_id>/``.
+
+    Does NOT touch ``current/`` — that's left for ``/wake`` to update via
+    ``set_current_from_history`` once the device is ready to draw this
+    frame. The cron render path lands here.
+
+    Returns the manifest written under ``history/<item_id>/manifest.json``
+    so callers can stash the metadata (sha, bytes, source) on a marker
+    in the generated queue without re-hashing the bmp.
+
+    The history manifest's ``image_url`` already points at the
+    ``history/<id>/processed.bmp`` archive — that's the URL
+    ``set_current_from_history`` re-uses when promoting to current.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    image_sha256 = compute_sha256(processed_bmp)
+    image_bytes = len(processed_bmp)
+
+    source_with_prompt = dict(source)
+    if prompt is not None:
+        source_with_prompt["prompt"] = prompt
+
+    # next_check_after on a history manifest is mostly advisory — the
+    # device never reads it directly; ``set_current_from_history``
+    # recomputes a fresh one when promoting to current. We still write
+    # one for completeness so the history manifest validates against the
+    # same dataclass.
+    next_check = compute_next_check_after(now, tick_interval=_poll_interval())
+
+    manifest = Manifest(
+        # version is per-frame here, not the global current-manifest version
+        # (which is only meaningful for ``current/manifest.json``). We carry
+        # 1 so the dataclass is happy.
+        version=1,
+        generated_at=iso_utc(now),
+        image_url=f"{_cdn_base()}/history/{item_id}/processed.bmp",
+        image_sha256=image_sha256,
+        image_bytes=image_bytes,
+        display=dict(DEFAULT_DISPLAY),
+        next_check_after=iso_utc(next_check),
+        source=source_with_prompt,
+    )
+
+    manifest_bytes = manifest.to_json().encode("utf-8")
+    history_prefix = f"history/{item_id}"
+    s3.put_object(
+        f"{history_prefix}/manifest.json",
+        manifest_bytes,
+        content_type="application/json",
+    )
+    s3.put_object(
+        f"{history_prefix}/processed.bmp",
+        processed_bmp,
+        content_type="image/bmp",
+    )
+    if original is not None:
+        s3.put_object(
+            f"{history_prefix}/original.png",
+            original,
+            content_type="image/png",
+        )
+    return manifest
+
+
 def publish(
     processed_bmp: bytes,
     *,
@@ -112,7 +200,13 @@ def publish(
     prompt: str | None = None,
     now: datetime | None = None,
 ) -> Manifest:
-    """Publish a processed frame.
+    """Archive a frame AND set it as the current frame in one shot.
+
+    Legacy entrypoint kept for the admin "render now" / "render item"
+    overrides — both call this so the operator sees the new image on
+    the panel without going through the generated queue. Cron-driven
+    renders use ``archive_to_history`` + the generated-queue marker
+    flow instead.
 
     Steps (see ARCHITECTURE §7, §8):
       1. Hash the BMP.
@@ -120,9 +214,6 @@ def publish(
       3. Build and write `current/manifest.json` with an incremented version.
       4. Archive to `history/<item_id>/` (manifest, processed BMP, original).
       5. Invalidate CloudFront if `EINKGEN_CF_DISTRIBUTION_ID` is set.
-
-    `prompt` is accepted for callers that want to override `source["prompt"]`;
-    if passed, it is merged into the source dict written to the manifest.
     """
     if now is None:
         now = datetime.now(timezone.utc)

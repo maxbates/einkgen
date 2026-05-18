@@ -176,7 +176,12 @@ export class EinkgenLambdas extends Construct {
       handler: 'einkgen.lambdas.generator.handler',
       code: bundlePython('requirements-generator.txt', sourceStaged),
       memorySize: 1024,
-      timeout: Duration.minutes(5),
+      // 15 min = Lambda max. Steady-state cron does 0-1 renders per
+      // tick (~1 min wall-clock) — the headroom is for the cold-start
+      // case where the generated buffer is empty and cron fills it to
+      // TARGET_GENERATED_QUEUE_LENGTH (~10 renders × 55 s ≈ 9 min) in
+      // a single invocation.
+      timeout: Duration.minutes(15),
       // ARCHITECTURE §4: reserved concurrency = 1 keeps queue drains FIFO-serial.
       reservedConcurrentExecutions: 1,
       logRetention: logs.RetentionDays.TWO_WEEKS,
@@ -200,6 +205,11 @@ export class EinkgenLambdas extends Construct {
           `${props.bucket.bucketArn}/current/*`,
           `${props.bucket.bucketArn}/history/*`,
           `${props.bucket.bucketArn}/queue/*`,
+          // Generated-queue markers: archive_to_history + buffer_item
+          // writes one per render; the legacy publish path may also drop
+          // a stale marker if Show-this-now is exercised against an item
+          // that was buffered.
+          `${props.bucket.bucketArn}/generated/*`,
         ],
       }),
     );
@@ -332,26 +342,86 @@ export class EinkgenLambdas extends Construct {
       handler: 'einkgen.lambdas.device_status.handler',
       code: bundlePython('requirements-device-status.txt', sourceStaged),
       memorySize: 256,
-      timeout: Duration.seconds(10),
+      // /wake's advance path does GetObject + PutObject + DeleteObject +
+      // CloudFront invalidation + lambda:Invoke serially, so the old
+      // 10 s window for a status POST is too tight. Still well under
+      // anything API Gateway would surface as a timeout.
+      timeout: Duration.seconds(20),
       // ARCHITECTURE §12: cap blast radius for token-spam attacks.
       reservedConcurrentExecutions: 5,
       logRetention: logs.RetentionDays.TWO_WEEKS,
       environment: {
         EINKGEN_BUCKET: props.bucket.bucketName,
+        EINKGEN_CDN_BASE: props.cdnBase,
+        EINKGEN_CF_DISTRIBUTION_ID: props.distribution.distributionId,
         DEVICE_STATUS_SECRET_NAME: props.deviceStatusToken.secretName,
+        // /wake's advance path async-invokes the generator to refill the
+        // buffer after popping the head marker. Without this env var the
+        // wake call still advances correctly; it just skips the
+        // backfill and waits for the next cron tick.
+        EINKGEN_GENERATOR_FUNCTION_NAME: this.generator.functionName,
       },
     });
+    // Status heartbeat write target (existing).
     this.deviceStatus.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['s3:PutObject'],
         resources: [`${props.bucket.bucketArn}/status/*`],
       }),
     );
+    // /wake's advance flow needs to read current/manifest.json (to debounce
+    // by sha) and rewrite it (to promote the new head). The history GetObject
+    // lets set_current_from_history read the archived manifest before
+    // re-pointing current at it.
+    this.deviceStatus.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:PutObject'],
+        resources: [`${props.bucket.bucketArn}/current/*`],
+      }),
+    );
+    this.deviceStatus.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject'],
+        resources: [`${props.bucket.bucketArn}/history/*`],
+      }),
+    );
+    // Generated queue: list, read head, delete on pop.
+    this.deviceStatus.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:DeleteObject'],
+        resources: [`${props.bucket.bucketArn}/generated/*`],
+      }),
+    );
+    this.deviceStatus.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:ListBucket'],
+        resources: [props.bucket.bucketArn],
+        conditions: {
+          StringLike: {
+            's3:prefix': ['generated/*'],
+          },
+        },
+      }),
+    );
+    // CloudFront invalidation on current/manifest.json after an advance,
+    // matching the publish path.
+    this.deviceStatus.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['cloudfront:CreateInvalidation'],
+        resources: [
+          `arn:aws:cloudfront::${props.bucket.stack.account}:distribution/${props.distribution.distributionId}`,
+        ],
+      }),
+    );
+    // Async-invoke the generator to fire render_one after each pop.
+    this.generator.grantInvoke(this.deviceStatus);
     props.deviceStatusToken.grantRead(this.deviceStatus);
 
     // API Gateway HTTP API in front of device-status. No CORS — only firmware
-    // POSTs here. The route is `POST /` because the firmware uses the base
-    // URL (no path suffix) and the handler doesn't dispatch by path.
+    // POSTs here. Two routes:
+    //   * POST /     — the periodic status heartbeat (existing).
+    //   * POST /wake — the wake-driven display advance (new in 0.6.0).
+    // The handler dispatches on rawPath internally.
     const deviceStatusHttp = new HttpApi(this, 'DeviceStatusHttp', {
       apiName: 'einkgen-device-status',
     });
@@ -360,6 +430,14 @@ export class EinkgenLambdas extends Construct {
       methods: [HttpMethod.POST],
       integration: new HttpLambdaIntegration(
         'DeviceStatusIntegration',
+        this.deviceStatus,
+      ),
+    });
+    deviceStatusHttp.addRoutes({
+      path: '/wake',
+      methods: [HttpMethod.POST],
+      integration: new HttpLambdaIntegration(
+        'DeviceWakeIntegration',
         this.deviceStatus,
       ),
     });
@@ -412,15 +490,25 @@ export class EinkgenLambdas extends Construct {
         resources: [`${props.bucket.bucketArn}/queue/*`],
       }),
     );
-    // ListBucket on queue/* so admin can enumerate keys when looking up
-    // an item by id (for move-to-top and the per-id /run, DELETE paths).
+    // DELETE /admin/generated/<id> (skip) and the implicit cancel from
+    // POST /admin/show both delete markers from generated/. Read is
+    // needed by the cancel() helper's list-and-suffix-match.
+    this.adminApi.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:DeleteObject'],
+        resources: [`${props.bucket.bucketArn}/generated/*`],
+      }),
+    );
+    // ListBucket on queue/* + generated/* so admin can enumerate keys
+    // when looking up an item by id (for the per-id /run, DELETE paths
+    // on queue and the skip path on generated).
     this.adminApi.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['s3:ListBucket'],
         resources: [props.bucket.bucketArn],
         conditions: {
           StringLike: {
-            's3:prefix': ['queue/*'],
+            's3:prefix': ['queue/*', 'generated/*'],
           },
         },
       }),

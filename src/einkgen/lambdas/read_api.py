@@ -11,9 +11,11 @@ payload format v2.0:
 
 Routes (all GET):
 
-- ``/queue``   → pending FIFO items from ``queue/`` (``queue/staged/`` excluded).
-- ``/history`` → recent ``history/<id>/manifest.json`` summaries, newest first.
-- ``/status``  → newest ``status/device-<id>.json`` merged with the device id
+- ``/queue``     → pending FIFO items from ``queue/`` (``queue/staged/`` excluded).
+- ``/generated`` → pre-rendered frames waiting to be displayed (markers
+  under ``generated/``). The buffer the ``/wake`` endpoint pops from.
+- ``/history``   → recent ``history/<id>/manifest.json`` summaries, newest first.
+- ``/status``    → newest ``status/device-<id>.json`` merged with the device id
   and S3 ``LastModified`` timestamp; 404 when no reports exist yet.
 
 Response shape is ``{"statusCode": int, "headers": {...}, "body": json}``
@@ -40,11 +42,17 @@ HISTORY_PREFIX = "history/"
 STATUS_PREFIX = "status/"
 QUEUE_PREFIX = "queue/"
 STAGED_PREFIX = "queue/staged/"
+GENERATED_PREFIX = "generated/"
 
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 500
 DEFAULT_QUEUE_LIMIT = 200
 MAX_QUEUE_LIMIT = 1000
+# Generated queue is target=10 in normal operation, but expose a higher
+# cap so an SPA configured with a longer buffer in future doesn't get
+# silently truncated.
+DEFAULT_GENERATED_LIMIT = 50
+MAX_GENERATED_LIMIT = 200
 
 _BASE_HEADERS = {
     "Content-Type": "application/json",
@@ -122,6 +130,33 @@ def _handle_queue(event: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             # ERROR token so the CloudWatch metric filter catches the miss.
             log.error("ERROR unreadable queue item: %s", key)
+            continue
+    return _response(200, {"items": items})
+
+
+def _handle_generated(event: dict[str, Any]) -> dict[str, Any]:
+    """List the generated-queue markers in FIFO order (head first).
+
+    Bounded by ``limit`` so a wedged buffer can't make the dashboard
+    timeout. Each marker is already small (history_id + sha + source
+    metadata) so we read every body in the range.
+    """
+    limit = _parse_limit(
+        event,
+        default=DEFAULT_GENERATED_LIMIT,
+        maximum=MAX_GENERATED_LIMIT,
+    )
+    keys = sorted(
+        obj["Key"]
+        for obj in s3.list_objects(GENERATED_PREFIX)
+        if obj["Key"].endswith(".json")
+    )
+    items: list[dict[str, Any]] = []
+    for key in keys[:limit]:
+        try:
+            items.append(json.loads(s3.get_object(key)))
+        except Exception:
+            log.error("ERROR unreadable generated marker: %s", key)
             continue
     return _response(200, {"items": items})
 
@@ -210,6 +245,8 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
 
         if path == "/queue":
             return _handle_queue(event)
+        if path == "/generated":
+            return _handle_generated(event)
         if path == "/history":
             return _handle_history(event)
         if path == "/status":

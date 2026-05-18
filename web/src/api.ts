@@ -25,6 +25,23 @@ export interface HistorySource {
   prompt?: string;
 }
 
+// One entry in the pre-rendered buffer. Each marker points at an
+// already-archived ``history/<history_id>/`` frame; the device hasn't
+// drawn it yet (it'll pop on the next /wake advance). The marker
+// embeds enough metadata for the SPA to render a tile without an
+// extra fetch per item.
+export interface GeneratedItem {
+  history_id: string;
+  queued_at: string;
+  image_sha256: string;
+  image_bytes: number;
+  source: HistorySource;
+}
+
+export interface GeneratedResponse {
+  items: GeneratedItem[];
+}
+
 export interface HistoryItem {
   id: string;
   generated_at: string;
@@ -83,6 +100,12 @@ async function fetchJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 export async function getQueue(signal?: AbortSignal): Promise<QueueResponse> {
   return fetchJson<QueueResponse>("/queue", signal);
+}
+
+export async function getGenerated(
+  signal?: AbortSignal,
+): Promise<GeneratedResponse> {
+  return fetchJson<GeneratedResponse>("/generated", signal);
 }
 
 export async function getHistory(
@@ -380,5 +403,21 @@ export async function adminDeleteQueueItem(itemId: string): Promise<void> {
   if (!res.ok) {
     const detail = await res.text();
     throw new Error(`Remove failed: ${res.status} ${detail}`);
+  }
+}
+
+// Skip a buffered generated-queue item. The history archive stays;
+// the marker is dropped so the device never displays the frame on
+// auto-advance (admin can still pin it later via Show this now).
+export async function adminSkipGenerated(historyId: string): Promise<void> {
+  const res = await adminFetch(
+    `/admin/generated/${encodeURIComponent(historyId)}`,
+    { method: "DELETE" },
+  );
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (res.status === 404) throw new Error("That item is no longer in the buffer.");
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Skip failed: ${res.status} ${detail}`);
   }
 }

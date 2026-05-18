@@ -299,3 +299,58 @@ def test_unexpected_error_returns_500(s3_bucket, monkeypatch):
     assert _body(resp) == {"error": "internal"}
     # Defensive headers still set on errors.
     assert resp["headers"]["Content-Type"] == "application/json"
+
+
+# ---------------------------------------------------------------------------
+# /generated — pre-rendered buffer
+# ---------------------------------------------------------------------------
+
+
+def test_generated_empty(s3_bucket):
+    resp = read_api.handler(_event("GET", "/generated"))
+    assert resp["statusCode"] == 200
+    assert _body(resp) == {"items": []}
+
+
+def test_generated_returns_items_in_fifo_order(s3_bucket):
+    from einkgen.core import generated_queue
+
+    a = generated_queue.enqueue(
+        "01HAAA00000000000000000000",
+        image_sha256="a" * 64,
+        image_bytes=1,
+        source={"kind": "generated", "prompt": "first"},
+    )
+    b = generated_queue.enqueue(
+        "01HBBB00000000000000000000",
+        image_sha256="b" * 64,
+        image_bytes=1,
+        source={"kind": "generated", "prompt": "second"},
+    )
+
+    resp = read_api.handler(_event("GET", "/generated"))
+    assert resp["statusCode"] == 200
+    body = _body(resp)
+    ids = [it["history_id"] for it in body["items"]]
+    assert ids == [a.history_id, b.history_id]
+    # Serialised form doesn't leak the internal s3 key.
+    for item in body["items"]:
+        assert "_s3_key" not in item
+    assert body["items"][0]["source"]["prompt"] == "first"
+
+
+def test_generated_limit_truncates(s3_bucket):
+    from einkgen.core import generated_queue
+
+    for i in range(5):
+        generated_queue.enqueue(
+            f"01H{i:023d}",
+            image_sha256="a" * 64,
+            image_bytes=1,
+            source={"kind": "generated"},
+        )
+
+    resp = read_api.handler(_event("GET", "/generated", query={"limit": "3"}))
+    assert resp["statusCode"] == 200
+    items = _body(resp)["items"]
+    assert len(items) == 3

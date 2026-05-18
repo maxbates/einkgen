@@ -2,20 +2,30 @@
 
 Routes (all under the ``/admin`` prefix, behind a single HTTP API):
 
-- ``POST /admin/login``         → ``{"password": "..."}``  → 204 + ``Set-Cookie``
-- ``GET  /admin/me``            → 200 ``{"authenticated": true}`` or 401
-- ``POST /admin/logout``        → 204 + cookie-clear ``Set-Cookie``
-- ``POST /admin/queue/prompt``  → ``{"prompt":..., "at":"top|bottom|now"}``
-                                                            → 200 ``{"id":...}``
-- ``POST /admin/queue/image``   → ``{"filename":..., "image_b64":..., "prompt":?, "at":?}``
-                                                            → 200 ``{"id":...}``
-- ``POST /admin/queue/<id>/run``→ 202 (async-invoke generator to render this specific item, regardless of position)
-- ``DELETE /admin/queue/<id>``  → 204 (cancel a pending item)
-- ``GET  /admin/prompts``       → 200 ``{"prompts": [...], "is_default": bool}``
-- ``PUT  /admin/prompts``       → ``{"prompts": [...]}``    → 200 ``{"prompts": [...]}``
-- ``POST /admin/prompts/reset`` → 200 ``{"prompts": [...]}`` (writes DEFAULTS)
-- ``POST /admin/show``          → ``{"history_id": "..."}`` → 200 ``{"version":...}``
-- ``GET  /admin/failures``      → 200 ``{"items": [...]}`` (last-hour drops)
+- ``POST /admin/login``             → ``{"password": "..."}``  → 204 + ``Set-Cookie``
+- ``GET  /admin/me``                → 200 ``{"authenticated": true}`` or 401
+- ``POST /admin/logout``            → 204 + cookie-clear ``Set-Cookie``
+- ``POST /admin/queue/prompt``      → ``{"prompt":..., "at":"top|bottom|now"}``
+                                                                → 200 ``{"id":...}``
+- ``POST /admin/queue/image``       → ``{"filename":..., "image_b64":..., "prompt":?, "at":?}``
+                                                                → 200 ``{"id":...}``
+- ``POST /admin/queue/<id>/run``    → 202 (async-invoke generator to render this specific item, regardless of position)
+- ``DELETE /admin/queue/<id>``      → 204 (cancel a pending item)
+- ``DELETE /admin/generated/<history_id>``
+                                    → 204 (skip — drop a generated-queue
+                                      marker so the device never displays
+                                      it; the ``history/<id>/`` archive
+                                      stays intact).
+- ``GET  /admin/prompts``           → 200 ``{"prompts": [...], "is_default": bool}``
+- ``PUT  /admin/prompts``           → ``{"prompts": [...]}``    → 200 ``{"prompts": [...]}``
+- ``POST /admin/prompts/reset``     → 200 ``{"prompts": [...]}`` (writes DEFAULTS)
+- ``POST /admin/show``              → ``{"history_id": "..."}`` → 200 ``{"version":...}``
+                                      Also drops the matching generated-
+                                      queue marker if one exists, so
+                                      "Show this now" on a buffered item
+                                      both displays it AND removes it
+                                      from the pending list.
+- ``GET  /admin/failures``          → 200 ``{"items": [...]}`` (last-hour drops)
 
 The ``at`` field on enqueue routes controls which of the two priority
 queues the item lands in: ``"bottom"`` (default) appends to the bottom
@@ -71,7 +81,14 @@ from typing import Any
 
 import boto3
 
-from einkgen.core import admin_cookie, failures, prompt_library, publish, queue
+from einkgen.core import (
+    admin_cookie,
+    failures,
+    generated_queue,
+    prompt_library,
+    publish,
+    queue,
+)
 from einkgen.core import s3 as s3mod
 
 log = logging.getLogger(__name__)
@@ -520,6 +537,11 @@ def _handle_show(event: dict[str, Any]) -> dict[str, Any]:
 
     No copy, no regenerate — just point the manifest at the history bmp.
     See ``einkgen.core.publish.set_current_from_history``.
+
+    Also best-effort cancels the matching generated-queue marker so an
+    item that was pending display gets removed from the buffer when it
+    becomes the current frame. Same idea as ``/wake``'s ``finalize``,
+    just kicked off by the operator instead of the device.
     """
     if _require_session(event) is None:
         return _response(401, {"error": "unauthorized"})
@@ -536,6 +558,12 @@ def _handle_show(event: dict[str, Any]) -> dict[str, Any]:
         manifest = publish.set_current_from_history(history_id)
     except publish.HistoryItemNotFound:
         return _response(404, {"error": "not_found", "detail": "no such history item"})
+    # Drop the marker if there was one — Show-this-now on a buffered
+    # item shouldn't leave a duplicate sitting in the generated queue.
+    try:
+        generated_queue.cancel(history_id)
+    except Exception:  # pragma: no cover - best-effort
+        log.exception("ERROR failed to cancel generated marker for %s", history_id)
     return _response(
         200,
         {
@@ -544,6 +572,22 @@ def _handle_show(event: dict[str, Any]) -> dict[str, Any]:
             "history_id": history_id,
         },
     )
+
+
+def _handle_generated_delete(event: dict[str, Any], history_id: str) -> dict[str, Any]:
+    """Skip a pending generated-queue marker.
+
+    The history archive stays — the item just won't be displayed unless
+    the operator explicitly Shows it later. This is the "I don't want
+    to see this on the panel" affordance.
+    """
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    if not generated_queue.cancel(history_id):
+        return _response(
+            404, {"error": "not_found", "detail": "no such generated item"}
+        )
+    return _response(204)
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +704,11 @@ _PER_ITEM_ROUTE_RE = re.compile(
     r"^/admin/queue/(?P<id>[^/]+)(?:/(?P<verb>run))?$"
 )
 
+# ``DELETE /admin/generated/<history_id>`` — skip a buffered render
+# without ever displaying it. Same id-validation pattern as the queue
+# routes so a malformed path can't escape into an S3 key.
+_GENERATED_ITEM_ROUTE_RE = re.compile(r"^/admin/generated/(?P<id>[^/]+)$")
+
 
 def _dispatch_per_item(method: str, path: str, event: dict[str, Any]) -> dict[str, Any] | None:
     m = _PER_ITEM_ROUTE_RE.match(path)
@@ -678,6 +727,22 @@ def _dispatch_per_item(method: str, path: str, event: dict[str, Any]) -> dict[st
     return None
 
 
+def _dispatch_generated_item(
+    method: str, path: str, event: dict[str, Any]
+) -> dict[str, Any] | None:
+    m = _GENERATED_ITEM_ROUTE_RE.match(path)
+    if m is None:
+        return None
+    history_id = m.group("id")
+    if not HISTORY_ID_RE.match(history_id):
+        return _response(
+            400, {"error": "bad_request", "detail": "malformed history id"}
+        )
+    if method == "DELETE":
+        return _handle_generated_delete(event, history_id)
+    return None
+
+
 def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     try:
         method = _method(event)
@@ -690,6 +755,9 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         per_item = _dispatch_per_item(method, path, event)
         if per_item is not None:
             return per_item
+        generated_item = _dispatch_generated_item(method, path, event)
+        if generated_item is not None:
+            return generated_item
         return _response(404, {"error": "not_found"})
     except Exception:
         log.exception("ERROR admin_api unhandled error")
