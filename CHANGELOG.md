@@ -5,6 +5,38 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.4.1.4] - 2026-05-17
+
+### Added
+- **"Recently rejected" feedback in the Admin tab.** When the generator
+  drops a queue item via `PermanentItemError` (e.g. OpenAI's safety
+  system returned `moderation_blocked`), it now writes a small
+  breadcrumb to `s3://<bucket>/queue/failed/<recorded_at>-<id>.json`
+  with the prompt, source, and reason. The SPA's Admin tab fetches
+  these via a new `GET /admin/failures` endpoint and shows them as a
+  compact "Recently rejected" panel — hidden entirely when empty, so
+  the happy path stays clean. Self-clearing: anything older than 1
+  hour is filtered out on read and best-effort deleted on the next
+  write, so the prefix never grows. The breadcrumb write is
+  best-effort — a failed notification can't block the queue drain. The
+  Queue tab and CLI listings are unaffected because `queue.list()`
+  excludes the `queue/failed/` prefix the same way it already excludes
+  `queue/staged/`.
+
+## [0.4.1.3] - 2026-05-17
+
+### Fixed
+- **Queue no longer pins on a prompt OpenAI rejects.** If a prompt
+  tripped OpenAI's safety system (HTTP 400 `moderation_blocked`), the
+  generator Lambda raised `BadRequestError`, Lambda's async-invoke retry
+  treated it as transient, and the item stayed at the head of the queue
+  forever — every subsequent S3 event redelivered the same blocked
+  prompt and no further items drained. The pipeline now translates
+  `openai.BadRequestError` into a new `PermanentItemError`; the
+  generator handler catches that signal, logs the failure, finalizes
+  the item, and continues draining. Retryable errors (network, 5xx,
+  rate limits) still propagate so Lambda retries them as before.
+
 ## [0.4.1.2] - 2026-05-16
 
 ### Changed

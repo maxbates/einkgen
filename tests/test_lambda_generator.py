@@ -106,3 +106,83 @@ def test_s3_event_with_empty_queue_is_noop(monkeypatch, s3_bucket):
     # already drained it). The handler just returns.
     generator.handler(_s3_event(), None)
     assert process_calls == []
+
+
+def test_permanent_error_drops_item_and_continues(monkeypatch, s3_bucket):
+    """A PermanentItemError on the head must finalize it and let the drain advance.
+
+    Regression: a prompt rejected by OpenAI's safety system (moderation_blocked)
+    used to pin the head of the queue forever because Lambda's async-invoke
+    retry treats every exception as transient. Now the generator catches
+    PermanentItemError, drops the item, and keeps draining.
+    """
+    from einkgen.core.pipeline import PermanentItemError
+
+    processed: list[QueueItem] = []
+
+    def fake_process(item: QueueItem) -> None:
+        if item.prompt == "blocked":
+            raise PermanentItemError("safety system: moderation_blocked")
+        processed.append(item)
+
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.pipeline.process_item", fake_process
+    )
+
+    blocked = q.enqueue("prompt", prompt="blocked")
+    good = q.enqueue("prompt", prompt="ok")
+
+    generator.handler(_s3_event(blocked._s3_key), None)
+
+    # Blocked item is dropped (not in processed), good item drained.
+    assert [it.prompt for it in processed] == ["ok"]
+    assert q.empty()
+
+
+def test_permanent_error_on_cron_drops_head(monkeypatch, s3_bucket):
+    """Cron path mirrors the S3-event path: drop on PermanentItemError."""
+    from einkgen.core.pipeline import PermanentItemError
+
+    def fake_process(item: QueueItem) -> None:
+        raise PermanentItemError("safety system: moderation_blocked")
+
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.pipeline.process_item", fake_process
+    )
+
+    head = q.enqueue("prompt", prompt="blocked head")
+    tail = q.enqueue("prompt", prompt="next attempt")
+
+    generator.handler(CRON_EVENT, None)
+
+    # Blocked head dropped; tail remains for the next tick / S3 event.
+    remaining = q.list()
+    assert [it.id for it in remaining] == [tail.id]
+    assert head.id not in {it.id for it in remaining}
+
+
+def test_permanent_error_writes_failure_breadcrumb(monkeypatch, s3_bucket):
+    """Dropped items leave a record the Admin tab can show."""
+    from einkgen.core import failures
+    from einkgen.core.pipeline import PermanentItemError
+
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.pipeline.process_item",
+        lambda item: (_ for _ in ()).throw(
+            PermanentItemError("safety system: moderation_blocked")
+        ),
+    )
+
+    blocked = q.enqueue("prompt", prompt="please reject me", source="admin")
+
+    generator.handler(_s3_event(blocked._s3_key), None)
+
+    breadcrumbs = failures.list_recent()
+    assert len(breadcrumbs) == 1
+    rec = breadcrumbs[0]
+    assert rec.id == blocked.id
+    assert rec.prompt == "please reject me"
+    assert rec.source == "admin"
+    assert "moderation_blocked" in rec.reason
+    # Queue is drained.
+    assert q.empty()

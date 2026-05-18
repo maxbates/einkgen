@@ -23,6 +23,10 @@ from einkgen.core import s3
 
 QUEUE_PREFIX = "queue/"
 STAGED_PREFIX = "queue/staged/"
+# Operator-visible breadcrumbs for permanently-failed items live under this
+# prefix. Excluded from queue listing so the public Queue tab never shows
+# dropped items. See ``einkgen.core.failures``.
+FAILED_PREFIX = "queue/failed/"
 
 
 @dataclass
@@ -100,11 +104,19 @@ def enqueue(
 
 
 def _iter_pending_keys() -> list[str]:
-    """Return lex-sorted queue object keys, excluding ``queue/staged/``."""
+    """Return lex-sorted queue object keys.
+
+    Excludes ``queue/staged/`` (raw uploads waiting for a queue item) and
+    ``queue/failed/`` (operator-visible drop breadcrumbs) — both share the
+    ``queue/`` prefix for IAM/lifecycle simplicity but are not pending
+    work.
+    """
     keys: list[str] = []
     for obj in s3.list_objects(QUEUE_PREFIX):
         key = obj["Key"]
         if key.startswith(STAGED_PREFIX):
+            continue
+        if key.startswith(FAILED_PREFIX):
             continue
         if not key.endswith(".json"):
             continue

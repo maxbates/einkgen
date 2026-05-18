@@ -17,6 +17,39 @@ from einkgen.core.queue import QueueItem
 log = logging.getLogger(__name__)
 
 
+class PermanentItemError(Exception):
+    """An item can never succeed and must be dropped from the queue.
+
+    Raised when the upstream model rejects the request in a way retrying
+    cannot recover from — most commonly OpenAI's safety system returning
+    ``moderation_blocked`` (HTTP 400). Lambda's async-invoke retry treats
+    every exception as transient, so without this signal a single blocked
+    prompt pins the head of the queue forever. The generator handler
+    finalizes the item when it sees this.
+    """
+
+
+def _call_openai(fn, *args, **kwargs):
+    """Invoke an OpenAI call, translating non-retryable 400s.
+
+    ``openai.BadRequestError`` covers user-input errors the API will reject
+    on every retry (moderation, invalid prompt, unsupported size). We
+    catch it lazily so this module stays importable when ``openai`` isn't
+    installed (e.g. tests that stub the generate module out via
+    ``sys.modules``).
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        try:
+            from openai import BadRequestError
+        except ImportError:
+            raise exc
+        if isinstance(exc, BadRequestError):
+            raise PermanentItemError(str(exc)) from exc
+        raise
+
+
 def process_item(item: QueueItem) -> None:
     """Generate (or fetch) -> convert -> publish.
 
@@ -30,7 +63,7 @@ def process_item(item: QueueItem) -> None:
     original_png: bytes
     if item.kind == "prompt":
         # BASE_PROMPT is prepended inside generate.generate.
-        original_png = generate.generate(item.prompt)
+        original_png = _call_openai(generate.generate, item.prompt)
     elif item.kind == "image":
         if not item.image_s3_key:
             raise ValueError(f"image item {item.id} has no image_s3_key")
@@ -42,15 +75,18 @@ def process_item(item: QueueItem) -> None:
             import os as _os
 
             filename = _os.path.basename(item.image_s3_key) or "input.png"
-            original_png = generate.generate_from_image(
-                item.prompt, uploaded, image_filename=filename
+            original_png = _call_openai(
+                generate.generate_from_image,
+                item.prompt,
+                uploaded,
+                image_filename=filename,
             )
         else:
             original_png = uploaded
     elif item.kind == "random":
         prompt = generate.random_prompt()
         item.prompt = prompt  # so publish/manifest can record the chosen subject
-        original_png = generate.generate(prompt)
+        original_png = _call_openai(generate.generate, prompt)
     else:
         raise ValueError(f"unknown kind: {item.kind!r}")
 

@@ -283,6 +283,31 @@ export async function adminShowHistory(
   return (await res.json()) as AdminShowResponse;
 }
 
+export interface AdminFailureItem {
+  id: string;
+  enqueued_at: string;
+  recorded_at: string;
+  source: string;
+  kind: string;
+  reason: string;
+  prompt: string | null;
+}
+
+export interface AdminFailuresResponse {
+  items: AdminFailureItem[];
+}
+
+export async function adminGetFailures(
+  signal?: AbortSignal,
+): Promise<AdminFailuresResponse> {
+  const res = await adminFetch("/admin/failures", { method: "GET", signal });
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (!res.ok) {
+    throw new Error(`GET /admin/failures failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as AdminFailuresResponse;
+}
+
 export async function adminEnqueueImage(
   file: File,
   prompt: string | null,

@@ -28,7 +28,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from einkgen.core import pipeline, queue
+from einkgen.core import failures, pipeline, queue
+from einkgen.core.pipeline import PermanentItemError
+from einkgen.core.queue import QueueItem
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +49,32 @@ def _is_cron_event(event: dict[str, Any]) -> bool:
     return False
 
 
+def _process_or_drop(item: QueueItem) -> None:
+    """Run the pipeline; drop the item if it will never succeed.
+
+    A ``PermanentItemError`` (e.g. OpenAI moderation_blocked on a prompt
+    the safety system will never accept) means retrying is hopeless —
+    finalize so the head can advance. Any other exception propagates and
+    Lambda's async-invoke retry redelivers the event.
+    """
+    try:
+        pipeline.process_item(item)
+    except PermanentItemError as exc:
+        log.error(
+            "dropping queue item %s (%s) — permanent failure: %s",
+            item.id,
+            item.kind,
+            exc,
+        )
+        # Best-effort operator-visible breadcrumb. If the write fails the
+        # queue still advances — the failure_record is a notification, not
+        # a queue primitive.
+        failures.record(item, str(exc))
+        queue.finalize(item)
+        return
+    queue.finalize(item)
+
+
 def handler(event: dict[str, Any], context: Any = None) -> None:
     if _is_cron_event(event):
         if queue.empty():
@@ -59,8 +87,7 @@ def handler(event: dict[str, Any], context: Any = None) -> None:
         item = queue.peek_head()
         if item is None:
             return
-        pipeline.process_item(item)
-        queue.finalize(item)
+        _process_or_drop(item)
         return
 
     # Any non-cron invocation: drain until empty (or until the safety cap).
@@ -72,10 +99,7 @@ def handler(event: dict[str, Any], context: Any = None) -> None:
         item = queue.peek_head()
         if item is None:
             return
-        pipeline.process_item(item)
-        # Only finalize after process_item succeeds; if it raised, Lambda
-        # retries the whole invocation and we'll try this same item again.
-        queue.finalize(item)
+        _process_or_drop(item)
         drained += 1
 
     if not queue.empty():

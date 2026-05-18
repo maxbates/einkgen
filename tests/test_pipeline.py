@@ -233,3 +233,83 @@ def test_image_kind_requires_key(monkeypatch):
     )
     with pytest.raises(ValueError):
         pipeline.process_item(item)
+
+
+def test_openai_bad_request_becomes_permanent_item_error(monkeypatch):
+    """OpenAI 400s (e.g. moderation_blocked) must surface as PermanentItemError.
+
+    Without this translation, Lambda's async-invoke retry would redeliver
+    the S3 event forever and pin the head of the queue. The generator
+    handler is responsible for finalizing on PermanentItemError; the
+    translation contract lives here.
+    """
+    from openai import BadRequestError
+
+    _install_fake_modules(monkeypatch)
+
+    # BadRequestError's __init__ expects a real httpx response — easier to
+    # construct one via Exception.__new__ and seed the message attribute the
+    # str() representation reads.
+    moderation_error = BadRequestError.__new__(BadRequestError)
+    Exception.__init__(
+        moderation_error, "rejected by safety system: moderation_blocked"
+    )
+
+    def raises_moderation(prompt):
+        raise moderation_error
+
+    monkeypatch.setitem(
+        sys.modules,
+        "einkgen.core.generate",
+        types.SimpleNamespace(
+            generate=raises_moderation,
+            generate_from_image=lambda *a, **k: b"",
+            random_prompt=lambda: "unused",
+            BASE_PROMPT="",
+            PROMPT_LIBRARY=[],
+            MODEL="gpt-image-2",
+        ),
+    )
+
+    item = QueueItem(
+        id="01HFTEST0007",
+        enqueued_at="2026-05-13T14:00:00Z",
+        source="admin",
+        kind="prompt",
+        prompt="something the safety system will reject",
+    )
+
+    with pytest.raises(pipeline.PermanentItemError):
+        pipeline.process_item(item)
+
+
+def test_non_bad_request_errors_propagate(monkeypatch):
+    """Generic exceptions stay raw so Lambda retries them as transient."""
+    _install_fake_modules(monkeypatch)
+
+    def raises_runtime(prompt):
+        raise RuntimeError("network blip")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "einkgen.core.generate",
+        types.SimpleNamespace(
+            generate=raises_runtime,
+            generate_from_image=lambda *a, **k: b"",
+            random_prompt=lambda: "unused",
+            BASE_PROMPT="",
+            PROMPT_LIBRARY=[],
+            MODEL="gpt-image-2",
+        ),
+    )
+
+    item = QueueItem(
+        id="01HFTEST0008",
+        enqueued_at="2026-05-13T14:00:00Z",
+        source="admin",
+        kind="prompt",
+        prompt="transient failure case",
+    )
+
+    with pytest.raises(RuntimeError):
+        pipeline.process_item(item)
