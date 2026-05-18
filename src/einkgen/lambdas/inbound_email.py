@@ -30,6 +30,16 @@ config/email_allowlist.txt, write queue/* and queue/staged/*, ses:SendEmail).
 It never reads the allowlist contents into a response — rejection emails are
 generic.
 
+NOW trigger
+-----------
+A subject prefixed with ``NOW ``, ``NOW:``, or ``[NOW]`` (case-insensitive)
+signals "render this now". The trigger is stripped from the prompt
+before enqueueing; the item lands at the **top** of the queue and the
+generator is async-invoked with ``render_now`` so it bypasses the 10-deep
+pre-rendered buffer. Same affordance as the SPA Admin tab's **Now**
+button — the email path was added in 0.6.1.0 so phone submissions don't
+disappear behind a ~5h buffer wait.
+
 Environment
 -----------
 - ``EINKGEN_BUCKET``     — bucket name (set by CDK).
@@ -39,11 +49,16 @@ Environment
   but enqueue still proceeds.
 - ``EINKGEN_PROJECT_URL`` — included in rejection replies as the "run your
   own" pointer. Optional.
+- ``EINKGEN_GENERATOR_FUNCTION_NAME`` — name of the generator Lambda.
+  Required for the NOW trigger to actually fire a render; without it the
+  message still enqueues at the top, the immediate render is skipped,
+  and the next cron tick picks it up.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from typing import Any
@@ -59,6 +74,7 @@ log = logging.getLogger(__name__)
 DEFAULT_INBOUND_PREFIX = "inbound/"
 
 _ses_client = None
+_lambda_client = None
 
 
 def _get_ses_client():
@@ -68,10 +84,43 @@ def _get_ses_client():
     return _ses_client
 
 
+def _get_lambda_client():
+    global _lambda_client
+    if _lambda_client is None:
+        _lambda_client = boto3.client("lambda")
+    return _lambda_client
+
+
 def _reset_clients() -> None:
-    """Drop cached SES client. Used by tests."""
-    global _ses_client
+    """Drop cached SES + lambda clients. Used by tests."""
+    global _ses_client, _lambda_client
     _ses_client = None
+    _lambda_client = None
+
+
+def _trigger_render_now() -> bool:
+    """Fire-and-forget invoke of the generator to render the head item.
+
+    Same pattern as ``admin_api._trigger_render_now``. Failure is logged
+    and swallowed — the item is on the queue at the top either way, so
+    the worst case is "wait for the next cron tick".
+    """
+    fn_name = os.environ.get("EINKGEN_GENERATOR_FUNCTION_NAME")
+    if not fn_name:
+        log.error(
+            "ERROR EINKGEN_GENERATOR_FUNCTION_NAME unset; cannot honour NOW trigger"
+        )
+        return False
+    try:
+        _get_lambda_client().invoke(
+            FunctionName=fn_name,
+            InvocationType="Event",
+            Payload=json.dumps({"action": "render_now"}).encode("utf-8"),
+        )
+        return True
+    except Exception:
+        log.exception("ERROR failed to invoke generator from inbound_email")
+        return False
 
 
 def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
@@ -124,14 +173,17 @@ def _process_one(key: str) -> None:
 
     item = _enqueue(parsed, sender=sender)
     log.info(
-        "inbound_email: enqueued %s (kind=%s, sender=%s)",
-        item.id, item.kind, sender,
+        "inbound_email: enqueued %s (kind=%s, sender=%s, urgent=%s)",
+        item.id, item.kind, sender, parsed.urgent,
     )
-    _send_confirmation(sender, item.id, item.kind, item.prompt)
+    if parsed.urgent:
+        _trigger_render_now()
+    _send_confirmation(sender, item.id, item.kind, item.prompt, urgent=parsed.urgent)
     _safe_delete(key)
 
 
 def _enqueue(parsed: email_parse.ParsedEmail, *, sender: str):
+    at = "top" if parsed.urgent else "bottom"
     if parsed.image_bytes:
         staged_key = _stage_image(parsed.image_bytes, parsed.image_filename or "image")
         prompt = parsed.prompt or None
@@ -140,9 +192,10 @@ def _enqueue(parsed: email_parse.ParsedEmail, *, sender: str):
             image_s3_key=staged_key,
             prompt=prompt,
             source="email",
+            at=at,
         )
     if parsed.prompt:
-        return queue.enqueue("prompt", prompt=parsed.prompt, source="email")
+        return queue.enqueue("prompt", prompt=parsed.prompt, source="email", at=at)
     # Neither prompt nor image — treat as a no-op. SES forwarded a content-less
     # message (e.g. an empty body with a stripped subject). Raise so the caller
     # logs + deletes; we don't enqueue a random in this branch because that'd
@@ -217,7 +270,7 @@ def _send_rejection(to: str | None) -> None:
 
 
 def _send_confirmation(
-    to: str, item_id: str, kind: str, prompt: str | None
+    to: str, item_id: str, kind: str, prompt: str | None, *, urgent: bool = False
 ) -> None:
     reply_from = _reply_from()
     if not reply_from:
@@ -226,6 +279,8 @@ def _send_confirmation(
         "prompt": "Queued your prompt for generation.",
         "image": "Queued your image for processing.",
     }.get(kind, f"Queued ({kind}).")
+    if urgent:
+        detail += " (NOW: rendering immediately into the buffer.)"
     sections = [detail]
     if prompt:
         # Echo the cleaned prompt back so the sender can verify what we
