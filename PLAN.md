@@ -39,7 +39,7 @@ einkgen/
 │   │   ├── pipeline.py             # one queue item → published frame
 │   │   └── s3.py                   # thin boto3 wrapper used everywhere
 │   └── lambdas/
-│       ├── generator.py            # S3 event + cron handlers; calls pipeline
+│       ├── generator.py            # cron + render_now handlers; calls pipeline
 │       ├── read_api.py             # GET /queue, /history, /status
 │       └── device_status.py        # POST / (X-Device-Token)
 ├── web/                            # Vite + React SPA, vanilla CSS, no UI lib
@@ -83,10 +83,17 @@ future work.
    `min(next_check_after, 1h)`.
 7. **Queue.** `core/queue.py` over S3-prefix: `enqueue` / `pop_head` /
    `list` / `cancel`. CLI: `einkgen queue prompt|image|ls|rm`.
-8. **Generator Lambda.** Single Lambda with two triggers — S3
-   ObjectCreated on `queue/` and EventBridge `rate(2 hours)`. Reserved
-   concurrency = 1. On cron with empty queue, enqueues a `random`; the
-   resulting S3 event drains it.
+8. **Generator Lambda.** Single Lambda with two triggers — EventBridge
+   `rate(30 minutes)` (cron) and `lambda.invoke` from the admin Lambda
+   (`{"action": "render_now"}`, used by **Now** / **Run**). Reserved
+   concurrency = 1. Each cron tick (a) tops the queue up to
+   `TARGET_QUEUE_LENGTH=5` items by expanding random library topics
+   through `generate.expand_topic` (text LLM, default `gpt-5-mini`)
+   and enqueueing the expansions, then (b) renders the head.
+
+   _Before [0.5.0.0] this Lambda also drained on S3 ObjectCreated for
+   `queue/*.json`; the trigger was removed when the queue was
+   redesigned into a curated buffer. See CHANGELOG [0.5.0.0]._
 9. **Read-api Lambda.** Public endpoint serving `GET /queue`, `/history`,
    `/status`. No auth.
 10. **Web app.** Vite + React SPA, three read-only tabs. Hosted from
@@ -99,6 +106,17 @@ future work.
 14. **(Future) Text/dashboard render mode** — replace the model call with
     a structured renderer (weather/calendar/etc.); same publish path.
 15. **(Future) OTA firmware updates** via `firmware/`.
+16. **(Future) Wake-button → render-on-demand.** Repurpose the Inkplate
+    wake button: on press, hit a small endpoint that (a) reports the
+    SHA-256 the panel currently shows, (b) the server compares against
+    `current/manifest.json`, and (c) if equal, async-invokes the
+    generator (`{"action":"render_now"}`) to pop the next queue head;
+    the firmware then re-polls the manifest a minute later. The queue
+    redesign in [0.5.0.0] already supports this end-to-end — the only
+    missing piece is the firmware button handler + a `POST /wake` route
+    that asks "is what's drawn still current?" and conditionally fires
+    `render_now`. Drives the queue forward at human-trigger pace
+    without changing the cron cadence.
 
 ---
 
@@ -107,14 +125,15 @@ future work.
 | Decision | Choice |
 | --- | --- |
 | Image model (v1) | OpenAI `gpt-image-1` at `1536×1024` |
-| Auto-gen cron interval | every 2 hours |
+| Auto-gen cron interval | every 30 minutes (was 2 h before [0.5.1.0]; flipping it is a one-line cdk + cdk.json change — see CHANGELOG [0.5.1.0] for cost/battery tradeoffs) |
 | Device poll interval | 1 hour (configurable via `einkgenPollIntervalSeconds` CDK context; firmware `SLEEP_MAX_SECONDS` must match — QUICKSTART §3.12) |
 | Prompt strategy | 10-entry random library (ARCHITECTURE §6) + a base prompt that specifies the panel and dither constraints |
 | Aspect / resize policy | center-crop only (1536×1024 → 1200×825), no resampling for generated images |
 | Bucket access | `current/*` and `web/*` public via CloudFront; `history/*` public for `processed.bmp` only (viewer-request function); rest accessed only via Lambdas |
 | Device cadence | sleeps `min(next_check_after, SLEEP_MAX_SECONDS)`; manifest hint = next device-poll tick + 5 min buffer |
-| Queue policy | strict FIFO, no coalescing |
-| Queue trigger | S3 ObjectCreated → generator Lambda (concurrency = 1) |
+| Queue policy | two-priority buffer; key prefix `queue/0-…` (top) drains before `queue/1-…` (bottom); FIFO within each; no in-place mutation of objects. Reordering of existing items isn't supported — pick `at="top"` or `at="bottom"` at enqueue time. |
+| Queue triggers | EventBridge `rate(30 minutes)` (cron, tops up + renders head) and `lambda.invoke` from admin-api with `{"action":"render_now"}` (Now button on a new submission) or `{"action":"render_item","item_id":...}` (per-row Run button). No S3 ObjectCreated drain since [0.5.0.0]. Reserved concurrency = 1 keeps them serial. |
+| Cron top-up | Each tick refills the queue to ≥ 5 pending items by expanding random library topics via `generate.expand_topic` (text LLM, default `gpt-5-mini`). |
 | Web app | read-only, React + Vite, three tabs (Queue / History / Device) |
 | User input | CLI only in v1; text/email deferred behind a future channel-specific Lambda |
 | Lambdas | 3 total: generator (writes), read-api (public reads), device-status (write status only) |

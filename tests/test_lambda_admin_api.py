@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from unittest.mock import MagicMock
 
 import boto3
 import pytest
@@ -17,6 +18,21 @@ TEST_PASSWORD = "photos-for-anyone"
 TEST_COOKIE_KEY = "very-secret-hmac-key"
 PASSWORD_SECRET_NAME = "einkgen-test/admin_password"
 COOKIE_SECRET_NAME = "einkgen-test/admin_cookie_signing_key"
+TEST_GENERATOR_FN = "einkgen-generator-test"
+
+
+@pytest.fixture
+def stub_lambda(monkeypatch):
+    """Patch the admin-api's Lambda client so 'now'/'run' don't fly out to AWS.
+
+    Returns the mock client so tests can introspect ``.invoke.call_args_list``.
+    Also wires ``EINKGEN_GENERATOR_FUNCTION_NAME`` so ``_trigger_render_now``
+    finds a function name to target.
+    """
+    monkeypatch.setenv("EINKGEN_GENERATOR_FUNCTION_NAME", TEST_GENERATOR_FN)
+    client = MagicMock()
+    monkeypatch.setattr(admin_api, "_get_lambda_client", lambda: client)
+    return client
 
 
 @pytest.fixture
@@ -231,6 +247,7 @@ def test_enqueue_prompt_happy_path(secrets, s3_bucket):
     assert resp["statusCode"] == 200
     body = json.loads(resp["body"])
     assert body["kind"] == "prompt"
+    assert body["at"] == "bottom"  # default placement
     # The item is actually in S3, and the source is tagged "admin".
     items = queue.list()
     assert len(items) == 1
@@ -239,6 +256,62 @@ def test_enqueue_prompt_happy_path(secrets, s3_bucket):
     assert only.prompt == "Bold geometric shapes."
     assert only.source == "admin"
     assert only.kind == "prompt"
+
+
+def test_enqueue_prompt_at_top_jumps_queue(secrets, s3_bucket):
+    seed = queue.enqueue("prompt", prompt="already here")
+
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/queue/prompt",
+            body={"prompt": "urgent", "at": "top"},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["at"] == "top"
+
+    ids = [it.id for it in queue.list()]
+    assert ids == [body["id"], seed.id]
+
+
+def test_enqueue_prompt_at_now_triggers_async_invoke(secrets, s3_bucket, stub_lambda):
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/queue/prompt",
+            body={"prompt": "render this immediately", "at": "now"},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["at"] == "now"
+
+    # Item landed at the head of the queue.
+    items = queue.list()
+    assert items[0].id == body["id"]
+    # And we fired exactly one async invoke at the generator.
+    stub_lambda.invoke.assert_called_once()
+    kwargs = stub_lambda.invoke.call_args.kwargs
+    assert kwargs["FunctionName"] == TEST_GENERATOR_FN
+    assert kwargs["InvocationType"] == "Event"
+    assert json.loads(kwargs["Payload"]) == {"action": "render_now"}
+
+
+def test_enqueue_prompt_rejects_unknown_at(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/queue/prompt",
+            body={"prompt": "x", "at": "middle"},
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 400
+    assert queue.list() == []
 
 
 def test_enqueue_prompt_blank_returns_400(secrets, s3_bucket):
@@ -290,6 +363,7 @@ def test_enqueue_image_happy_path(secrets, s3_bucket):
     assert resp["statusCode"] == 200
     body = json.loads(resp["body"])
     assert body["kind"] == "image"
+    assert body["at"] == "bottom"
     items = queue.list()
     assert len(items) == 1
     only = items[0]
@@ -325,6 +399,46 @@ def test_enqueue_image_filename_is_sanitized(secrets, s3_bucket):
     # The dangerous path component is stripped; the staged key never contains '..'
     assert ".." not in items[0].image_s3_key
     assert " " not in items[0].image_s3_key
+
+
+def test_enqueue_image_at_top(secrets, s3_bucket):
+    queue.enqueue("prompt", prompt="already here")
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/queue/image",
+            body={
+                "filename": "x.png",
+                "image_b64": base64.b64encode(b"img").decode(),
+                "at": "top",
+            },
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["at"] == "top"
+    assert queue.list()[0].id == body["id"]
+
+
+def test_enqueue_image_at_now_triggers_async_invoke(secrets, s3_bucket, stub_lambda):
+    resp = admin_api.handler(
+        _event(
+            "POST",
+            "/admin/queue/image",
+            body={
+                "filename": "x.png",
+                "image_b64": base64.b64encode(b"img").decode(),
+                "at": "now",
+            },
+            cookies=_auth_cookies(),
+        )
+    )
+    assert resp["statusCode"] == 200
+    stub_lambda.invoke.assert_called_once()
+    assert (
+        stub_lambda.invoke.call_args.kwargs["FunctionName"] == TEST_GENERATOR_FN
+    )
 
 
 def test_enqueue_image_bad_base64_returns_400(secrets, s3_bucket):
@@ -581,6 +695,103 @@ def test_show_missing_field_returns_400(secrets, s3_bucket):
         )
     )
     assert resp["statusCode"] == 400
+
+
+# ---------------------------------------------------------------------------
+# /admin/queue/<id>/run + DELETE /admin/queue/<id>
+# ---------------------------------------------------------------------------
+
+
+def test_top_route_does_not_exist(secrets, s3_bucket):
+    """The per-row Top button + /top route were dropped in the 2-priority redesign."""
+    item = queue.enqueue("prompt", prompt="x")
+    resp = admin_api.handler(
+        _event("POST", f"/admin/queue/{item.id}/top", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 404
+
+
+def test_run_invokes_generator_with_render_item_payload(secrets, s3_bucket, stub_lambda):
+    """``/run`` doesn't reorder the queue — it fires render_item async.
+
+    The on-disk queue is untouched until the generator actually renders.
+    """
+    a = queue.enqueue("prompt", prompt="first")
+    b = queue.enqueue("prompt", prompt="second")
+    a_key_before = a._s3_key
+    b_key_before = b._s3_key
+
+    resp = admin_api.handler(
+        _event("POST", f"/admin/queue/{b.id}/run", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 202
+    body = json.loads(resp["body"])
+    assert body["id"] == b.id
+    assert body["render_triggered"] is True
+
+    # No reordering happened — the same two items live at the same keys.
+    items_by_id = {it.id: it for it in queue.list()}
+    assert items_by_id[a.id]._s3_key == a_key_before
+    assert items_by_id[b.id]._s3_key == b_key_before
+
+    # And the async invoke targeted the right item with render_item.
+    stub_lambda.invoke.assert_called_once()
+    kwargs = stub_lambda.invoke.call_args.kwargs
+    assert kwargs["FunctionName"] == TEST_GENERATOR_FN
+    assert kwargs["InvocationType"] == "Event"
+    payload = json.loads(kwargs["Payload"])
+    assert payload == {"action": "render_item", "item_id": b.id}
+
+
+def test_run_requires_session(secrets, s3_bucket, stub_lambda):
+    item = queue.enqueue("prompt", prompt="x")
+    resp = admin_api.handler(_event("POST", f"/admin/queue/{item.id}/run"))
+    assert resp["statusCode"] == 401
+    stub_lambda.invoke.assert_not_called()
+
+
+def test_run_unknown_id_returns_404_without_invoking(secrets, s3_bucket, stub_lambda):
+    resp = admin_api.handler(
+        _event("POST", "/admin/queue/01HNONEXIST00/run", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 404
+    stub_lambda.invoke.assert_not_called()
+
+
+def test_run_malformed_id_returns_400(secrets, s3_bucket, stub_lambda):
+    # Path-escape attempt: the regex extracts up to the next slash, then
+    # QUEUE_ID_RE rejects the lowercase + special chars.
+    resp = admin_api.handler(
+        _event("POST", "/admin/queue/..%2Fetc%2Fpasswd/run", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] in (400, 404)
+    stub_lambda.invoke.assert_not_called()
+
+
+def test_delete_queue_item(secrets, s3_bucket):
+    a = queue.enqueue("prompt", prompt="first")
+    b = queue.enqueue("prompt", prompt="second")
+
+    resp = admin_api.handler(
+        _event("DELETE", f"/admin/queue/{a.id}", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 204
+    assert [it.id for it in queue.list()] == [b.id]
+
+
+def test_delete_queue_item_requires_session(secrets, s3_bucket):
+    item = queue.enqueue("prompt", prompt="x")
+    resp = admin_api.handler(_event("DELETE", f"/admin/queue/{item.id}"))
+    assert resp["statusCode"] == 401
+    # Item still on the queue.
+    assert queue.list()[0].id == item.id
+
+
+def test_delete_queue_item_missing_returns_404(secrets, s3_bucket):
+    resp = admin_api.handler(
+        _event("DELETE", "/admin/queue/01HNONEXIST00", cookies=_auth_cookies())
+    )
+    assert resp["statusCode"] == 404
 
 
 # ---------------------------------------------------------------------------

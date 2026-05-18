@@ -107,6 +107,30 @@ def test_image_uploads_staged_and_enqueues(s3_bucket, tmp_path, capsys):
     assert staged["Body"].read() == src.read_bytes()
 
 
+def test_prompt_top_flag_jumps_queue(s3_bucket, capsys):
+    main(["queue", "prompt", "seed"])
+    capsys.readouterr()
+    main(["queue", "prompt", "urgent", "--top"])
+    capsys.readouterr()
+
+    ids_in_order = [it.id for it in queue_core.list()]
+    # The --top item is now the head.
+    assert queue_core.list()[0].prompt == "urgent"
+    assert queue_core.list()[1].prompt == "seed"
+
+
+def test_image_top_flag_jumps_queue(s3_bucket, tmp_path, capsys):
+    src = tmp_path / "x.jpg"
+    src.write_bytes(b"\xff\xd8\xff" + b"fake")
+    main(["queue", "prompt", "seed"])
+    capsys.readouterr()
+    main(["queue", "image", str(src), "--top"])
+    capsys.readouterr()
+
+    assert queue_core.list()[0].kind == "image"
+    assert queue_core.list()[1].prompt == "seed"
+
+
 def test_image_with_prompt_records_restyle_hint(s3_bucket, tmp_path, capsys):
     src = tmp_path / "skyline.jpg"
     src.write_bytes(b"\xff\xd8\xff" + b"fake-jpeg-bytes" * 8)

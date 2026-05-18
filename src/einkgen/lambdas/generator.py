@@ -1,26 +1,48 @@
-"""``einkgen-generator`` Lambda — drains the queue and handles the 2h cron.
+"""``einkgen-generator`` Lambda — cron-driven render + queue top-up.
 
-Two triggers:
+Triggers
+--------
+- **EventBridge cron** (rate driven by ``einkgenPollIntervalSeconds``
+  in ``infra/cdk.json`` — default 30 min) — every tick:
 
-- **EventBridge ``rate(2 hours)``** (cron) — if the queue is empty, enqueue
-  a ``random`` item (the resulting S3 ObjectCreated event re-invokes this
-  Lambda and the same code path drains it). If the queue is non-empty,
-  process **exactly one** item — the head — to self-heal items stranded by
-  a prior failed S3 delivery (e.g. an init-time crash that exhausted
-  Lambda's async-retry budget). One item per tick keeps OpenAI cost bounded
-  to the cron cadence even if the queue has a backlog; the normal S3-event
-  path drains in real time and is what handles steady-state.
-- **S3 ObjectCreated** on ``queue/`` — drain pending items.
+    1. ``top_up_queue()`` — if the queue holds fewer than
+       ``TARGET_QUEUE_LENGTH`` pending items, pick that many topics from
+       the operator-editable prompt library, run each through
+       ``generate.expand_topic()`` (text LLM) to turn the topic into a
+       concrete image prompt, and enqueue the expansions at the bottom.
+       This keeps the queue continuously full so the operator always has
+       something to reorder / inspect / drop without the panel going
+       stale.
 
-Reserved concurrency = 1 keeps drains serial. We drain to empty per
-invocation because S3 ObjectCreated events can batch multiple records,
-and a single delivery that only processes the first record would leak
-the rest until the next cron tick.
+    2. ``_render_head()`` — pop the lowest-position item, generate the
+       image, publish.
 
-The drain follows a *peek → process → finalize* pattern so a mid-pipeline
-failure leaves the item on the queue; Lambda's async-invoke retry then
-redelivers and we try again. Items that ultimately fail end up in the
-configured DLQ (if any) after Lambda exhausts retries.
+- **Direct invocation**, two variants — both fired by the admin API via
+  ``lambda:Invoke`` with ``InvocationType=Event`` so the HTTP request
+  returns immediately:
+
+    - ``{"action": "render_now"}`` — render the current head exactly
+      once. Used by the **Now** button on a new submission (the new
+      item lands at the top of the queue first, then this is fired).
+
+    - ``{"action": "render_item", "item_id": "..."}`` — render the
+      *specific* item with that id, regardless of its current queue
+      position. Used by the per-row **Run** button so the operator can
+      execute any pending item without first having to promote it to
+      the head. The item is finalized (deleted from the queue) on
+      success; if it has already been drained when the invocation
+      lands, the handler logs and returns.
+
+There is **no S3 ObjectCreated drain** anymore. Items sit on the queue
+until either the cron tick renders them or an operator triggers
+``render_now``. That's the entire point of the redesign: the queue is a
+buffer the operator can curate, not a fire-and-forget pipe. New
+submissions from CLI / email don't auto-render — they'll go out on the
+next cron tick, or the operator can hit **Run** in the SPA.
+
+Reserved concurrency = 1 keeps everything serial, including overlapping
+cron + admin invocations: a "Now" request fired while the cron is mid-
+render queues behind it and runs as soon as the cron returns.
 """
 
 from __future__ import annotations
@@ -28,17 +50,24 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from einkgen.core import failures, pipeline, queue
+from einkgen.core import failures, generate, pipeline, prompt_library, queue
 from einkgen.core.pipeline import PermanentItemError
 from einkgen.core.queue import QueueItem
 
 log = logging.getLogger(__name__)
 
-# Safety cap so a pathological queue can't pin the Lambda forever.
-# Reserved concurrency = 1 means subsequent S3 events queue inside Lambda;
-# capping per-invocation drain bounds wall-clock time. Set this higher than
-# any realistic burst.
-MAX_ITEMS_PER_INVOCATION = 16
+# Steady-state target queue depth. The cron tops up to this floor each
+# tick, so an operator opening the dashboard always sees a handful of
+# pending items to reorder or run. Topping up beyond this is fine — the
+# operator can manually enqueue more — and the cron just won't add more
+# until depth drops back below the floor.
+TARGET_QUEUE_LENGTH = 5
+
+# Hard ceiling on text-expansions per cron tick. Prevents a pathological
+# (negative count, repeated failures) state from running away. In normal
+# operation the cron tops up exactly 1 item per tick (steady state) and
+# at most TARGET_QUEUE_LENGTH on first deploy.
+MAX_TOP_UP_PER_TICK = TARGET_QUEUE_LENGTH
 
 
 def _is_cron_event(event: dict[str, Any]) -> bool:
@@ -76,35 +105,112 @@ def _process_or_drop(item: QueueItem) -> None:
 
 
 def handler(event: dict[str, Any], context: Any = None) -> None:
-    if _is_cron_event(event):
-        if queue.empty():
-            queue.enqueue("random", source="cron")
-            # The resulting S3 event drains the new item.
+    action = event.get("action")
+    if action == "render_now":
+        _render_head()
+        return
+    if action == "render_item":
+        item_id = event.get("item_id")
+        if not isinstance(item_id, str) or not item_id:
+            log.warning("generator: render_item event missing item_id: %s", event)
             return
-        # Non-empty queue: process exactly one head item. This is the
-        # backstop for items stranded by a failed S3 delivery; under normal
-        # operation the S3 event has already drained them.
-        item = queue.peek_head()
-        if item is None:
-            return
-        _process_or_drop(item)
+        _render_item_by_id(item_id)
         return
 
-    # Any non-cron invocation: drain until empty (or until the safety cap).
-    # We don't switch on ``event["Records"]`` — the queue itself is the
-    # source of truth, and a single event may correspond to multiple
-    # records anyway.
-    drained = 0
-    while drained < MAX_ITEMS_PER_INVOCATION:
-        item = queue.peek_head()
-        if item is None:
-            return
-        _process_or_drop(item)
-        drained += 1
+    if _is_cron_event(event):
+        _top_up_queue()
+        _render_head()
+        return
 
-    if not queue.empty():
+    # Anything else — including stray legacy S3 ObjectCreated events
+    # delivered after the trigger was removed but before all in-flight
+    # notifications drained — is logged and ignored. We deliberately do
+    # NOT fall back to draining the queue on unknown events: this Lambda
+    # only renders when explicitly asked to (cron tick, render_now,
+    # render_item).
+    log.info("generator: ignoring unrecognised event shape: %s", event)
+
+
+def _top_up_queue() -> None:
+    """Ensure the queue holds at least ``TARGET_QUEUE_LENGTH`` items.
+
+    Each missing slot is filled by picking a topic from the prompt
+    library and asking the text LLM to expand it into a concrete image
+    prompt. Failures fall back to enqueueing the raw topic so the queue
+    still fills — better a less-detailed prompt than a stalled queue.
+    """
+    current = queue.count()
+    if current >= TARGET_QUEUE_LENGTH:
+        return
+
+    needed = min(TARGET_QUEUE_LENGTH - current, MAX_TOP_UP_PER_TICK)
+    log.info(
+        "generator: topping up queue from %d to %d (+%d)",
+        current, current + needed, needed,
+    )
+    for _ in range(needed):
+        topic = prompt_library.random_prompt()
+        try:
+            expanded = generate.expand_topic(topic)
+        except Exception:
+            log.exception(
+                "ERROR generator: expand_topic failed, enqueueing raw topic: %r",
+                topic,
+            )
+            expanded = topic
+        try:
+            queue.enqueue("prompt", prompt=expanded, source="cron")
+        except Exception:
+            # An enqueue failure (S3 throttle, IAM blip) shouldn't halt
+            # the render step below. Log and move on.
+            log.exception("ERROR generator: enqueue during top-up failed")
+
+
+def _render_head() -> None:
+    """Render the current head item, if any.
+
+    The pipeline already handles all three kinds (prompt / image /
+    random) — ``random`` is preserved for items enqueued before the
+    cron redesign; new items use ``prompt`` with an expanded subject.
+    """
+    head = queue.peek_head()
+    if head is None:
+        log.info("generator: queue empty, nothing to render")
+        return
+    log.info(
+        "generator: rendering head id=%s kind=%s source=%s",
+        head.id, head.kind, head.source,
+    )
+    # _process_or_drop handles the PermanentItemError → record + finalize
+    # path so a moderation-blocked prompt at the head can't pin the queue.
+    # Retryable failures still propagate and Lambda redelivers.
+    _process_or_drop(head)
+
+
+def _render_item_by_id(item_id: str) -> None:
+    """Render a specific pending item, regardless of its queue position.
+
+    Used by the admin **Run** button (`POST /admin/queue/<id>/run` →
+    `lambda.invoke` with ``{"action": "render_item", "item_id": ...}``)
+    so an operator can execute any pending item without having to first
+    promote it to the head. The item is deleted on success.
+
+    If the id doesn't match any pending item — e.g. the cron drained
+    it between the click and the invocation — log and return without
+    raising. The HTTP request already returned 202 by the time we get
+    here, so the only thing this would accomplish is a Lambda retry
+    that can never succeed.
+    """
+    item = queue.get(item_id)
+    if item is None:
         log.info(
-            "hit per-invocation drain cap (%d); remaining items will be picked up "
-            "by the next S3 event or cron tick",
-            MAX_ITEMS_PER_INVOCATION,
+            "generator: render_item id=%s already drained or never existed, skipping",
+            item_id,
         )
+        return
+    log.info(
+        "generator: render_item id=%s kind=%s source=%s",
+        item.id, item.kind, item.source,
+    )
+    # Same permanent-vs-retryable distinction as the cron head render.
+    _process_or_drop(item)

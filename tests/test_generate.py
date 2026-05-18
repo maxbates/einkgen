@@ -11,9 +11,12 @@ from einkgen.core import generate as generate_mod
 from einkgen.core import prompt_library as prompt_library_mod
 from einkgen.core.generate import (
     BASE_PROMPT,
+    EXPAND_TOPIC_SYSTEM_PROMPT,
     IMAGE_SIZE,
     PROMPT_LIBRARY,
+    TEXT_MODEL,
     _resolve_api_key,
+    expand_topic,
     generate,
     generate_from_image,
     random_prompt,
@@ -112,6 +115,51 @@ def test_generate_from_image_calls_edit_endpoint_with_prepended_base_prompt():
     assert image_arg.name == "photo.jpg"
     image_arg.seek(0)
     assert image_arg.read() == b"original-image-bytes"
+
+
+def _fake_text_client(content: str) -> MagicMock:
+    """Mimic ``client.chat.completions.create(...).choices[0].message.content``."""
+    client = MagicMock()
+    response = MagicMock()
+    choice = MagicMock()
+    choice.message.content = content
+    response.choices = [choice]
+    client.chat.completions.create.return_value = response
+    return client
+
+
+def test_expand_topic_calls_text_model_and_returns_stripped_content():
+    client = _fake_text_client("  A single rusty bicycle leans on a "
+                               "whitewashed wall.\n")
+    out = expand_topic("urban still life", client=client)
+
+    assert out == "A single rusty bicycle leans on a whitewashed wall."
+
+    client.chat.completions.create.assert_called_once()
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == TEXT_MODEL
+    messages = kwargs["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == EXPAND_TOPIC_SYSTEM_PROMPT
+    assert messages[1]["role"] == "user"
+    # The user message is the trimmed topic, not the full prompt.
+    assert messages[1]["content"] == "urban still life"
+
+
+def test_expand_topic_rejects_empty_topic():
+    with pytest.raises(ValueError):
+        expand_topic("   ")
+
+
+def test_expand_topic_raises_when_response_has_no_content():
+    client = MagicMock()
+    response = MagicMock()
+    choice = MagicMock()
+    choice.message.content = ""
+    response.choices = [choice]
+    client.chat.completions.create.return_value = response
+    with pytest.raises(RuntimeError, match="missing content"):
+        expand_topic("anything", client=client)
 
 
 def test_resolve_api_key_prefers_env_var(monkeypatch):

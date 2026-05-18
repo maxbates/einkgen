@@ -10,6 +10,11 @@ export interface QueueItem {
   image_s3_key?: string;
 }
 
+// Placement for admin enqueue calls. "top"/"bottom" pick which of the
+// two priority queues the new item joins; "now" enqueues at the top
+// AND fires the generator async so the new item renders immediately.
+export type EnqueueAt = "top" | "bottom" | "now";
+
 export interface QueueResponse {
   items: QueueItem[];
 }
@@ -204,12 +209,16 @@ export async function adminLogout(): Promise<void> {
 export interface AdminEnqueueResponse {
   id: string;
   kind: string;
+  at?: EnqueueAt;
 }
 
-export async function adminEnqueuePrompt(prompt: string): Promise<AdminEnqueueResponse> {
+export async function adminEnqueuePrompt(
+  prompt: string,
+  at: EnqueueAt = "bottom",
+): Promise<AdminEnqueueResponse> {
   const res = await adminFetch("/admin/queue/prompt", {
     method: "POST",
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, at }),
   });
   if (res.status === 401) throw new Error("Session expired. Please log in again.");
   if (!res.ok) {
@@ -311,6 +320,7 @@ export async function adminGetFailures(
 export async function adminEnqueueImage(
   file: File,
   prompt: string | null,
+  at: EnqueueAt = "bottom",
 ): Promise<AdminEnqueueResponse> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   // Build base64 in chunks so we don't blow the call-stack limit on phone-size
@@ -330,6 +340,7 @@ export async function adminEnqueueImage(
       filename: file.name || "image",
       image_b64,
       prompt: prompt ?? undefined,
+      at,
     }),
   });
   if (res.status === 401) throw new Error("Session expired. Please log in again.");
@@ -339,4 +350,35 @@ export async function adminEnqueueImage(
     throw new Error(`Upload failed: ${res.status} ${detail}`);
   }
   return (await res.json()) as AdminEnqueueResponse;
+}
+
+// ---------------------------------------------------------------------------
+// Per-item queue actions — used by the Queue tab when logged in as admin.
+// "Run" doesn't reorder the queue; it fires a render-this-specific-item
+// async invoke at the generator. There is no per-row "move to top" — the
+// queue is two-priority and items aren't reordered after enqueue.
+// ---------------------------------------------------------------------------
+
+export async function adminRunQueueItem(itemId: string): Promise<void> {
+  const res = await adminFetch(`/admin/queue/${encodeURIComponent(itemId)}/run`, {
+    method: "POST",
+  });
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (res.status === 404) throw new Error("That item is no longer on the queue.");
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Run failed: ${res.status} ${detail}`);
+  }
+}
+
+export async function adminDeleteQueueItem(itemId: string): Promise<void> {
+  const res = await adminFetch(`/admin/queue/${encodeURIComponent(itemId)}`, {
+    method: "DELETE",
+  });
+  if (res.status === 401) throw new Error("Session expired. Please log in again.");
+  if (res.status === 404) throw new Error("That item is no longer on the queue.");
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Remove failed: ${res.status} ${detail}`);
+  }
 }

@@ -5,14 +5,28 @@ Routes (all under the ``/admin`` prefix, behind a single HTTP API):
 - ``POST /admin/login``         → ``{"password": "..."}``  → 204 + ``Set-Cookie``
 - ``GET  /admin/me``            → 200 ``{"authenticated": true}`` or 401
 - ``POST /admin/logout``        → 204 + cookie-clear ``Set-Cookie``
-- ``POST /admin/queue/prompt``  → ``{"prompt": "..."}``    → 200 ``{"id":...}``
-- ``POST /admin/queue/image``   → ``{"filename":..., "image_b64":..., "prompt":?}``
+- ``POST /admin/queue/prompt``  → ``{"prompt":..., "at":"top|bottom|now"}``
                                                             → 200 ``{"id":...}``
+- ``POST /admin/queue/image``   → ``{"filename":..., "image_b64":..., "prompt":?, "at":?}``
+                                                            → 200 ``{"id":...}``
+- ``POST /admin/queue/<id>/run``→ 202 (async-invoke generator to render this specific item, regardless of position)
+- ``DELETE /admin/queue/<id>``  → 204 (cancel a pending item)
 - ``GET  /admin/prompts``       → 200 ``{"prompts": [...], "is_default": bool}``
 - ``PUT  /admin/prompts``       → ``{"prompts": [...]}``    → 200 ``{"prompts": [...]}``
 - ``POST /admin/prompts/reset`` → 200 ``{"prompts": [...]}`` (writes DEFAULTS)
 - ``POST /admin/show``          → ``{"history_id": "..."}`` → 200 ``{"version":...}``
 - ``GET  /admin/failures``      → 200 ``{"items": [...]}`` (last-hour drops)
+
+The ``at`` field on enqueue routes controls which of the two priority
+queues the item lands in: ``"bottom"`` (default) appends to the bottom
+queue; ``"top"`` appends to the top queue (which always drains before
+the bottom one); ``"now"`` writes to the top queue **and** async-invokes
+the generator so the new item is rendered immediately.
+
+``/run`` is the equivalent shortcut for an item that's already on the
+queue — it async-invokes the generator with ``render_item`` so that
+specific item renders next, without any reordering or in-place rewrite
+of S3 objects.
 
 Auth
 ----
@@ -39,6 +53,8 @@ Environment
 - ``EINKGEN_BUCKET``                — queue/staged uploads land here.
 - ``ADMIN_PASSWORD_SECRET_NAME``    — default ``einkgen/admin_password``.
 - ``ADMIN_COOKIE_KEY_SECRET_NAME``  — default ``einkgen/admin_cookie_signing_key``.
+- ``EINKGEN_GENERATOR_FUNCTION_NAME`` — name of the generator Lambda;
+  required for ``at="now"`` and ``/run``. Without it those routes 500.
 """
 
 from __future__ import annotations
@@ -84,6 +100,15 @@ SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 # ``history/<id>/manifest.json`` key the publish helper constructs.
 HISTORY_ID_RE = re.compile(r"^[A-Z0-9]{8,32}$")
 
+# Queue ids share the same ULID-shaped alphabet — they're issued by the
+# same generator. Use the same regex so /admin/queue/<id>/... can't be
+# tricked into walking S3 paths via slashes or dots in the id segment.
+QUEUE_ID_RE = HISTORY_ID_RE
+
+# Placement options accepted on enqueue routes.
+ALLOWED_AT = ("top", "bottom", "now")
+DEFAULT_AT = "bottom"
+
 _BASE_HEADERS = {
     "Content-Type": "application/json",
     # Cache-Control on every admin response so a CDN doesn't accidentally
@@ -96,6 +121,7 @@ _cached_password_at: float = 0.0
 _cached_cookie_key: str | None = None
 _cached_cookie_key_at: float = 0.0
 _sm_client = None
+_lambda_client = None
 
 
 def _get_sm_client():
@@ -105,15 +131,23 @@ def _get_sm_client():
     return _sm_client
 
 
+def _get_lambda_client():
+    global _lambda_client
+    if _lambda_client is None:
+        _lambda_client = boto3.client("lambda")
+    return _lambda_client
+
+
 def _reset_cache() -> None:
     """Drop cached secrets + client. Used by tests."""
     global _cached_password, _cached_password_at
-    global _cached_cookie_key, _cached_cookie_key_at, _sm_client
+    global _cached_cookie_key, _cached_cookie_key_at, _sm_client, _lambda_client
     _cached_password = None
     _cached_password_at = 0.0
     _cached_cookie_key = None
     _cached_cookie_key_at = 0.0
     _sm_client = None
+    _lambda_client = None
 
 
 def _read_secret_string(secret_name: str) -> str:
@@ -308,6 +342,61 @@ def _handle_logout() -> dict[str, Any]:
     return _response(204, cookies=[admin_cookie.build_clear_cookie()])
 
 
+def _parse_at(body: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """Validate the optional ``at`` field. Returns ``(at, error_response)``."""
+    raw = body.get("at", DEFAULT_AT)
+    if not isinstance(raw, str) or raw not in ALLOWED_AT:
+        return DEFAULT_AT, _response(
+            400,
+            {
+                "error": "bad_request",
+                "detail": f"at must be one of {ALLOWED_AT!r}",
+            },
+        )
+    return raw, None
+
+
+def _enqueue_placement(at: str) -> str:
+    """``at="now"`` enqueues at the top; the async render is fired separately."""
+    return "top" if at == "now" else at
+
+
+def _invoke_generator(payload: dict[str, Any]) -> bool:
+    """Fire-and-forget invoke of the generator Lambda.
+
+    Returns whether the invoke succeeded. Failures are logged and
+    swallowed by the caller — the item is on the queue regardless, so
+    the worst case is "wait for the next cron tick" rather than data
+    loss.
+    """
+    fn_name = os.environ.get("EINKGEN_GENERATOR_FUNCTION_NAME")
+    if not fn_name:
+        log.error(
+            "ERROR EINKGEN_GENERATOR_FUNCTION_NAME unset; cannot invoke generator"
+        )
+        return False
+    try:
+        _get_lambda_client().invoke(
+            FunctionName=fn_name,
+            InvocationType="Event",  # async — returns 202 immediately
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+        return True
+    except Exception:
+        log.exception("ERROR failed to invoke generator with payload=%r", payload)
+        return False
+
+
+def _trigger_render_now() -> bool:
+    """Async-invoke the generator to render the current head item."""
+    return _invoke_generator({"action": "render_now"})
+
+
+def _trigger_render_item(item_id: str) -> bool:
+    """Async-invoke the generator to render a specific pending item."""
+    return _invoke_generator({"action": "render_item", "item_id": item_id})
+
+
 def _handle_queue_prompt(event: dict[str, Any]) -> dict[str, Any]:
     if _require_session(event) is None:
         return _response(401, {"error": "unauthorized"})
@@ -322,8 +411,21 @@ def _handle_queue_prompt(event: dict[str, Any]) -> dict[str, Any]:
         return _response(
             413, {"error": "payload_too_large", "detail": "prompt too long"}
         )
-    item = queue.enqueue("prompt", prompt=prompt.strip(), source="admin")
-    return _response(200, {"id": item.id, "kind": item.kind})
+    at, at_err = _parse_at(body)
+    if at_err is not None:
+        return at_err
+    item = queue.enqueue(
+        "prompt",
+        prompt=prompt.strip(),
+        source="admin",
+        at=_enqueue_placement(at),
+    )
+    if at == "now":
+        _trigger_render_now()
+    return _response(
+        200,
+        {"id": item.id, "kind": item.kind, "at": at},
+    )
 
 
 def _safe_filename(name: str) -> str:
@@ -364,13 +466,53 @@ def _handle_queue_image(event: dict[str, Any]) -> dict[str, Any]:
                 413, {"error": "payload_too_large", "detail": "prompt too long"}
             )
         prompt = prompt_raw.strip()
+    at, at_err = _parse_at(body)
+    if at_err is not None:
+        return at_err
     sha8 = hashlib.sha256(data).hexdigest()[:8]
     staged_key = f"{queue.STAGED_PREFIX}{sha8}-{filename}"
     s3mod.put_object(staged_key, data)
     item = queue.enqueue(
-        "image", image_s3_key=staged_key, prompt=prompt, source="admin"
+        "image",
+        image_s3_key=staged_key,
+        prompt=prompt,
+        source="admin",
+        at=_enqueue_placement(at),
     )
-    return _response(200, {"id": item.id, "kind": item.kind})
+    if at == "now":
+        _trigger_render_now()
+    return _response(
+        200,
+        {"id": item.id, "kind": item.kind, "at": at},
+    )
+
+
+def _handle_queue_run(event: dict[str, Any], item_id: str) -> dict[str, Any]:
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    # Check existence before invoking — saves a Lambda spin-up and gives
+    # the operator a clean 404 on "this just got drained" instead of
+    # silently no-op-ing inside the generator.
+    item = queue.get(item_id)
+    if item is None:
+        return _response(404, {"error": "not_found", "detail": "no such queue item"})
+    fired = _trigger_render_item(item_id)
+    return _response(
+        202 if fired else 502,
+        {
+            "id": item.id,
+            "kind": item.kind,
+            "render_triggered": fired,
+        },
+    )
+
+
+def _handle_queue_delete(event: dict[str, Any], item_id: str) -> dict[str, Any]:
+    if _require_session(event) is None:
+        return _response(401, {"error": "unauthorized"})
+    if not queue.cancel(item_id):
+        return _response(404, {"error": "not_found", "detail": "no such queue item"})
+    return _response(204)
 
 
 def _handle_show(event: dict[str, Any]) -> dict[str, Any]:
@@ -510,6 +652,32 @@ _ROUTES: dict[tuple[str, str], Any] = {
 }
 
 
+# Per-item queue routes — ``/admin/queue/<id>/run`` plus
+# ``DELETE /admin/queue/<id>``. Matched separately from _ROUTES because
+# they need to extract <id> from the path and validate it before
+# touching S3.
+_PER_ITEM_ROUTE_RE = re.compile(
+    r"^/admin/queue/(?P<id>[^/]+)(?:/(?P<verb>run))?$"
+)
+
+
+def _dispatch_per_item(method: str, path: str, event: dict[str, Any]) -> dict[str, Any] | None:
+    m = _PER_ITEM_ROUTE_RE.match(path)
+    if m is None:
+        return None
+    item_id = m.group("id")
+    verb = m.group("verb")
+    # Reject ids that don't look ULID-shaped before any auth check so a
+    # malformed path never reaches S3-key construction.
+    if not QUEUE_ID_RE.match(item_id):
+        return _response(400, {"error": "bad_request", "detail": "malformed queue id"})
+    if verb == "run" and method == "POST":
+        return _handle_queue_run(event, item_id)
+    if verb is None and method == "DELETE":
+        return _handle_queue_delete(event, item_id)
+    return None
+
+
 def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     try:
         method = _method(event)
@@ -517,9 +685,12 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         if (method, path) == ("POST", "/admin/logout"):
             return _handle_logout()
         route = _ROUTES.get((method, path))
-        if route is None:
-            return _response(404, {"error": "not_found"})
-        return route(event)
+        if route is not None:
+            return route(event)
+        per_item = _dispatch_per_item(method, path, event)
+        if per_item is not None:
+            return per_item
+        return _response(404, {"error": "not_found"})
     except Exception:
         log.exception("ERROR admin_api unhandled error")
         return _response(500, {"error": "internal"})

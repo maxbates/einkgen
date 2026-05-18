@@ -1,16 +1,23 @@
-"""S3-backed prompt library for the cron's ``random`` picks.
+"""S3-backed topic library for the cron's queue top-up.
 
-The library lives at ``s3://<bucket>/config/prompt_library.txt`` as a plain
-text file:
+Each cron tick, the generator picks ``TARGET_QUEUE_LENGTH - count()``
+topics at random from this library, runs each through
+``generate.expand_topic`` (text LLM) to turn the topic into a concrete
+image prompt, and enqueues the expansions. The library itself is
+*topics*, not finished prompts — the expansion step is what adds
+specificity per pick. See ARCHITECTURE §4 / §6.
 
-    # one prompt per line; blank lines and #-prefixed lines are ignored
+The library lives at ``s3://<bucket>/config/prompt_library.txt`` as a
+plain text file:
+
+    # one topic per line; blank lines and #-prefixed lines are ignored
     Geometric composition — overlapping circles, squares, triangles.
     Botanical illustration — pen-and-ink style; a single plant or flower.
 
-It's a file (not Secrets Manager) so an operator can edit it from the SPA
-admin tab, the AWS console, the CLI, or ``aws s3 cp`` — there's nothing
-sensitive here. The Lambda keeps the loaded list in module scope to
-amortise the GetObject across warm invocations.
+It's a file (not Secrets Manager) so an operator can edit it from the
+SPA admin tab, the AWS console, the CLI, or ``aws s3 cp`` — there's
+nothing sensitive here. The Lambda keeps the loaded list in module
+scope to amortise the GetObject across warm invocations.
 
 If the S3 object is missing, ``load()`` falls back to ``DEFAULTS`` (the
 original 10 entries from ARCHITECTURE §6) so a fresh deploy never picks
@@ -46,10 +53,12 @@ DEFAULTS: tuple[str, ...] = (
 )
 
 _HEADER = (
-    "# einkgen prompt library — random subject lines the cron picks from.\n"
-    "# One prompt per line. Lines starting with # are ignored.\n"
-    "# Managed by `einkgen prompts {ls,edit,reset}` and the SPA admin tab,\n"
-    "# but free to edit by hand.\n"
+    "# einkgen topic library — the cron picks one of these at random per\n"
+    "# top-up slot, then runs it through generate.expand_topic() (text LLM)\n"
+    "# to turn the topic into a concrete image prompt before enqueueing.\n"
+    "# One topic per line. Lines starting with # are ignored. Managed by\n"
+    "# `einkgen prompts {ls,edit,reset}` and the SPA admin tab, but free\n"
+    "# to edit by hand.\n"
 )
 
 _cached: tuple[str, ...] | None = None

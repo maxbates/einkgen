@@ -82,25 +82,43 @@ export class EinkgenStack extends Stack {
       ? `https://${siteDomain}`
       : `https://${cdn.distribution.distributionDomainName}`;
 
-    // Device-poll cadence override. Default: unset → publish.py uses its
-    // built-in 1 h default, which matches the firmware's SLEEP_MAX_SECONDS
-    // floor. Operators who want a different cadence (e.g. 3 h, 30 min)
-    // pass an integer second count here AND edit
-    // ``firmware/inkplate10/inkplate10.ino`` so SLEEP_MAX_SECONDS matches
-    // — otherwise the firmware silently clamps. See QUICKSTART §3.12.
-    //   cdk deploy -c einkgenPollIntervalSeconds=10800   # 3 hours
+    // Generation + device-poll cadence — single knob. The value here
+    // drives BOTH:
+    //   • the EventBridge rule that fires the generator (one image-gen
+    //     call per tick), and
+    //   • the ``EINKGEN_POLL_INTERVAL_SECONDS`` env var on the
+    //     generator + inbound-email Lambdas, which determines the
+    //     ``next_check_after`` hint in each manifest the device fetches.
+    //
+    // Coupling them eliminates the "edit two files in lockstep" footgun
+    // — there's no point polling more often than cron renders, or
+    // rendering more often than the device picks up. The firmware's
+    // ``SLEEP_MAX_SECONDS = 1 h`` is a cap, not a target: any cadence
+    // ≤ 3600 s is honoured directly with no firmware re-flash.
+    // Cadences > 3600 s (e.g. 3 h) require also bumping the firmware
+    // constant — see QUICKSTART §3.12.
+    //
+    // Default lives in cdk.json (``einkgenPollIntervalSeconds``); a
+    // per-deploy override is ``-c einkgenPollIntervalSeconds=<seconds>``.
+    const DEFAULT_POLL_INTERVAL_SECONDS = 1800; // 30 minutes
     const pollIntervalCtx = this.node.tryGetContext('einkgenPollIntervalSeconds');
-    const pollIntervalSeconds =
-      pollIntervalCtx !== undefined && pollIntervalCtx !== null && `${pollIntervalCtx}`.trim()
-        ? `${pollIntervalCtx}`.trim()
-        : undefined;
-    if (pollIntervalSeconds !== undefined) {
-      const parsed = Number(pollIntervalSeconds);
+    let pollIntervalSeconds = DEFAULT_POLL_INTERVAL_SECONDS;
+    if (pollIntervalCtx !== undefined && pollIntervalCtx !== null && `${pollIntervalCtx}`.trim()) {
+      const parsed = Number(`${pollIntervalCtx}`.trim());
       if (!Number.isInteger(parsed) || parsed <= 0) {
         throw new Error(
-          `einkgenPollIntervalSeconds must be a positive integer (got ${pollIntervalSeconds})`,
+          `einkgenPollIntervalSeconds must be a positive integer (got ${pollIntervalCtx})`,
         );
       }
+      pollIntervalSeconds = parsed;
+    }
+    // EventBridge rate() only accepts whole minutes/hours/days, and the
+    // minimum is 1 minute. Catch sub-minute or non-minute-aligned values
+    // at synth so the deploy doesn't blow up midway through.
+    if (pollIntervalSeconds < 60 || pollIntervalSeconds % 60 !== 0) {
+      throw new Error(
+        `einkgenPollIntervalSeconds must be at least 60 and a multiple of 60 (got ${pollIntervalSeconds})`,
+      );
     }
 
     const lambdas = new EinkgenLambdas(this, 'Lambdas', {

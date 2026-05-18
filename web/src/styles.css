@@ -602,6 +602,69 @@ button {
   flex-wrap: wrap;
 }
 
+/* 3-button enqueue cluster — Top / Bottom / Now */
+.enqueue-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.enqueue-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+}
+
+.enqueue-btn svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+.enqueue-btn-now {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+.enqueue-btn-now:hover {
+  background: var(--accent);
+  opacity: 0.85;
+}
+
+.enqueue-btn-danger {
+  color: var(--error-fg);
+  border-color: var(--error-fg);
+}
+
+.enqueue-btn-danger:hover {
+  background: var(--error-bg);
+}
+
+.enqueue-btn-small {
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
+/* Queue tab — per-row admin actions */
+.queue-row-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.chip-head {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+
+/* Admin "Recently rejected" panel (from v0.4.1.4 failures system) */
 .admin-failures-header {
   display: flex;
   justify-content: space-between;
