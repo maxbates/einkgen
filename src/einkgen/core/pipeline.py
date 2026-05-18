@@ -1,8 +1,23 @@
-"""One queue item -> a published frame.
+"""One queue item -> a rendered frame.
 
-Lazy-imports ``generate``, ``convert``, ``publish`` so this module loads cleanly
-in worktrees where those siblings have not been written yet (and so tests can
-inject mocks via ``sys.modules``).
+Two render flows share the generate-and-convert front half:
+
+- ``buffer_item(item)`` archives the frame under ``history/<id>/`` and
+  enqueues a marker in the generated queue (``core.generated_queue``).
+  The device only sees the frame once a ``/wake`` advance pops the
+  marker and re-points ``current/manifest.json`` at it. This is the
+  cron-driven path.
+
+- ``publish_item(item)`` archives the frame AND immediately points
+  ``current/manifest.json`` at it (legacy ``publish``). Used by the
+  admin **Now** / **Run** overrides where the operator wants the image
+  on the panel right away rather than through the buffer.
+
+Both flows handle the ``prompt`` / ``image`` / ``image+prompt`` /
+``random`` cases via the same ``_render(item)`` helper. Lazy-imports
+``generate`` / ``convert`` / ``publish`` so this module loads cleanly
+in worktrees where those siblings have not been written yet (and so
+tests can inject mocks via ``sys.modules``).
 """
 
 from __future__ import annotations
@@ -11,7 +26,7 @@ import importlib
 import logging
 from typing import Any
 
-from einkgen.core import s3
+from einkgen.core import generated_queue, s3
 from einkgen.core.queue import QueueItem
 
 log = logging.getLogger(__name__)
@@ -50,15 +65,15 @@ def _call_openai(fn, *args, **kwargs):
         raise
 
 
-def process_item(item: QueueItem) -> None:
-    """Generate (or fetch) -> convert -> publish.
+def _render(item: QueueItem) -> tuple[bytes, bytes, dict[str, Any], bool]:
+    """Generate or fetch the source, convert to dithered BMP.
 
-    For ``image`` kind, the staged source is removed from S3 after a
-    successful publish so ``queue/staged/`` does not grow unboundedly.
+    Returns ``(processed_bmp, original_png, source_dict, image_was_generated)``.
+    Caller is responsible for archiving / publishing and for cleaning up
+    the staged upload (for image-kind items).
     """
     generate = importlib.import_module("einkgen.core.generate")
     convert_mod = importlib.import_module("einkgen.core.convert")
-    publish_mod = importlib.import_module("einkgen.core.publish")
 
     original_png: bytes
     if item.kind == "prompt":
@@ -112,6 +127,50 @@ def process_item(item: QueueItem) -> None:
     if item.prompt is not None:
         source["prompt"] = item.prompt
 
+    return processed_bmp, original_png, source, image_was_generated
+
+
+def _cleanup_staged(item: QueueItem) -> None:
+    """Best-effort delete of ``queue/staged/<…>`` after a successful render."""
+    if item.kind == "image" and item.image_s3_key:
+        try:
+            s3.delete_object(item.image_s3_key)
+        except Exception:  # pragma: no cover - best-effort cleanup
+            log.warning("failed to delete staged image %s", item.image_s3_key)
+
+
+def buffer_item(item: QueueItem) -> None:
+    """Render → ``history/<id>/`` → enqueue marker on the generated queue.
+
+    The cron-driven render path. The device only sees this frame after a
+    ``/wake`` advance pops the marker.
+    """
+    publish_mod = importlib.import_module("einkgen.core.publish")
+    processed_bmp, original_png, source, _ = _render(item)
+    manifest = publish_mod.archive_to_history(
+        processed_bmp,
+        source=source,
+        item_id=item.id,
+        original=original_png,
+        prompt=item.prompt,
+    )
+    generated_queue.enqueue(
+        item.id,
+        image_sha256=manifest.image_sha256,
+        image_bytes=manifest.image_bytes,
+        source=manifest.source,
+    )
+    _cleanup_staged(item)
+
+
+def publish_item(item: QueueItem) -> None:
+    """Render → ``history/<id>/`` + set as current in one shot.
+
+    Used by admin "Now" / "Run" overrides where the operator wants the
+    image on the panel immediately, skipping the generated queue.
+    """
+    publish_mod = importlib.import_module("einkgen.core.publish")
+    processed_bmp, original_png, source, _ = _render(item)
     publish_mod.publish(
         processed_bmp,
         source=source,
@@ -119,12 +178,10 @@ def process_item(item: QueueItem) -> None:
         original=original_png,
         prompt=item.prompt,
     )
+    _cleanup_staged(item)
 
-    # Clean up the staged upload now that history/<id>/original.png is the
-    # canonical archive. Best-effort: a failure here doesn't roll back the
-    # published frame.
-    if item.kind == "image" and item.image_s3_key:
-        try:
-            s3.delete_object(item.image_s3_key)
-        except Exception:  # pragma: no cover - best-effort cleanup
-            log.warning("failed to delete staged image %s", item.image_s3_key)
+
+# Back-compat alias for the historical public name. Callers that just want the
+# "archive + immediately set current" behavior (admin Now / Run, older tests)
+# can keep using ``process_item``. The cron path uses ``buffer_item`` directly.
+process_item = publish_item
