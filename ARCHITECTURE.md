@@ -32,47 +32,91 @@ Sources: [Inkplate 10 overview](https://docs.soldered.com/inkplate/10/overview/)
 
 ```
    CLI ───┐
-   admin ─┤   enqueue
-   email ─┤  ───────▶  ┌────────────────────┐      cron tick (2 h)   ┌──────────────────┐
-   cron ──┘            │  queue (S3 prefix) │  + admin "Now"/"Run"  ▶│ generator Lambda │──┐
-                       │  reorderable buffer│  (lambda.invoke async)│  (concurrency=1) │  │
-                       └────────────────────┘                       └──────────────────┘  │
-                              ▲                                                           │
-                              │                                                           ▼
-                              │                                                 ┌────────────────┐
-                              │   read-only                                     │   S3 bucket    │
-                       ┌─────────────────┐    ◀── public reads ──               │   + manifest   │
-                       │  web app (SPA)  │    via read-api Lambda               └────────┬───────┘
-                       │  3 tabs, public │                                               │
-                       │  + Admin tab    │  ◀── writes through admin-api Lambda          │ CloudFront
-                       └─────────────────┘                                               ▼ HTTPS GET
-                                                                                 ┌──────────────┐
-                                                                                 │ Inkplate 10  │  wakes ≤ every 1h,
-                                                                                 │   firmware   │  pulls manifest,
-                                                                                 └──────────────┘  redraws if changed,
-                                                                                                   POSTs status, sleeps
+   admin ─┤   enqueue                    cron tick (30 min)         per-pop replenish
+   email ─┤  ───────▶  ┌──────────────┐  top up + render N      ┌──────────────────┐
+   cron ──┘            │ prompt queue │ ──────────────────────▶│ generator Lambda │
+                       │  (S3 queue/) │                         │ (concurrency=1)  │
+                       └──────────────┘                         └─────────┬────────┘
+                                                                          │ buffer_item:
+                                                                          │  archive +
+                                                                          ▼  enqueue marker
+                                              ┌────────────────────────────────┐
+                              advance / pop ◀─│  generated queue (S3 generated/)│
+                              on /wake call   │  ~10 pre-rendered frames        │
+                                              └─────────────┬───────────────────┘
+                                                            │ set_current_from_history
+                                                            ▼
+                                                  ┌────────────────┐
+                                                  │   S3 bucket    │
+                                                  │   + manifest   │
+                                                  └────────┬───────┘
+                                                           │ CloudFront
+                                                           ▼ HTTPS GET
+                                                  ┌──────────────┐
+                                                  │ Inkplate 10  │  POST /wake → advance,
+                                                  │   firmware   │  GET manifest, redraw,
+                                                  └──────────────┘  POST status, sleep
 ```
 
-The queue is now a curated buffer. The cron tick — every 2 h — keeps it
-topped up (≥ 5 pending items, each a text-LLM expansion of a topic from
-the prompt library) and renders the current head. There is **no S3
-ObjectCreated auto-drain**: items enqueued by CLI / email / admin sit on
-the queue until the next cron tick or an explicit admin **Run** / **Now**
-button async-invokes the generator with `{"action":"render_now"}`.
+There are now **two queues**:
+
+- The **prompt queue** at `queue/<…>.json` is the curated buffer of
+  text submissions / image uploads waiting to be rendered. Cron's
+  text-LLM top-up keeps it ≥ 5 deep so the next render step never
+  starves.
+- The **generated queue** at `generated/<…>.json` is the buffer of
+  pre-rendered frames waiting to be *displayed*. Each marker points at
+  an existing `history/<id>/` archive (a full render: dithered BMP,
+  source PNG, history manifest); the device hasn't drawn it yet.
+  Target depth is 10. Each cron tick refills the buffer all the way
+  to that target in a single invocation (no per-tick render cap — the
+  Lambda's 15-min timeout fits a worst-case 10-render cold-start
+  comfortably). The `/wake` endpoint pops the head.
+
+The cron tick — every 30 min by default — does two things: refill the
+generated buffer to `TARGET_GENERATED_QUEUE_LENGTH` (drawing prompts
+off the prompt queue, topping that queue up inline as it drains), then
+leave the prompt queue at its floor so the SPA shows a sensible
+"pending prompts" count between ticks. **Cron does NOT touch
+`current/manifest.json`.** Display advancement is entirely driven by
+`POST /wake`.
 
 A single generator Lambda renders one item at a time (reserved
-concurrency = 1). Cron, async invokes, and any future trigger all
-funnel through that one serialised worker, so cost is bounded by the
-slowest caller and head reads are race-free.
+concurrency = 1). Cron, the per-wake `render_one` replenish, the
+admin **Now** / **Run** overrides, and any future trigger all funnel
+through that one serialised worker.
 
-The Inkplate runs a small sketch that, on every wake:
+The Inkplate runs a small sketch that, on every wake (timer tick OR
+WAKE-button press):
 1. Joins Wi-Fi.
-2. `GET /current/manifest.json` (CloudFront-cached, supports `If-None-Match`).
-3. If `image_sha256` differs from the value in NVS, downloads `image.bmp` and calls `drawImage(..., dither=false)`.
-4. POSTs `{battery, rssi, current_hash, fw_version}` to the device-status Lambda (shared-secret header).
-5. Saves the new hash, schedules an RTC alarm for `min(manifest.next_check_after, now + 1h)`, deep-sleeps.
+2. **`POST /wake`** with `{"current_sha256": "<nvs hash>"}` and the
+   shared-secret token. The server compares against
+   `current/manifest.json`:
+     - sha **matches** + buffer non-empty → pop head, re-point
+       current at it, fire `render_one` async to backfill, respond
+       `advance` with the new sha. Subsequent GET manifest sees the
+       update.
+     - sha **mismatches** → device hasn't drawn the latest yet;
+       respond `redraw`. **This is what debounces rapid presses** —
+       no pop until the device confirms it caught up.
+     - buffer empty → `queue_empty`. No advance, no synchronous
+       OpenAI call.
+3. `GET /current/manifest.json` (CloudFront-cached, supports
+   `If-None-Match`).
+4. If `image_sha256` differs from the value in NVS, downloads
+   `image_url` (which points at `history/<id>/processed.bmp`) and
+   calls `drawImage(..., dither=false)` after verifying the sha
+   matches the manifest's claim.
+5. POSTs `{battery, rssi, current_hash, fw_version}` to the
+   device-status Lambda (`POST /`).
+6. Saves the new hash, schedules an RTC alarm for
+   `min(manifest.next_check_after, now + 1h)`, deep-sleeps until
+   either the alarm fires or the WAKE button is pressed.
 
-The server never pushes; it just guarantees `manifest.json` and `image.bmp` are fresh. The 1-hour sleep cap guarantees user-submitted prompts appear within ≤1h of being enqueued.
+The server never pushes; it just guarantees `manifest.json` and the
+referenced history bytes are fresh. The 1-hour sleep cap guarantees a
+queued frame appears on the panel within ≤1 h of becoming the head
+of the generated buffer.
 
 ---
 
@@ -157,11 +201,19 @@ The queue API in `core/queue.py` is the seam: any future channel becomes a small
 
 ---
 
-## 4. Queue
+## 4. Queues
 
-The queue is a **two-priority buffer**: cron / CLI / email / admin all
-write to it; nothing renders until cron, `render_now`, or the admin
-**Run** button explicitly says so. Items in the **top** queue always
+The system has **two queues**. The prompt queue holds submissions
+waiting to be rendered; the generated queue holds rendered frames
+waiting to be displayed. The cron pipeline pulls from the prompt
+queue and writes to the generated queue; the `/wake` device endpoint
+pops from the generated queue and re-points `current/manifest.json`.
+
+### 4a. Prompt queue (`queue/`)
+
+The prompt queue is a **two-priority buffer**: cron / CLI / email /
+admin all write to it; nothing renders until cron, `render_now`, or
+the admin **Run** button explicitly says so. Items in the **top** queue always
 drain before any item in the **bottom** queue; FIFO within each. No
 coalescing.
 
@@ -225,38 +277,42 @@ Field constraints by kind:
 
 ```
 on invoke:
-  if event["action"] == "render_now":          # admin Now via lambda.invoke
-    render_head()
+  if event["action"] == "render_now":          # admin Now — sets current
+    publish_item(queue.peek_head())            # archive + set current/
+    queue.finalize(head)
     return
-  if event["action"] == "render_item":         # admin per-row Run
-    render_item_by_id(event["item_id"])
+  if event["action"] == "render_item":         # admin Run — sets current
+    publish_item(queue.get(event["item_id"]))
+    return
+  if event["action"] == "render_one":          # /wake replenish — buffer only
+    buffer_item(queue.peek_head())             # archive + enqueue marker
+    queue.finalize(head)
     return
   if cron (source=aws.events):
-    top_up_queue(target=TARGET_QUEUE_LENGTH)   # text-LLM expansions to ≥5 items
-    render_head()
+    top_up_prompt_queue(target=5)              # text-LLM expansions to ≥5
+    while generated_queue.count() < 10 and tick_renders < MAX_RENDERS_PER_TICK:
+        buffer_item(queue.peek_head())         # one render per loop iteration
     return
   # anything else (stray S3 event from the old trigger): log and ignore
 
-render_head():
-  head = queue.peek_head()
-  if head is None: return
-  render_one(head)
-  queue.finalize(head)
+publish_item(item):                            # admin path
+  processed = _render(item)                    # generate → convert
+  publish(processed, ...)                      # writes history/<id>/ AND current/
 
-render_item_by_id(item_id):
-  item = queue.get(item_id)
-  if item is None: return                      # already drained — log + noop
-  render_one(item)
-  queue.finalize(item)
+buffer_item(item):                             # cron / wake path
+  processed = _render(item)
+  manifest = archive_to_history(processed, ...)
+  generated_queue.enqueue(item.id,             # marker carries sha + source
+                          image_sha256=manifest.image_sha256,
+                          ...)
 
-render_one(item):
+_render(item):                                 # shared front half
   match item.kind:
     "prompt": img = model.generate(BASE_PROMPT + item.prompt)
     "image" if item.prompt: img = model.edit(item.image, BASE_PROMPT + item.prompt)
     "image":  img = s3.fetch(item.image_s3_key)
     "random": img = model.generate(BASE_PROMPT + prompt_library.random_prompt())
-  processed = convert(img)
-  publish(processed, source=item)
+  return convert(img)
 ```
 
 ### Cancel, run, idempotency
@@ -267,13 +323,78 @@ render_one(item):
 - `POST /admin/queue/<id>/run` and the per-row **Run** button
   async-invoke the generator with `{"action": "render_item",
   "item_id": "<id>"}`. The generator fetches that specific item,
-  renders, and finalizes — no reordering or in-place rewrite of any
-  other queue object. The HTTP request returns 202 immediately; the
-  render happens off the request path.
+  renders it, and **sets current directly** (bypassing the generated
+  buffer) — same intent as admin **Now**.
 - There is **no move-to-top route**. Placement is decided at enqueue
   time (`at="top"` or `at="bottom"`).
 - Each item has a stable `id`; archive on `history/<id>/` is idempotent
   on re-delivery.
+
+### 4b. Generated queue (`generated/`)
+
+The pre-rendered buffer. Each marker at `generated/<iso_ts>-<history_id>.json`
+points at an existing `history/<id>/` archive:
+
+```json
+{
+  "history_id": "01HF7Z…",
+  "queued_at": "2026-05-13T14:05:12Z",
+  "image_sha256": "abc…",
+  "image_bytes": 990123,
+  "source": { "kind": "generated", "model": "gpt-image-2", "prompt": "…" }
+}
+```
+
+The marker is intentionally small — the dithered bmp lives under
+`history/<id>/processed.bmp` and is already CDN-cached. Markers are
+written by `core.pipeline.buffer_item` and consumed by `/wake`.
+
+**FIFO, single priority, no in-place mutation.** Lex-sort of
+`generated/*.json` is the queue order. Operations:
+
+- `enqueue(history_id, sha, bytes, source)` — cron / `render_one`.
+- `peek_head()` — `/wake` to find the next to display.
+- `finalize(item)` — `/wake` after a successful advance.
+- `cancel(history_id)` — admin **Skip** (`DELETE /admin/generated/<id>`)
+  and the implicit drop on `POST /admin/show` (so "Show this now" on a
+  buffered item both displays it and removes the duplicate marker).
+- `count()` / `list()` — public `GET /generated`.
+
+The `history/<id>/` archive **survives** a skip or a pop — the marker
+is a lifecycle annotation on top of an item that's already in
+history. Skipping just means "don't auto-display"; the operator can
+still pin it later via **Show this now**.
+
+### 4c. Display advance: `POST /wake`
+
+The device-status Lambda handles two routes: the existing `POST /`
+status heartbeat and `POST /wake`. Both are `X-Device-Token`
+authenticated. `/wake` is the only way `current/manifest.json` moves
+forward (other than admin **Now** / **Show this now**); cron does
+not touch current.
+
+The handler reads `current/manifest.json` and compares its
+`image_sha256` to the device's reported `current_sha256`:
+
+| device.sha vs manifest.sha | generated queue | response |
+| --- | --- | --- |
+| match (or no manifest yet) | non-empty | pop head, `set_current_from_history(history_id)`, async-invoke `render_one`, respond `advance` |
+| match (or no manifest yet) | empty | respond `queue_empty` — wait for next cron tick |
+| mismatch | (irrelevant) | respond `redraw` — device hasn't drawn the latest yet, just refetch manifest |
+
+The mismatch branch is the **debounce**: rapid wake presses don't pop
+multiple items because the second press still reports the old sha.
+After the device fetches the new manifest and updates NVS, the next
+wake matches and can advance again. Single-device deployments
+naturally serialise this.
+
+Concurrency: two simultaneous `/wake` calls (timer + button at the
+same moment) can both reach the advance branch. Both write a new
+manifest pointing at the same history id (idempotent — last write
+wins, same content); the marker delete is racy but tolerant —
+whichever loses the `DeleteObject` race sees a no-op. Reserved
+concurrency on the generator (1) serialises any race on the
+replenish render.
 
 ---
 
@@ -411,11 +532,13 @@ The device-poll tick and the **EventBridge auto-gen cron** are driven by the sam
 ```
 s3://einkgen-<env>/
 ├── current/
-│   ├── manifest.json        # what the device reads
-│   └── image.bmp            # latest dithered frame
+│   ├── manifest.json        # what the device reads — points at history/<id>/processed.bmp post-/wake
+│   └── image.bmp            # legacy path; written only by admin "Now"/"Run" overrides
 ├── queue/
-│   ├── 2026-05-13T14-05-12Z-01HF7Z….json   # pending items, lex-sortable
+│   ├── 0-2026-05-13T14-05-12Z-01HF7Z….json  # prompt queue, lex-sortable (priority 0 = top, 1 = bottom)
 │   └── staged/abc123.jpg                    # media attached to image-kind items
+├── generated/
+│   └── 2026-05-13T14-10-00Z-01HF7Z….json    # pre-rendered buffer markers, FIFO; each points at history/<id>/
 ├── inbound/
 │   └── <ses-message-id>     # raw RFC 5322 messages from SES, deleted after processing
 ├── config/
@@ -424,7 +547,7 @@ s3://einkgen-<env>/
 │   └── 01HF7Z…/                # one folder per item id
 │       ├── manifest.json       # has prompt, source, hash, timestamps
 │       ├── original.png        # raw model output (or uploaded source)
-│       └── processed.bmp       # what we sent to the device
+│       └── processed.bmp       # what we sent (or will send) to the device
 ├── firmware/
 │   └── v0.1.0/inkplate.bin     # for future OTA
 ├── status/
@@ -437,8 +560,9 @@ Access policy:
 
 | Prefix | Who reads | Who writes |
 | --- | --- | --- |
-| `current/*` | **public** via CloudFront — this is what the device fetches | generator Lambda only |
+| `current/*` | **public** via CloudFront — this is what the device fetches | generator Lambda (admin **Now**/**Run** paths) + device-status Lambda (`/wake` advance) + admin Lambda (`/admin/show`) |
 | `history/*` | public via CloudFront, but a viewer-request function gates the prefix to `processed.bmp` only — raw `original.png` uploads aren't reachable through the CDN | generator Lambda |
+| `generated/*` | read-api Lambda (`GET /generated`) | generator Lambda (enqueue on render); device-status (delete on `/wake` pop); admin Lambda (delete on skip / show) |
 | `web/*` | public via CloudFront (the SPA) | the `BucketDeployment` construct on each `cdk deploy` |
 | `queue/*`, `status/*`, `firmware/*` | read-api Lambda (IAM) | generator + device-status + CLI (IAM) |
 | `inbound/*` | inbound-email Lambda only | SES (via receipt rule action), inbound-email Lambda (delete after processing) |
@@ -454,13 +578,18 @@ Four Lambdas (five with inbound email), one bucket, one CloudFront distribution,
 
 - **S3 bucket `einkgen-<env>`** — single store: `current/`, `queue/`, `history/`, `status/`, `firmware/`, `web/`.
 - **CloudFront distribution** — fronts the bucket via an Origin Access Control. `current/*`, `history/<id>/processed.bmp`, and `web/*` are publicly readable; the rest of the bucket is locked down at the bucket-policy level and accessed only via Lambdas with IAM.
-- **Lambda `einkgen-generator`** — only writer of `current/` and `history/`. Triggered by:
-  - **EventBridge** `rate(30 minutes)` → top up the queue to ≥5 items (text-LLM expansion of random library topics), then render the head.
-  - **`lambda.invoke`** from the admin Lambda with `{"action": "render_now"}` (Admin "Now" button) or `{"action": "render_item", "item_id": "..."}` (per-row "Run" button).
+- **Lambda `einkgen-generator`** — writes `history/` (always), `generated/` (cron + `render_one` paths), and `current/` (admin **Now** / **Run** paths). Triggered by:
+  - **EventBridge** `rate(30 minutes)` → refill the generated buffer all the way to `TARGET_GENERATED_QUEUE_LENGTH` (no display advance). The buffer-refill loop tops the prompt queue back up inline (via text-LLM expansion of random library topics) whenever it runs dry, so a fully-drained buffer can refill in a single invocation. Lambda timeout is 15 min — fits a worst-case 10-render cold start.
+  - **`lambda.invoke`** from the device-status Lambda with `{"action": "render_one"}` (`/wake` replenish after a pop) — archives to `history/` + enqueues a `generated/` marker, no `current/` write.
+  - **`lambda.invoke`** from the admin Lambda with `{"action": "render_now"}` (admin **Now** button) or `{"action": "render_item", "item_id": "..."}` (per-row **Run** button) — archives to `history/` AND sets as current, bypassing the generated buffer.
 
-  No S3 ObjectCreated trigger — see §4. Reserved concurrency = **1** (serial drain across all triggers). Async retries = **0** on both the function and the EventBridge target (caps OpenAI cost-amplification from transient failures). Reads `OPENAI_API_KEY` from Secrets Manager. ARM64 Graviton2, 1024 MB. Pillow is bundled into the function zip (no third-party Lambda layer).
-- **Lambda `einkgen-read-api`** — public API Gateway HTTP API with CORS pinned to the CloudFront origin (plus `http://localhost:5173` for dev). Read-only IAM on the bucket. Routes: `GET /queue`, `GET /history`, `GET /status`. The web app's only backend.
-- **Lambda `einkgen-device-status`** — API Gateway HTTP API with **no CORS** (firmware-only). Accepts `POST /` with an `X-Device-Token` header (validated against Secrets Manager). Writes `status/device-<id>.json`. Write-only IAM on the `status/` prefix. Reserved concurrency caps blast radius from abuse.
+  No S3 ObjectCreated trigger — see §4. Reserved concurrency = **1** (serial drain across all triggers, including the new `render_one`). Async retries = **0** on both the function and the EventBridge target (caps OpenAI cost-amplification from transient failures). Reads `OPENAI_API_KEY` from Secrets Manager. ARM64 Graviton2, 1024 MB. Pillow is bundled into the function zip (no third-party Lambda layer).
+- **Lambda `einkgen-read-api`** — public API Gateway HTTP API with CORS pinned to the CloudFront origin (plus `http://localhost:5173` for dev). Read-only IAM on the bucket. Routes: `GET /queue`, `GET /generated`, `GET /history`, `GET /status`. The web app's only public backend.
+- **Lambda `einkgen-device-status`** — API Gateway HTTP API with **no CORS** (firmware-only). Two routes, both with `X-Device-Token` shared-secret auth:
+  - `POST /` writes `status/device-<id>.json` (battery / RSSI heartbeat).
+  - `POST /wake` advances the display: reads `current/manifest.json`, compares the sha against the device's reported `current_sha256`, pops the head of `generated/` and points current at it via `set_current_from_history`, fires `render_one` async at the generator to refill the buffer. Sha-debounced (mismatch = "device hasn't redrawn yet, no pop").
+
+  Reserved concurrency caps blast radius from abuse. IAM: read+write `current/*`, read `history/*`, list+read+delete `generated/*`, invoke generator, CF invalidation, secrets read, write-only `status/*`.
 - **Lambda `einkgen-admin-api`** — API Gateway HTTP API attached to CloudFront as the `/admin/*` behavior (same origin as the SPA, so the session cookie can be SameSite=Lax). All routes live under `/admin/`. Validates the operator password against `einkgen/admin_password` on login (constant-time compare), mints an HMAC-SHA256-signed session cookie keyed by `einkgen/admin_cookie_signing_key`, and writes to `queue/*` (text prompt) or `queue/staged/*` (image) on success. Reserved concurrency = 5.
 - **Lambda `einkgen-inbound-email`** *(opt-in, gated by the `einkgenInboundDomain` CDK context flag)*. S3 ObjectCreated on `inbound/*` triggers it; SES's receipt rule for the configured domain writes raw RFC 5322 messages there. Parses MIME, checks SES `Authentication-Results` for SPF/DKIM pass aligned with the From: domain, validates the sender against `config/email_allowlist.txt`, stages any image attachment under `queue/staged/`, calls `queue.enqueue(source="email")`, and sends a confirmation or rejection reply via SES. Scoped IAM: read+delete `inbound/*`, read `config/email_allowlist.txt`, write `queue/*`, `ses:SendEmail` constrained to the configured reply-From address. Reserved concurrency = 5.
 - **Secrets Manager** — `einkgen/openai_api_key`, `einkgen/device_status_token`, `einkgen/admin_password`, `einkgen/admin_cookie_signing_key` (auto-generated by CDK on first deploy). Lambdas get scoped read.
@@ -488,13 +617,30 @@ See [QUICKSTART.md](QUICKSTART.md) for how to populate the Secrets Manager value
 
 ## 11. Inkplate firmware sketch
 
-A single Arduino sketch in `firmware/inkplate10/`:
+A single Arduino sketch in `firmware/inkplate10/`. Each wake (timer
+RTC alarm OR `EXT0` WAKE-button press) runs `setup()` cold:
+
 - Joins Wi-Fi (credentials in `secrets.h`, gitignored).
+- Reads the previously-shown sha + low-battery flag from NVS.
+- **`POST /wake`** with `{"current_sha256": "<nvs hash>"}` and the
+  `X-Device-Token` header. The server uses this to decide whether to
+  pop the generated buffer head (see §4c); the firmware doesn't act
+  on the response body directly — it logs it for serial debugging
+  and proceeds. A failed `/wake` is OK; the manifest-fetch path
+  takes over.
 - HTTPS GET `manifest.json` from CloudFront, parse with `ArduinoJson`.
 - Compare `image_sha256` to the value in NVS.
-- If changed: `display.drawImage(manifestImageUrl, 0, 0, false, false)`; `display.display()`. Persist the new hash.
-- POST `{battery_v, battery_pct, rssi, current_hash, fw_version}` to the device-status endpoint with `X-Device-Token: <DEVICE_STATUS_TOKEN>`.
-- Compute wake target: `min(manifest.next_check_after, now + 1h)`. Set RTC alarm. Fallback: 1 hour if the manifest fetch failed.
+- If changed: download `image_url` (now points at `history/<id>/processed.bmp`)
+  into a PSRAM buffer, verify its SHA-256 matches the manifest's claim,
+  `display.image.drawBitmapFromBuffer(...)`, optionally composite the
+  low-battery overlay, `display.display()`. Persist the new hash + low
+  flag.
+- POST `{battery_v, battery_pct, rssi, current_hash, fw_version}` to
+  the device-status endpoint with `X-Device-Token: <DEVICE_STATUS_TOKEN>`.
+- Compute wake target: `min(manifest.next_check_after, now + 1h)`.
+  Set RTC alarm AND arm `EXT0` for the WAKE-button GPIO so a press
+  short-circuits the sleep. Fallback: 1 hour if the manifest fetch
+  failed.
 - `esp_deep_sleep_start()`.
 
 ---
@@ -508,13 +654,13 @@ Tabling each component against "what can go wrong":
 | **Public CloudFront `current/*` and `history/*processed.bmp`** | Anyone reads the latest dithered image. | Acceptable — that's the device's read path. The CloudFront viewer-request function blocks `history/*original.png` from public reads. |
 | **Read-api API Gateway endpoint** | Anyone reads queue/history/status metadata (incl. prompts). | Acceptable — public by design. CORS pinned to the CloudFront origin + `localhost:5173` to discourage casual abuse, but content is not sensitive. Lambda has read-only IAM so abuse can't escalate. |
 | **Admin-api `/admin/*` endpoints (login + write)** | Attacker brute-forces the password and triggers unbounded OpenAI spend. | Single shared password in Secrets Manager (constant-time compare). Cookie is HMAC-signed with a CDK-auto-generated 64-byte key; tampering or forging requires the key. Reserved concurrency = 5 on the admin Lambda + reserved concurrency = 1 on the generator caps any successful attack at the cron rate. No daily $ cap yet (deferred — see [TODOS.md](TODOS.md)). Rotate the cookie key via `put-secret-value` to invalidate every outstanding session. |
-| **Device-status API Gateway endpoint** | Attacker spams POSTs and fills `status/` with junk, racking up minor S3 costs. | `X-Device-Token` header validated against Secrets Manager via `hmac.compare_digest`. Wrong token → 401, no S3 write. `device_id` regex + 4 KB body cap + body-field allowlist. Lambda reserved concurrency caps blast radius. |
-| **Generator Lambda** | If someone could invoke it with their own input, they could burn OpenAI spend. | No external trigger — only S3 ObjectCreated on `queue/` (`.json` suffix only — staged images can't trigger it) and EventBridge. The only way to write to `queue/` is operator IAM. Async retries = 0 so a transient failure can't multiply OpenAI cost. |
+| **Device-status API Gateway endpoint** (`POST /` + `POST /wake`) | Attacker spams POSTs and fills `status/` with junk, racking up minor S3 costs OR triggers `/wake` advances + replenish renders, draining the generated buffer and burning OpenAI calls. | `X-Device-Token` header validated against Secrets Manager via `hmac.compare_digest` (both routes). Wrong token → 401, no S3 write, no `lambda:Invoke`. `/` body: `device_id` regex + 4 KB body cap + body-field allowlist. `/wake` body: hex-64 sha regex + 4 KB cap. Lambda reserved concurrency caps blast radius. Each `/wake` triggers at most one `render_one` (generator's reserved concurrency = 1 serialises), so cost amplification is bounded by the cron cadence on top. The mismatch-debounce in `/wake` also caps per-press effect: only one pop until the device confirms it caught up. |
+| **Generator Lambda** | If someone could invoke it with their own input, they could burn OpenAI spend. | No external trigger. The four entry paths are: EventBridge cron, `lambda.invoke` from the admin Lambda (cookie-gated `Now` / `Run`), `lambda.invoke` from the device-status Lambda (`/wake` replenish, gated by `X-Device-Token`), and IAM-scoped operator writes to `queue/`. Reserved concurrency = 1 serialises them all. Async retries = 0 so a transient failure can't multiply OpenAI cost. |
 | **CLI / operator IAM** | Leaked AWS credentials → attacker spams the queue → unbounded OpenAI spend. | Scoped IAM policy (writes limited to `queue/`); standard credential hygiene (no committed `.env`); rotate on suspicion. No daily $ cap yet (deferred — see [TODOS.md](TODOS.md)). |
 | **OpenAI API key** | Direct leak → attacker uses the key. | Stored in Secrets Manager, read only by the generator Lambda's role. Not present in the web app, the read-api Lambda, or the device. |
 | **Web app (React)** | XSS via untrusted prompt strings rendered in the Queue/History tabs. | React escapes by default. We never `dangerouslySetInnerHTML`. Prompt sources are all trusted (CLI operator + built-in library). |
 | **Firmware credentials** | Inkplate is stolen → Wi-Fi password + `DEVICE_STATUS_TOKEN` are readable from flash. | Acceptable. Token only writes status; Wi-Fi password is the same risk as any home IoT device. |
 | **Supply chain** | Compromised Python or npm dep runs in Lambda or CLI. | Pin versions in `pyproject.toml` / `package-lock.json`; minimize deps (Pillow, boto3, openai, ULID; React, Vite). |
-| **Manifest tampering** | Attacker writes a malicious `manifest.json` pointing the device at a payload. | Only the generator and admin-api Lambdas have write access to `current/*` (admin-api needs it for `POST /admin/show`, which is operator-trusted and inside the same blast-radius cap as the rest of the admin routes). Bucket policy denies anonymous and operator writes to `current/*`. Device only fetches over HTTPS from CloudFront. |
+| **Manifest tampering** | Attacker writes a malicious `manifest.json` pointing the device at a payload. | Three Lambdas have scoped write access to `current/*`: the generator (admin **Now**/**Run** paths), the admin Lambda (`/admin/show`), and the device-status Lambda (`/wake` advance via `set_current_from_history`). All three either require an operator session (admin) or a valid `X-Device-Token` (device-status) and can only point `current` at an existing `history/<id>/processed.bmp` archive — they can't invent new image bytes inside `current/`. Bucket policy denies anonymous and operator writes to `current/*`. Device only fetches over HTTPS from CloudFront and verifies the SHA-256 of the downloaded bytes against the manifest's claim before drawing. |
 
 Things we are explicitly **not** defending against in v1: cost-runaway from a compromised AWS account (deferred → cost cap is a future ask, [TODOS.md](TODOS.md)), DDoS of the public endpoints (AWS absorbs it; only S3 read amplification, which is bounded), and physical attacks on the Inkplate.

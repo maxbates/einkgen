@@ -5,6 +5,127 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.0.0] - 2026-05-18
+
+### Added
+- **Pre-rendered "generated queue" buffer between the prompt queue and
+  history.** A new S3 prefix ``generated/`` holds markers, each pointing
+  at an existing ``history/<id>/`` archive that has been rendered but
+  not yet shown on the panel. Target depth is 10 (configurable via
+  ``TARGET_GENERATED_QUEUE_LENGTH`` in
+  [src/einkgen/lambdas/generator.py](src/einkgen/lambdas/generator.py)).
+  Each cron tick refills the buffer all the way to that target in a
+  single invocation — there's no per-tick render cap. The generator's
+  Lambda timeout is raised to 15 min (Lambda max) so a worst-case cold
+  start of 10 renders × ~55 s fits comfortably. Steady state is 0–1
+  renders per tick (``/wake`` triggers its own per-pop replenish).
+  Module: [src/einkgen/core/generated_queue.py](src/einkgen/core/generated_queue.py).
+
+- **`POST /wake` on the device-status Lambda.** Body
+  ``{"current_sha256": "<hex>"}``; the server compares against
+  ``current/manifest.json``. Three branches:
+
+  * **sha matches + buffer non-empty** → pop the head marker, point
+    current at that history frame via ``set_current_from_history``,
+    async-invoke the generator with ``render_one`` to backfill,
+    respond ``{"action":"advance","manifest_sha256":...}``. The device
+    sees a new sha on its subsequent manifest fetch and redraws.
+  * **sha mismatch (device hasn't drawn the latest yet)** → respond
+    ``{"action":"redraw","manifest_sha256":...}``. **This is the
+    debounce**: rapid wake presses never pop more than one item until
+    the device has actually drawn the previous pop.
+  * **buffer empty** → ``{"action":"queue_empty"}``. Don't burn a fresh
+    OpenAI call to invent a frame on the wake path — wait for the next
+    cron tick to refill.
+
+  Auth is the existing ``X-Device-Token`` shared secret. The firmware
+  calls ``/wake`` on every wake (timer or WAKE button) before fetching
+  the manifest; a failed ``/wake`` degrades cleanly to the legacy
+  redraw-if-changed behavior. The 30-minute timer cadence (the same
+  ``einkgenPollIntervalSeconds`` knob from 0.5.1.0) continues to drive
+  the firmware's wake interval — the new bit is the WAKE-button press
+  now advances immediately instead of waiting for the next timer tick.
+
+- **Generator action ``render_one``** — direct-invoke payload
+  ``{"action": "render_one"}``. Renders the head of the prompt queue
+  into the generated buffer (no display advance). Fired by ``/wake``
+  to replenish after a pop so steady-state depth stays at the target.
+
+- **Admin API: ``DELETE /admin/generated/<history_id>``** — skip a
+  buffered render. The marker is dropped from the buffer so the panel
+  never auto-advances to it; the ``history/<id>/`` archive stays
+  intact so the operator can still pin it later via **Show this now**.
+  Same cookie-gated session as the rest of ``/admin/*``.
+
+- **Read API: ``GET /generated``** — public FIFO listing of the
+  buffered markers. Each item is a tiny JSON with ``history_id``,
+  ``queued_at``, ``image_sha256``, ``image_bytes``, ``source`` —
+  enough for the SPA Queue tab to render a tile (thumbnail comes from
+  ``history/<id>/processed.bmp``).
+
+- **SPA Queue tab** now shows two sections: **Up next on the device**
+  (the generated buffer, with thumbnails) and **Pending prompts** (the
+  prompt queue). Admin sees per-row **Show now** / **Skip** buttons on
+  the generated section.
+
+### Changed
+- **``POST /admin/show`` now also drops the matching generated-queue
+  marker** if one exists for the history id. "Show this now" on a
+  buffered item both promotes it to current AND removes the duplicate
+  from the up-next list. History remains untouched.
+
+- **Cron no longer touches ``current/manifest.json``.** Display
+  advancement happens entirely on ``/wake`` (timer wake or button
+  wake). Cron's job is now strictly buffer-maintenance: top up the
+  prompt queue via ``expand_topic`` and refill the generated buffer
+  all the way to ``TARGET_GENERATED_QUEUE_LENGTH`` (the buffer-refill
+  loop tops the prompt queue back up inline whenever it runs dry, so
+  even a fully-drained buffer fills in one tick). The admin **Now** /
+  **Run** overrides still bypass the buffer and set current directly
+  (since the operator explicitly chose to display *this* thing right
+  now).
+
+- **Generator Lambda timeout raised 5 min → 15 min.** Cron's worst
+  case is the cold-start fill (~10 renders × 55 s ≈ 9 min). Steady-
+  state is 0–1 renders per tick.
+
+- **Pipeline split.** ``einkgen.core.pipeline`` now exposes both
+  ``buffer_item(item)`` (archive + enqueue marker, cron path) and
+  ``publish_item(item)`` (archive + set as current, admin path).
+  ``process_item`` remains as an alias for ``publish_item`` for
+  back-compat with the older test suite. The shared front half
+  (generate → convert → source-dict assembly) is in ``_render``.
+
+- **Firmware now hits ``POST /wake`` on every wake** before fetching
+  the manifest. The current sha (read from NVS) is sent in the body
+  so the server can debounce. A failed ``/wake`` is logged and
+  ignored — the existing manifest-fetch path takes over, so flaky
+  networks don't brick the panel.
+
+### Infra (CDK)
+- **device-status Lambda** gets new IAM perms: ``s3:GetObject`` /
+  ``s3:PutObject`` on ``current/*``, ``s3:GetObject`` on
+  ``history/*``, ``s3:GetObject`` / ``s3:DeleteObject`` on
+  ``generated/*`` (plus ``s3:ListBucket`` scoped to ``generated/*``),
+  ``cloudfront:CreateInvalidation``, and ``lambda:InvokeFunction`` on
+  the generator. New env var
+  ``EINKGEN_GENERATOR_FUNCTION_NAME`` so ``/wake`` can fire
+  ``render_one``. Timeout raised from 10 s → 20 s to cover the advance
+  path's serial S3 + CloudFront calls.
+- **HTTP API** gets a second route ``POST /wake`` alongside the
+  existing ``POST /``. Both hit the same Lambda; dispatch is by
+  ``rawPath`` inside the handler.
+- **generator Lambda** gets write access to ``generated/*`` so the
+  cron path can enqueue markers.
+- **admin Lambda** gets ``s3:GetObject``/``s3:DeleteObject`` on
+  ``generated/*`` (skip + show-removes-marker), plus ``ListBucket``
+  scoped to include ``generated/*``.
+
+### Storage
+- New prefix ``s3://<bucket>/generated/`` for the buffer markers.
+  Filtered out by both the prompt-queue listing and the failure
+  breadcrumb listing — distinct purpose, distinct prefix.
+
 ## [0.5.1.0] - 2026-05-17
 
 ### Changed

@@ -62,6 +62,75 @@ available for serial error diffusion.
 runtime; OpenAI is the only thing worth optimising and we can't (it's a network
 call). Revisit only if we drop OpenAI for a local model.
 
+## Generated queue / /wake
+
+### Embed manifest fields in `/wake` response to skip the stale CloudFront fetch
+**Priority:** P1
+**Source:** 0.6.0.0 adversarial review
+
+After a `/wake` advance the device immediately `GET`s `current/manifest.json`, but
+CloudFront caches that path with `defaultTtl: 60s`/`maxTtl: 300s`
+([infra/lib/cloudfront.ts](infra/lib/cloudfront.ts)) and the in-flight
+`CreateInvalidation` typically takes 5–60 s to propagate. The fetch almost always
+returns the pre-advance manifest, the device sees its own `storedHash` and skips
+the redraw, and the panel doesn't update until the next wake cycle (≤ 1 h with
+the firmware's `SLEEP_MAX_SECONDS` cap) when the cache has expired and the legacy
+sha-mismatch path catches up. The system self-heals but the wake-button UX is
+"press → nothing → wait 30 min → image changes".
+
+Fix: extend the `/wake` 200 response to include `image_url`, `image_sha256`,
+`image_bytes`, and `next_check_after` for `action=advance`. Firmware uses these
+directly (skip the second `GET manifest.json`) when the response carries them.
+Falls back to the legacy manifest-fetch path when fields are absent (older
+server) or `action != advance`.
+
+### Submissions via email / CLI shouldn't disappear behind the buffer
+**Priority:** P2
+**Source:** 0.6.0.0 adversarial review (UX regression)
+
+Pre-0.6.0.0, an inbound email or `einkgen queue prompt` submission rendered on
+the next cron tick (≤ 30 min). Now those submissions land on the prompt queue
+and only get buffered into `generated/` after cron drains 10 items ahead of them
+— so the user-visible latency is 10 × 30 min = ~5 h. Admin **Now** / **Run**
+already bypass the buffer; we want the same affordance for email and CLI when
+the submitter is signaling "show this soon".
+
+Fix options: (a) email/CLI both grow an `at="now"` knob that fires `render_now`
+after enqueue (`einkgen queue prompt "<text>" --now`, email subject like
+`Subject: NOW <prompt>`), or (b) cron preferentially drains non-`source="cron"`
+items into the buffer first so user-submitted prompts surface within one cron
+tick.
+
+### Concurrent `/wake` calls race on `current/manifest.json` version increment
+**Priority:** P3
+**Source:** 0.6.0.0 security review (race condition)
+
+`set_current_from_history` is now called from `/wake` (concurrency = 5) plus
+admin `/admin/show` plus the generator's `publish_item` path. Two concurrent
+calls both read `previous_version = N`, both write `N+1` — classic lost-update
+on the manifest's `version` field. Not a correctness issue for the device (it
+keys off `image_sha256`, not `version`) but the monotonicity property
+documented in ARCHITECTURE §7 doesn't hold.
+
+Fix: switch `current/manifest.json` writes to use S3 `If-Match`/`If-None-Match`
+conditional puts and retry on collision, OR funnel all current-manifest writes
+through the generator Lambda (concurrency = 1).
+
+### Empty-prompt-library deadlock leaves buffer drained with no signal
+**Priority:** P3
+**Source:** 0.6.0.0 adversarial review
+
+If the operator clears the prompt library from the Admin tab AND `expand_topic`
+fails (text-LLM down, OpenAI outage) so the raw-topic fallback also can't enqueue
+anything, the cron buffer-refill loop exits without rendering. The buffer drains
+over a few `/wake` calls and stays empty; `/wake` returns `queue_empty` forever
+with no operator-visible alert. Pre-0.6.0.0 the equivalent was "cron didn't
+render", which had the same outcome but was less prominent because there was no
+buffer-depth concept.
+
+Fix: a CloudWatch alarm on generated-queue depth = 0 for >2 cron ticks. Or have
+the SPA Admin tab surface "buffer empty, library may need topics".
+
 ## Read API
 
 ### Multi-device `/devices` endpoint
@@ -84,14 +153,17 @@ tiers (Claude structured + Claude adversarial subagent). Run `npm install -g
 challenge on future releases.
 
 ### Daily OpenAI cost cap
-**Priority:** P3
-**Source:** PLAN §3 + phase 2 adversarial review
+**Priority:** P2 *(was P3 — bumped in 0.6.0.0 because `POST /wake` is a new
+device-token-authenticated public spend trigger; a leaked token can drive
+sustained renders bounded only by generator concurrency = 1 + the sha-debounce
+which only holds within a single device's wake cycle)*
+**Source:** PLAN §3 + phase 2 adversarial review + 0.6.0.0 security review
 
 No daily $ cap on OpenAI spend. `retryAttempts: 0` on the generator Lambda + the
 EventBridge target caps retry-amplification. Cost-runaway from a high-volume
-legitimate queue is bounded only by reserved concurrency = 1 + the 2h cron
-interval. Add a CloudWatch alarm on the generator's invocation count + OpenAI
-usage when convenient.
+legitimate queue or a leaked device token is bounded only by reserved concurrency
+= 1 + the cron interval. Add a CloudWatch alarm on the generator's invocation
+count + OpenAI usage when convenient.
 
 ### CloudFront invalidation `CallerReference` collisions
 **Priority:** P4

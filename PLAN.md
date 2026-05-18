@@ -106,17 +106,18 @@ future work.
 14. **(Future) Text/dashboard render mode** — replace the model call with
     a structured renderer (weather/calendar/etc.); same publish path.
 15. **(Future) OTA firmware updates** via `firmware/`.
-16. **(Future) Wake-button → render-on-demand.** Repurpose the Inkplate
-    wake button: on press, hit a small endpoint that (a) reports the
-    SHA-256 the panel currently shows, (b) the server compares against
-    `current/manifest.json`, and (c) if equal, async-invokes the
-    generator (`{"action":"render_now"}`) to pop the next queue head;
-    the firmware then re-polls the manifest a minute later. The queue
-    redesign in [0.5.0.0] already supports this end-to-end — the only
-    missing piece is the firmware button handler + a `POST /wake` route
-    that asks "is what's drawn still current?" and conditionally fires
-    `render_now`. Drives the queue forward at human-trigger pace
-    without changing the cron cadence.
+16. **Wake-button → instant advance** (landed in [0.6.0.0]).
+    The implementation diverged from the original sketch: instead of
+    firing `render_now` and asking the firmware to poll back a minute
+    later, `POST /wake` now pops the head of a pre-rendered buffer
+    (the new generated queue at `generated/<…>.json`) and re-points
+    `current/manifest.json` at it synchronously. The firmware's next
+    manifest fetch sees the new sha and redraws on the same wake. Cron
+    pre-fills the buffer to depth 10 so a button press never has to
+    block on a model call. A `render_one` async-invoke replenishes
+    after each pop. The sha-mismatch branch debounces rapid presses
+    (no pop until the device confirms it drew the previous one). See
+    ARCHITECTURE §4b–§4c + CHANGELOG [0.6.0.0].
 
 ---
 
@@ -132,8 +133,10 @@ future work.
 | Bucket access | `current/*` and `web/*` public via CloudFront; `history/*` public for `processed.bmp` only (viewer-request function); rest accessed only via Lambdas |
 | Device cadence | sleeps `min(next_check_after, SLEEP_MAX_SECONDS)`; manifest hint = next device-poll tick + 5 min buffer |
 | Queue policy | two-priority buffer; key prefix `queue/0-…` (top) drains before `queue/1-…` (bottom); FIFO within each; no in-place mutation of objects. Reordering of existing items isn't supported — pick `at="top"` or `at="bottom"` at enqueue time. |
-| Queue triggers | EventBridge `rate(30 minutes)` (cron, tops up + renders head) and `lambda.invoke` from admin-api with `{"action":"render_now"}` (Now button on a new submission) or `{"action":"render_item","item_id":...}` (per-row Run button). No S3 ObjectCreated drain since [0.5.0.0]. Reserved concurrency = 1 keeps them serial. |
-| Cron top-up | Each tick refills the queue to ≥ 5 pending items by expanding random library topics via `generate.expand_topic` (text LLM, default `gpt-5-mini`). |
+| Queue triggers | EventBridge `rate(30 minutes)` (cron — tops up prompt queue and buffers up to `MAX_RENDERS_PER_TICK` into the generated queue), and `lambda.invoke` with `{"action":"render_one"}` (`/wake` replenish), `{"action":"render_now"}` (admin Now), or `{"action":"render_item","item_id":...}` (admin Run). No S3 ObjectCreated drain since [0.5.0.0]. Reserved concurrency = 1 keeps them serial. |
+| Cron top-up | Each tick (a) refills the prompt queue to ≥ 5 items via `generate.expand_topic` (text LLM, default `gpt-5-mini`), then (b) renders up to `MAX_RENDERS_PER_TICK = 2` items from the prompt queue into the generated buffer until the generated buffer reaches its target of 10. |
+| Generated queue | New in [0.6.0.0]. Pre-rendered buffer between the prompt queue and history. Each marker at `generated/<iso_ts>-<history_id>.json` points at an existing `history/<id>/` archive. `/wake` pops the head; admin can skip (drop marker) or "Show this now" (set current + drop marker). |
+| Display advance | `POST /wake` on the device-status Lambda. Sha-debounced advance: pop head of generated queue, `set_current_from_history`, fire `render_one` async. Cron does NOT touch `current/`. Admin **Now** / **Run** bypass the buffer for operator-driven immediacy. |
 | Web app | read-only, React + Vite, three tabs (Queue / History / Device) |
 | User input | CLI only in v1; text/email deferred behind a future channel-specific Lambda |
 | Lambdas | 3 total: generator (writes), read-api (public reads), device-status (write status only) |
