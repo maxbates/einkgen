@@ -11,21 +11,31 @@ Two POST routes, both shared-secret authenticated via ``X-Device-Token``:
   ``{"current_sha256": "<hex>"}`` reports what the panel is currently
   showing. The handler compares against ``current/manifest.json``:
 
-      * sha mismatch (or no manifest yet)  → ``{"action":"redraw"}``
-        the device just hasn't drawn the latest manifest yet, or this
-        is a fresh deploy. Tell it to fetch + draw the existing
-        manifest. We do NOT pop the generated queue here — debouncing
-        falls naturally out of this check, so rapid presses don't
-        burn through the buffer.
+      * sha mismatch  → ``{"action":"redraw", ...manifest fields}``.
+        The device just hasn't drawn the latest manifest yet. We do
+        NOT pop the generated queue here — debouncing falls naturally
+        out of this check, so rapid presses don't burn through the
+        buffer.
 
       * sha match + generated queue non-empty → pop the head marker,
         re-point ``current/manifest.json`` at that history frame,
         async-invoke the generator with ``render_one`` to backfill,
-        respond ``{"action":"advance","manifest_sha256":...}``.
+        respond ``{"action":"advance", ...manifest fields}``.
 
-      * sha match + generated queue empty → ``{"action":"queue_empty"}``.
-        Don't burn a synchronous OpenAI call to invent a fresh frame —
-        the next cron tick will refill the buffer.
+      * sha match (or no manifest yet) + generated queue empty →
+        ``{"action":"queue_empty"}``. Don't burn a synchronous OpenAI
+        call to invent a fresh frame — the next cron tick will refill
+        the buffer. No manifest fields needed; the firmware keeps
+        drawing what it already has.
+
+  Advance and redraw responses embed ``image_url``, ``image_sha256``,
+  ``image_bytes`` and ``next_check_after`` so the firmware can skip
+  the follow-up ``GET current/manifest.json`` entirely. CloudFront
+  caches that path for 60–300 s and a fresh
+  ``CreateInvalidation`` typically takes 5–60 s to propagate, so
+  fetching it right after a server-side advance reliably returns the
+  pre-advance manifest. Embedding the fields collapses the wake
+  round-trip to one POST and one image GET.
 
 Auth
 ----
@@ -101,6 +111,7 @@ from botocore.exceptions import ClientError
 
 from einkgen.core import generated_queue, publish
 from einkgen.core import s3 as s3mod
+from einkgen.core.manifest import Manifest
 
 log = logging.getLogger(__name__)
 
@@ -353,8 +364,8 @@ def _handle_status(event: dict[str, Any]) -> dict[str, Any]:
 _MISSING_OBJECT_CODES = {"NoSuchKey", "NotFound", "404"}
 
 
-def _read_current_manifest_sha() -> str | None:
-    """Return ``image_sha256`` from ``current/manifest.json`` or None.
+def _read_current_manifest() -> Manifest | None:
+    """Return the parsed ``current/manifest.json`` or None.
 
     None means the manifest doesn't exist yet (fresh deploy) or is
     malformed — both treated as "device hasn't seen anything yet, so any
@@ -368,13 +379,25 @@ def _read_current_manifest_sha() -> str | None:
             return None
         raise
     try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
+        return Manifest.from_json(body)
+    except (json.JSONDecodeError, ValueError, KeyError):
         return None
-    sha = data.get("image_sha256")
-    if isinstance(sha, str) and sha:
-        return sha
-    return None
+
+
+def _manifest_fields(manifest: Manifest) -> dict[str, Any]:
+    """Subset of manifest fields the firmware needs to skip a stale fetch.
+
+    Echoed in the ``/wake`` response so the firmware can feed them
+    straight into ``downloadVerifyAndDraw`` without a follow-up
+    ``GET current/manifest.json`` that would hit CloudFront's 60–300 s
+    cache and return the pre-advance manifest.
+    """
+    return {
+        "image_url": manifest.image_url,
+        "image_sha256": manifest.image_sha256,
+        "image_bytes": manifest.image_bytes,
+        "next_check_after": manifest.next_check_after,
+    }
 
 
 def _fire_replenish() -> None:
@@ -444,18 +467,23 @@ def _handle_wake(event: dict[str, Any]) -> dict[str, Any]:
             {"error": "bad_request", "detail": "current_sha256 must be hex-64"},
         )
 
-    manifest_sha = _read_current_manifest_sha()
+    current_manifest = _read_current_manifest()
+    manifest_sha = current_manifest.image_sha256 if current_manifest else None
 
     # Branch 1: device hasn't drawn the current manifest yet. Tell it to
     # redraw the existing manifest rather than popping more off the buffer
     # — this is what makes rapid wake presses a no-op until the device
-    # actually shows the previous pop.
-    if manifest_sha is not None and reported_sha != manifest_sha:
+    # actually shows the previous pop. We embed the manifest fields so
+    # the firmware can skip the follow-up GET (CloudFront caches
+    # current/manifest.json for 60–300 s and an in-flight invalidation
+    # typically takes 5–60 s to propagate).
+    if current_manifest is not None and reported_sha != manifest_sha:
         return _response(
             200,
             {
                 "action": "redraw",
                 "manifest_sha256": manifest_sha,
+                **_manifest_fields(current_manifest),
             },
         )
 
@@ -515,5 +543,6 @@ def _handle_wake(event: dict[str, Any]) -> dict[str, Any]:
             "action": "advance",
             "manifest_sha256": new_manifest.image_sha256,
             "history_id": head.history_id,
+            **_manifest_fields(new_manifest),
         },
     )
