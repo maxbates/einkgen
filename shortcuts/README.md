@@ -14,6 +14,23 @@ Both end the same way:
 > Inkplate wakes (default: 1 hour, or press the **WAKE** button on the
 > device), it shows the new image.
 
+### Skipping the buffer with a NOW trigger
+
+Since 0.6.1.0, both paths support a "render this now" override that
+bypasses the ~10-deep pre-rendered buffer (otherwise an email or HTTP
+submission waits behind everything else cron has queued up):
+
+- **Path A (email):** prefix the subject with `NOW `, `NOW:`, or
+  `[NOW]` (case-insensitive). The trigger word is stripped from the
+  prompt before generation.
+- **Path B (HTTP):** add `"at": "now"` to the JSON body of the
+  `/admin/queue/prompt` request.
+
+Without the trigger, submissions land at the bottom of the queue and
+render on the next cron tick after the buffer drains — usually fine for
+"set it and forget it" but slow if you wanted to see it on the panel
+right away.
+
 These instructions describe the **iOS 17+ Shortcuts app**. Action names
 shift slightly between iOS versions; if the exact label is gone, the
 capability still exists — search the action picker for the keyword in
@@ -56,7 +73,13 @@ In the **Shortcuts** app:
    - **To:** any local-part `@<your-inbound-domain>` works (the receipt
      rule catches every address). For example: `prompt@einkgen.link`.
    - **From:** the address you added to the allowlist.
-   - **Subject:** leave blank, or pin a fixed prefix like `einkgen`.
+   - **Subject:** leave blank, or pin a fixed prefix like `einkgen`. To
+     always skip the buffer, pin the subject to `NOW` — the trigger
+     gets stripped before the prompt reaches gpt-image-2 (see
+     "Skipping the buffer" above). Build a second shortcut named
+     **einkgen now** with the same actions but a `NOW` subject if you
+     want one-tap urgent submissions while keeping the default path
+     for batch submissions.
    - **Body:** tap the **Email** field → select **Dictated Text** from
      the variable picker.
    - Expand the action and switch **Show When Run** → **off**, so Siri
@@ -171,7 +194,11 @@ In the **Shortcuts** app:
    **Cookie**.
 8. **Dictate Text** action — **Stop Listening: On Tap**.
 9. **Dictionary** action — key `prompt`, value the **Dictated Text**
-   variable. Rename the output to **PromptBody**.
+   variable. (Add a second key `at` with value `now` if you want this
+   shortcut to always bypass the buffer — see "Skipping the buffer"
+   above. Without the `at` key, items land at the bottom of the queue
+   and render on the next cron tick after the buffer drains.) Rename
+   the output to **PromptBody**.
 10. **Get Contents of URL** action:
     - URL: `https://<Domain>/admin/queue/prompt`
     - **Method:** POST
