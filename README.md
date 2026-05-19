@@ -74,6 +74,7 @@ tests/          pytest suite, moto-backed
 
 ## Status
 
-v0.2.0.1 — first real deploy is live (see [CHANGELOG.md](CHANGELOG.md)).
-The Inkplate firmware path is implemented and verified end-to-end via the
-device-status API; the physical device hasn't shipped yet.
+v0.6.5.0 — live at <https://einkgen.link/>. See [CHANGELOG.md](CHANGELOG.md)
+for what landed when. The pipeline runs every 30 minutes by default and
+the wake-button advance path is in place. The physical Inkplate is
+verified end-to-end against the device-status API.
