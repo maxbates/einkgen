@@ -423,7 +423,11 @@ def test_wake_malformed_sha_returns_400(s3_bucket, secret):
 
 
 def test_wake_redraw_when_device_sha_differs(s3_bucket, secret, monkeypatch):
-    """Mismatch → tell device to redraw existing manifest; don't pop buffer."""
+    """Mismatch → tell device to redraw existing manifest; don't pop buffer.
+
+    The response embeds the current manifest fields so the firmware can
+    skip the follow-up GET that would otherwise hit CloudFront's cache.
+    """
     _seed_current_manifest(s3_bucket, sha=SHA_CURRENT)
     _enqueue_marker("01HHHHHHHHHHHHHHHHHHHHHHHH")
     invokes = _stub_replenish(monkeypatch)
@@ -435,6 +439,11 @@ def test_wake_redraw_when_device_sha_differs(s3_bucket, secret, monkeypatch):
     payload = json.loads(resp["body"])
     assert payload["action"] == "redraw"
     assert payload["manifest_sha256"] == SHA_CURRENT
+    # Embedded manifest fields — firmware uses these to skip the GET.
+    assert payload["image_url"] == "https://cdn.example.com/current/image.bmp"
+    assert payload["image_sha256"] == SHA_CURRENT
+    assert payload["image_bytes"] == 12345
+    assert payload["next_check_after"] == "2026-05-18T00:30:00Z"
     # Buffer untouched.
     assert generated_queue.count() == 1
     # No replenish fired — we didn't advance.
@@ -442,7 +451,12 @@ def test_wake_redraw_when_device_sha_differs(s3_bucket, secret, monkeypatch):
 
 
 def test_wake_advance_pops_head_and_sets_current(s3_bucket, secret, monkeypatch):
-    """Match + non-empty buffer → pop, set_current_from_history, fire replenish."""
+    """Match + non-empty buffer → pop, set_current_from_history, fire replenish.
+
+    The response embeds the freshly-published manifest fields so the
+    firmware can skip the follow-up GET (which would hit a CloudFront
+    cache still pointing at the pre-advance manifest).
+    """
     _seed_current_manifest(s3_bucket, sha=SHA_CURRENT)
     history_id = "01HHHHHHHHHHHHHHHHHHHHHHHH"
     history_sha = "1" + "a" * 63
@@ -458,6 +472,11 @@ def test_wake_advance_pops_head_and_sets_current(s3_bucket, secret, monkeypatch)
     assert payload["action"] == "advance"
     assert payload["history_id"] == history_id
     assert payload["manifest_sha256"] == history_sha
+    # Embedded manifest fields point at the just-promoted history frame.
+    assert payload["image_url"].endswith(f"/history/{history_id}/processed.bmp")
+    assert payload["image_sha256"] == history_sha
+    assert payload["image_bytes"] == 999
+    assert ISO8601_UTC.match(payload["next_check_after"])
     # Marker was finalized; buffer is empty now.
     assert generated_queue.empty()
     # Replenish fired exactly once.
@@ -470,10 +489,18 @@ def test_wake_advance_pops_head_and_sets_current(s3_bucket, secret, monkeypatch)
     )
     assert new_manifest["image_sha256"] == history_sha
     assert new_manifest["source"]["replayed_from"] == history_id
+    # The embedded fields agree with what landed in S3.
+    assert payload["image_url"] == new_manifest["image_url"]
+    assert payload["next_check_after"] == new_manifest["next_check_after"]
 
 
 def test_wake_queue_empty_when_buffer_drained(s3_bucket, secret, monkeypatch):
-    """Match + empty buffer → noop, don't burn a fresh OpenAI call."""
+    """Match + empty buffer → noop, don't burn a fresh OpenAI call.
+
+    No manifest fields are embedded — the firmware keeps drawing what
+    it already has and falls back to fetchManifest on the next wake
+    (where the cache will have caught up).
+    """
     _seed_current_manifest(s3_bucket, sha=SHA_CURRENT)
     invokes = _stub_replenish(monkeypatch)
 
@@ -484,6 +511,10 @@ def test_wake_queue_empty_when_buffer_drained(s3_bucket, secret, monkeypatch):
     payload = json.loads(resp["body"])
     assert payload["action"] == "queue_empty"
     assert payload["manifest_sha256"] == SHA_CURRENT
+    assert "image_url" not in payload
+    assert "image_sha256" not in payload
+    assert "image_bytes" not in payload
+    assert "next_check_after" not in payload
     assert invokes == []
 
 
@@ -503,6 +534,42 @@ def test_wake_first_deploy_no_current_manifest_advances(s3_bucket, secret, monke
     payload = json.loads(resp["body"])
     assert payload["action"] == "advance"
     assert payload["history_id"] == history_id
+    # Embedded manifest fields are present on the fresh-deploy advance.
+    assert payload["image_url"].endswith(f"/history/{history_id}/processed.bmp")
+    assert payload["image_sha256"] == history_sha
+    assert payload["image_bytes"] == 999
+    assert ISO8601_UTC.match(payload["next_check_after"])
+    assert generated_queue.empty()
+    assert len(invokes) == 1
+
+
+def test_wake_advance_when_current_manifest_malformed(s3_bucket, secret, monkeypatch):
+    """Garbage at current/manifest.json → treated as missing → advance branch.
+
+    Same UX as a fresh deploy. Guards against a malformed manifest
+    (mid-write crash, partial S3 put) stranding the device in the
+    redraw branch.
+    """
+    s3_bucket.put_object(
+        Bucket=TEST_BUCKET,
+        Key=publish.CURRENT_MANIFEST_KEY,
+        Body=b"this is not json",
+    )
+    history_id = "01HMALFORMED01HMALFORMED01"
+    history_sha = "3" + "c" * 63
+    _seed_history(s3_bucket, history_id, sha=history_sha)
+    _enqueue_marker(history_id, sha=history_sha)
+    invokes = _stub_replenish(monkeypatch)
+
+    body = json.dumps({"current_sha256": SHA_DEVICE_STALE})
+    resp = device_status.handler(_wake_event(body))
+
+    assert resp["statusCode"] == 200
+    payload = json.loads(resp["body"])
+    assert payload["action"] == "advance"
+    assert payload["history_id"] == history_id
+    assert payload["image_sha256"] == history_sha
+    assert payload["image_bytes"] == 999
     assert generated_queue.empty()
     assert len(invokes) == 1
 
@@ -521,6 +588,9 @@ def test_wake_marker_pointing_at_missing_history_drops_marker(
     assert resp["statusCode"] == 200
     payload = json.loads(resp["body"])
     assert payload["action"] == "queue_empty"
+    # Falls through the queue_empty branch — no embedded manifest.
+    assert "image_url" not in payload
+    assert "image_sha256" not in payload
     # Marker was dropped so we don't hit the same fault on the next wake.
     assert generated_queue.empty()
     # No replenish fired — we didn't actually advance.

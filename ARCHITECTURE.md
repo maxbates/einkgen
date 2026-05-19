@@ -380,13 +380,25 @@ The handler reads `current/manifest.json` and compares its
 | --- | --- | --- |
 | match (or no manifest yet) | non-empty | pop head, `set_current_from_history(history_id)`, async-invoke `render_one`, respond `advance` |
 | match (or no manifest yet) | empty | respond `queue_empty` — wait for next cron tick |
-| mismatch | (irrelevant) | respond `redraw` — device hasn't drawn the latest yet, just refetch manifest |
+| mismatch | (irrelevant) | respond `redraw` — device hasn't drawn the latest yet |
 
 The mismatch branch is the **debounce**: rapid wake presses don't pop
 multiple items because the second press still reports the old sha.
 After the device fetches the new manifest and updates NVS, the next
 wake matches and can advance again. Single-device deployments
 naturally serialise this.
+
+Both `advance` and `redraw` responses embed the manifest fields the
+firmware needs to draw the next image — `image_url`, `image_sha256`,
+`image_bytes`, `next_check_after`. Firmware feeds them straight into
+the image GET so it never re-fetches `current/manifest.json` after a
+`/wake` round-trip. This sidesteps CloudFront's 60–300 s cache on
+that path (which historically returned the pre-advance manifest after
+a `set_current_from_history` write, making the panel slow to update
+after a wake-button press). `queue_empty` carries no manifest fields
+— the firmware keeps drawing what it already has. A server rollback
+(no embedded fields) drops the firmware back to the legacy
+`fetchManifest` path automatically.
 
 Concurrency: two simultaneous `/wake` calls (timer + button at the
 same moment) can both reach the advance branch. Both write a new

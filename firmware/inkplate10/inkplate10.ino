@@ -5,12 +5,17 @@
 //   2. POST {current_sha256} to the device-status Lambda's /wake route.
 //      The server compares the reported sha against current/manifest.json.
 //      If the device has caught up, /wake pops the generated-queue head
-//      and re-points current at it (the next manifest fetch sees the new
-//      sha). If the device hasn't drawn the latest yet, /wake is a no-op
-//      and returns redraw. /wake is best-effort: any error is logged and
-//      the existing manifest-fetch path runs anyway, so a flaky network
-//      degrades to the legacy redraw-if-changed behavior.
-//   3. GET manifest.json from CloudFront.
+//      and re-points current at it. If the device hasn't drawn the
+//      latest yet, /wake is a no-op and returns redraw. Both advance
+//      and redraw responses carry the new manifest fields (image_url,
+//      image_sha256, image_bytes, next_check_after) so we can feed them
+//      straight into the image GET without a follow-up manifest fetch —
+//      CloudFront caches current/manifest.json for 60–300 s and would
+//      otherwise return the pre-advance manifest. /wake is best-effort:
+//      any error is logged and the legacy manifest-fetch path runs as a
+//      fallback, so a flaky network or a server rollback degrades cleanly.
+//   3. If /wake didn't return manifest fields (queue_empty or HTTP error),
+//      GET manifest.json from CloudFront.
 //   4. If image_sha256 differs from NVS, OR battery has crossed the
 //      low-battery threshold since last draw, redraw: drawBitmapFromBuffer()
 //      + (optionally) drawBatteryOverlay() + display() + persist.
@@ -409,15 +414,37 @@ static String wakeUrl()
     return u;
 }
 
+// Manifest fields embedded in the /wake response (since v0.6.1.0).
+// `hasManifest` is true only when the server returned all four image
+// fields — i.e. action=advance or action=redraw on a fresh server.
+// queue_empty, HTTP errors, and older servers all leave hasManifest
+// false and the caller falls back to fetchManifest.
+struct WakeResult {
+    bool   hasManifest;
+    String action;           // "advance" | "redraw" | "queue_empty" | ""
+    String imageUrl;
+    String imageHash;        // image_sha256
+    int    imageBytes;
+    String nextCheckAfter;   // ISO 8601 UTC
+};
+
 // Best-effort wake POST. Tells the server "the panel is currently
-// showing <sha>", which lets it pop the next pre-rendered image off the
-// generated queue (if the device is caught up) or send back a "redraw"
-// hint (if not). Returns true on HTTP 200 — but the caller never branches
-// on this: the subsequent manifest fetch is the authoritative source of
-// truth and a failed /wake just degrades to the legacy refresh-if-changed
-// path. Logs the parsed action for serial debugging.
-static bool postWake(const char *current_hash)
+// showing <sha>". On HTTP 200 the response carries `action` and
+// (for advance/redraw) the manifest fields the firmware would
+// otherwise have to fetch from CloudFront — `out` is populated so
+// the caller can skip the follow-up GET. Returns true on HTTP 200;
+// the caller never hard-fails on /wake — a failed call just means
+// `out.hasManifest = false` and we drop back to the legacy
+// fetchManifest path.
+static bool postWake(const char *current_hash, WakeResult &out)
 {
+    out.hasManifest    = false;
+    out.action         = "";
+    out.imageUrl       = "";
+    out.imageHash      = "";
+    out.imageBytes     = 0;
+    out.nextCheckAfter = "";
+
     String url = wakeUrl();
     Serial.printf("[wake] POST %s\n", url.c_str());
     WiFiClientSecure client;
@@ -448,11 +475,29 @@ static bool postWake(const char *current_hash)
         http.end();
         return false;
     }
-    // Best-effort response logging — we don't act on the body, but it
-    // makes serial debugging much easier ("did the server advance?").
     String resp = http.getString();
     Serial.printf("[wake] OK %s\n", resp.c_str());
     http.end();
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, resp);
+    if (err) {
+        Serial.printf("[wake] response parse error: %s\n", err.c_str());
+        return true;  // HTTP succeeded — caller falls back to fetchManifest.
+    }
+    const char *action      = doc["action"]           | "";
+    const char *imageUrl    = doc["image_url"]        | "";
+    const char *imageHash   = doc["image_sha256"]     | "";
+    int         imageBytes  = doc["image_bytes"]      | 0;
+    const char *nextCheck   = doc["next_check_after"] | "";
+    out.action = action;
+    if (imageUrl[0] && imageHash[0] && imageBytes > 0) {
+        out.imageUrl       = imageUrl;
+        out.imageHash      = imageHash;
+        out.imageBytes     = imageBytes;
+        out.nextCheckAfter = nextCheck;
+        out.hasManifest    = true;
+    }
     return true;
 }
 
@@ -518,45 +563,66 @@ void setup()
 
     // Hit /wake BEFORE fetching the manifest. The server uses the sha
     // we report to decide whether to pop the next pre-rendered image
-    // (advance) or just leave the manifest as-is. The subsequent
-    // manifest fetch sees whatever /wake decided. A failed /wake call
-    // is OK — the manifest fetch path still works exactly as before.
+    // (advance) or just leave the manifest as-is. On HTTP 200 with
+    // action=advance/redraw, the response embeds image_url +
+    // image_sha256 + image_bytes + next_check_after so we can skip the
+    // follow-up GET current/manifest.json (which would hit CloudFront's
+    // 60–300 s cache and reliably return the pre-advance manifest after
+    // an advance). A failed /wake or a queue_empty response drops us
+    // back to the legacy fetchManifest path so a server rollback
+    // degrades cleanly.
     Preferences nvs;
     nvs.begin(NVS_NAMESPACE, /*readOnly=*/false);
     String storedHash = nvs.getString(NVS_KEY_HASH, "");
     bool   wasLow     = nvs.getBool(NVS_KEY_BATT_LOW, false);
 
-    (void)postWake(storedHash.c_str());
+    WakeResult wake;
+    (void)postWake(storedHash.c_str(), wake);
 
-    String body;
-    if (!fetchManifest(body)) {
-        nvs.end();
-        deepSleepFor(SLEEP_FALLBACK_SECONDS);
-        return;
+    // Manifest fields we'll use below. Either come from the /wake
+    // response (preferred — fresh and cache-bypassing) or from a
+    // follow-up fetchManifest call (legacy fallback).
+    String imageUrl;
+    String imageHash;
+    String nextCheckAfter;
+
+    if (wake.hasManifest && wake.action != "queue_empty") {
+        Serial.printf("[wake] using embedded manifest from action=%s\n",
+                      wake.action.c_str());
+        imageUrl       = wake.imageUrl;
+        imageHash      = wake.imageHash;
+        nextCheckAfter = wake.nextCheckAfter;
+    } else {
+        Serial.printf("[wake] no embedded manifest (action=%s) — falling back to GET\n",
+                      wake.action.c_str());
+        String body;
+        if (!fetchManifest(body)) {
+            nvs.end();
+            deepSleepFor(SLEEP_FALLBACK_SECONDS);
+            return;
+        }
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, body);
+        if (err) {
+            Serial.printf("[manifest] parse error: %s\n", err.c_str());
+            nvs.end();
+            deepSleepFor(SLEEP_FALLBACK_SECONDS);
+            return;
+        }
+        imageUrl       = (const char *)(doc["image_url"]        | "");
+        imageHash      = (const char *)(doc["image_sha256"]     | "");
+        nextCheckAfter = (const char *)(doc["next_check_after"] | "");
     }
 
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body);
-    if (err) {
-        Serial.printf("[manifest] parse error: %s\n", err.c_str());
-        nvs.end();
-        deepSleepFor(SLEEP_FALLBACK_SECONDS);
-        return;
-    }
-
-    const char *imageUrl       = doc["image_url"]        | "";
-    const char *imageHash      = doc["image_sha256"]     | "";
-    const char *nextCheckAfter = doc["next_check_after"] | "";
-
-    if (!imageUrl[0] || !imageHash[0]) {
+    if (imageUrl.length() == 0 || imageHash.length() == 0) {
         Serial.println("[manifest] missing image_url or image_sha256");
         nvs.end();
         deepSleepFor(SLEEP_FALLBACK_SECONDS);
         return;
     }
-    Serial.printf("[manifest] image_url=%s\n", imageUrl);
-    Serial.printf("[manifest] image_sha256=%s\n", imageHash);
-    Serial.printf("[manifest] next_check_after=%s\n", nextCheckAfter);
+    Serial.printf("[manifest] image_url=%s\n", imageUrl.c_str());
+    Serial.printf("[manifest] image_sha256=%s\n", imageHash.c_str());
+    Serial.printf("[manifest] next_check_after=%s\n", nextCheckAfter.c_str());
 
     // Read battery before deciding whether to redraw, so we can also trigger
     // a refresh when charge crosses the low-battery threshold (the overlay
@@ -571,7 +637,7 @@ void setup()
     bool   battChanged = (isLow != wasLow);
     bool   needsRedraw = hashChanged || battChanged;
     Serial.printf("[hash] stored=\"%s\" new=\"%s\" changed=%d\n",
-                  storedHash.c_str(), imageHash, hashChanged ? 1 : 0);
+                  storedHash.c_str(), imageHash.c_str(), hashChanged ? 1 : 0);
     Serial.printf("[batt] %d%% low=%d wasLow=%d changed=%d\n",
                   battPct, isLow ? 1 : 0, wasLow ? 1 : 0, battChanged ? 1 : 0);
 
@@ -583,8 +649,8 @@ void setup()
 
     if (needsRedraw) {
         Serial.println("[draw] downloading and verifying image");
-        if (downloadVerifyAndDraw(imageUrl, imageHash, isLow, battPct)) {
-            nvs.putString(NVS_KEY_HASH, imageHash);
+        if (downloadVerifyAndDraw(imageUrl.c_str(), imageHash.c_str(), isLow, battPct)) {
+            nvs.putString(NVS_KEY_HASH, imageHash.c_str());
             nvs.putBool(NVS_KEY_BATT_LOW, isLow);
             currentHash = imageHash;
             Serial.println("[draw] OK, hash + battery state persisted");
@@ -603,8 +669,8 @@ void setup()
 
     // Compute sleep duration from next_check_after.
     uint64_t sleepSeconds = SLEEP_FALLBACK_SECONDS;
-    if (haveTime && nextCheckAfter[0]) {
-        time_t target = parseIso8601Utc(nextCheckAfter);
+    if (haveTime && nextCheckAfter.length() > 0) {
+        time_t target = parseIso8601Utc(nextCheckAfter.c_str());
         time_t now    = 0;
         time(&now);
         if (target > 0 && now > 0) {

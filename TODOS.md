@@ -64,26 +64,6 @@ call). Revisit only if we drop OpenAI for a local model.
 
 ## Generated queue / /wake
 
-### Embed manifest fields in `/wake` response to skip the stale CloudFront fetch
-**Priority:** P1
-**Source:** 0.6.0.0 adversarial review
-
-After a `/wake` advance the device immediately `GET`s `current/manifest.json`, but
-CloudFront caches that path with `defaultTtl: 60s`/`maxTtl: 300s`
-([infra/lib/cloudfront.ts](infra/lib/cloudfront.ts)) and the in-flight
-`CreateInvalidation` typically takes 5–60 s to propagate. The fetch almost always
-returns the pre-advance manifest, the device sees its own `storedHash` and skips
-the redraw, and the panel doesn't update until the next wake cycle (≤ 1 h with
-the firmware's `SLEEP_MAX_SECONDS` cap) when the cache has expired and the legacy
-sha-mismatch path catches up. The system self-heals but the wake-button UX is
-"press → nothing → wait 30 min → image changes".
-
-Fix: extend the `/wake` 200 response to include `image_url`, `image_sha256`,
-`image_bytes`, and `next_check_after` for `action=advance`. Firmware uses these
-directly (skip the second `GET manifest.json`) when the response carries them.
-Falls back to the legacy manifest-fetch path when fields are absent (older
-server) or `action != advance`.
-
 ### Submissions via email / CLI shouldn't disappear behind the buffer
 **Priority:** P2
 **Source:** 0.6.0.0 adversarial review (UX regression)
@@ -154,7 +134,7 @@ challenge on future releases.
 
 ### Daily OpenAI cost circuit-breaker (Option B)
 **Priority:** P3 *(was P2; Option A — CloudWatch alarm + SNS topic on the
-generator's 24 h invocation count — shipped in [0.6.1.0])*
+generator's 24 h invocation count — shipped in [0.6.2.0])*
 **Source:** PLAN §3 + phase 2 adversarial review + 0.6.0.0 security review
 
 Option A (observability) is live: a CloudWatch alarm on
@@ -195,4 +175,18 @@ instead.
 
 ## Completed
 
-(none yet — this file was bootstrapped in v0.2.0.0)
+### ~~Embed manifest fields in `/wake` response to skip the stale CloudFront fetch~~ (resolved in 0.6.1.0)
+**Priority:** P1 → resolved
+**Source:** 0.6.0.0 adversarial review
+
+After a `/wake` advance the device immediately `GET`-ed `current/manifest.json`,
+but CloudFront caches that path with `defaultTtl: 60s`/`maxTtl: 300s` and the
+in-flight `CreateInvalidation` typically takes 5–60 s to propagate, so the fetch
+returned the pre-advance manifest and the device skipped the redraw until the
+next wake cycle.
+
+Fixed in 0.6.1.0: the `/wake` 200 response now includes `image_url`,
+`image_sha256`, `image_bytes`, and `next_check_after` for both `action=advance`
+and `action=redraw`. Firmware feeds them straight into `downloadVerifyAndDraw`
+and skips the follow-up GET. `action=queue_empty` and a server rollback both
+degrade cleanly to the legacy `fetchManifest` path.

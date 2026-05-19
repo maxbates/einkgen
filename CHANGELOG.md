@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
-## [0.6.1.0] - 2026-05-18
+## [0.6.2.0] - 2026-05-19
 
 ### Added
 - **Daily OpenAI cost-cap CloudWatch alarm.** A CloudWatch alarm on
@@ -34,6 +34,28 @@ This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 - ARCHITECTURE §12 threat-model rows for **Generator Lambda** and **CLI
   / operator IAM** now reference the alarm instead of pointing at the
   deferred TODO entry.
+
+## [0.6.1.0] - 2026-05-18
+
+### Fixed
+- **WAKE-button latency from minutes to one round-trip.** The
+  ``POST /wake`` advance response now embeds ``image_url``,
+  ``image_sha256``, ``image_bytes`` and ``next_check_after`` from the
+  freshly-published manifest, and the firmware feeds them straight
+  into ``downloadVerifyAndDraw`` instead of issuing a follow-up
+  ``GET current/manifest.json``. The follow-up GET hit CloudFront's
+  60–300 s cache and reliably returned the pre-advance manifest, so
+  the device saw ``storedHash == imageHash``, skipped the redraw, and
+  the panel only updated on the next wake cycle (≤ 1 h with the
+  firmware's ``SLEEP_MAX_SECONDS`` cap). Self-healed but the
+  wake-button UX was "press → nothing → wait 30 min → image changes".
+  The ``action=redraw`` branch carries the same fields so the same
+  bypass applies after an admin **Show this now**. ``action=queue_empty``
+  carries no manifest fields — firmware falls back to ``fetchManifest``
+  and keeps drawing what it already has. A server rollback (no
+  embedded fields) degrades cleanly to the legacy fetch path. Modules:
+  [src/einkgen/lambdas/device_status.py](src/einkgen/lambdas/device_status.py),
+  [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino).
 
 ## [0.6.0.0] - 2026-05-18
 
