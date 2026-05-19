@@ -3,6 +3,9 @@ import { Duration } from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 
 export interface EinkgenObservabilityProps {
   envName: string;
@@ -10,12 +13,27 @@ export interface EinkgenObservabilityProps {
   readApi: lambda.Function;
   deviceStatus: lambda.Function;
   adminApi: lambda.Function;
+  /**
+   * Threshold for the daily generator-invocation alarm. Each invocation
+   * is roughly one ``gpt-image-2`` medium-quality call (~$0.04). Default
+   * 100/day ≈ ~$4/day. See `einkgenDailyRenderCap` in cdk.json.
+   */
+  dailyRenderCap: number;
+  /**
+   * Optional email address to subscribe to the alarm SNS topic. When
+   * unset, the topic is still created and the alarm still fires, but
+   * nothing is subscribed (operator can attach a subscription manually
+   * via the console). See `einkgenAlarmEmail` in cdk.json.
+   */
+  alarmEmail?: string;
 }
 
 const METRIC_NAMESPACE = 'einkgen';
 
 export class EinkgenObservability extends Construct {
   public readonly dashboard: cloudwatch.Dashboard;
+  public readonly alarmTopic: sns.Topic;
+  public readonly dailyRenderAlarm: cloudwatch.Alarm;
 
   constructor(scope: Construct, id: string, props: EinkgenObservabilityProps) {
     super(scope, id);
@@ -85,6 +103,52 @@ export class EinkgenObservability extends Construct {
       new cloudwatch.GraphWidget({
         title: 'ERROR log counts (all Lambdas)',
         left: errorMetrics,
+        width: 24,
+      }),
+    );
+
+    // ---- Daily generator-invocation alarm ------------------------------
+    // The generator Lambda is the only OpenAI spend trigger. Every
+    // invocation is roughly one `gpt-image-2` medium-quality call
+    // (~$0.04). Alarm on cumulative invocations over a rolling 24 h
+    // window so a leaked device token or misconfigured cron can't
+    // drain the OpenAI budget overnight without an operator signal.
+    //
+    // Threshold and (optional) email subscriber come from CDK context
+    // flags wired in einkgen-stack.ts.
+    this.alarmTopic = new sns.Topic(this, 'AlarmTopic', {
+      displayName: `einkgen ${props.envName} alarms`,
+    });
+    if (props.alarmEmail) {
+      this.alarmTopic.addSubscription(new subs.EmailSubscription(props.alarmEmail));
+    }
+
+    const dailyInvocations = props.generator.metricInvocations({
+      // 1-day period so a single datapoint = the 24 h rolling sum.
+      period: Duration.days(1),
+      statistic: cloudwatch.Stats.SUM,
+      label: 'generator invocations (24h)',
+    });
+    this.dailyRenderAlarm = new cloudwatch.Alarm(this, 'GeneratorDailyRenderCap', {
+      alarmName: `einkgen-${props.envName}-generator-daily-render-cap`,
+      alarmDescription:
+        `einkgen generator invocations exceeded ${props.dailyRenderCap} in a 24h window. ` +
+        'At ~$0.04 per gpt-image-2 medium call this is a runaway cost signal — ' +
+        'investigate /wake traffic, the device token, and the cron rule.',
+      metric: dailyInvocations,
+      threshold: props.dailyRenderCap,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      // INSUFFICIENT_DATA keeps the alarm quiet during the first 24h
+      // post-deploy / after long idle stretches.
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    this.dailyRenderAlarm.addAlarmAction(new cwactions.SnsAction(this.alarmTopic));
+
+    this.dashboard.addWidgets(
+      new cloudwatch.AlarmWidget({
+        title: `generator daily render cap (≤ ${props.dailyRenderCap} / 24h)`,
+        alarm: this.dailyRenderAlarm,
         width: 24,
       }),
     );

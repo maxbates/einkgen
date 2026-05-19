@@ -652,6 +652,44 @@ must be a positive integer, at least 60, and a multiple of 60
 > the new monthly cost so future-you / future-them can spot the
 > drift.
 
+### 3.13. (Optional) Subscribe to the daily OpenAI cost-cap alarm
+
+Every deploy ships a CloudWatch alarm on the generator Lambda's
+**Invocations** metric over a rolling 24 h window. Threshold is the
+`einkgenDailyRenderCap` context flag in [infra/cdk.json](infra/cdk.json)
+— default `100` (~$4/day at `gpt-image-2` medium). Each invocation
+is roughly one OpenAI image call, so this is a usable proxy for
+daily $ spend.
+
+The alarm publishes to an SNS topic created in the same stack. To
+get notified, set `einkgenAlarmEmail` once:
+
+1. Edit [infra/cdk.json](infra/cdk.json), add
+   `"einkgenAlarmEmail": "<you>@<domain>"` next to
+   `einkgenDailyRenderCap`.
+2. Redeploy: `AWS_PROFILE=einkgen ./infra/scripts/deploy.sh`.
+3. Check the inbox — AWS sends a one-time confirmation email
+   (subject "AWS Notification - Subscription Confirmation"). Click
+   the link. The topic ARN now has a confirmed subscriber.
+
+Why this matters: `POST /wake` is a device-token-authenticated public
+endpoint that can drive renders. The generator's reservedConcurrency
+= 1 plus the sha-debounce cap sustained spend at roughly $57/day
+worst-case, but a leaked token or misconfigured cron could still
+quietly drain the OpenAI budget overnight without an operator
+signal. The alarm is observability-only — it doesn't auto-stop the
+cron — but it gives the operator an actionable signal to disable the
+EventBridge rule (`aws events disable-rule --name einkgen-generator-cron`)
+or rotate the device token. A future circuit-breaker Lambda will do
+this automatically; see [TODOS.md](TODOS.md).
+
+Tuning the threshold: at the default 30 min cron cadence the
+generator fires 48× / day on cron alone, plus up to ~10 renders / day
+to keep the buffer topped up. 100/day is roughly 2× steady state.
+If you raise the cadence to 15 min (cron alone = 96/day), bump
+`einkgenDailyRenderCap` accordingly or the alarm will flap on
+normal traffic.
+
 ---
 
 ## Part 4 — Day-2 ops

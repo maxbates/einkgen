@@ -5,6 +5,36 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.2.0] - 2026-05-19
+
+### Added
+- **Daily OpenAI cost-cap CloudWatch alarm.** A CloudWatch alarm on
+  ``AWS/Lambda Invocations`` for ``einkgen-generator`` over a rolling
+  24 h window now fires when daily invocations exceed
+  ``einkgenDailyRenderCap`` (new CDK context flag in
+  [infra/cdk.json](infra/cdk.json), default ``100`` ≈ ~$4/day at
+  ``gpt-image-2`` medium). The alarm publishes to a new SNS topic; set
+  ``einkgenAlarmEmail`` to subscribe an inbox. This is **Option A
+  (observability)** from [TODOS.md](TODOS.md) — observability-only, the
+  alarm doesn't auto-stop the cron yet. A circuit-breaker Lambda
+  (Option B) is deferred until the alarm proves insufficient on its
+  own. Motivation: ``POST /wake`` (shipped in 0.6.0.0) is a new public
+  device-token-authenticated spend trigger; reservedConcurrency + the
+  sha-debounce cap sustained spend at ~$57/day worst case, but a
+  leaked token could still quietly drain the OpenAI budget overnight
+  without an operator signal. See [QUICKSTART §3.13](QUICKSTART.md#313-optional-subscribe-to-the-daily-openai-cost-cap-alarm)
+  for setup. Module: [infra/lib/observability.ts](infra/lib/observability.ts).
+
+- **CDK test harness (jest + ts-jest).** First test suite under
+  ``infra/test/`` covers the new alarm + SNS topic, including a
+  snapshot that catches structural regressions across redeploys. Run
+  with ``npm test`` from ``infra/``.
+
+### Changed
+- ARCHITECTURE §12 threat-model rows for **Generator Lambda** and **CLI
+  / operator IAM** now reference the alarm instead of pointing at the
+  deferred TODO entry.
+
 ## [0.6.1.0] - 2026-05-18
 
 ### Fixed

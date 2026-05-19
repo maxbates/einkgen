@@ -11,11 +11,15 @@
     "synth": "cdk synth",
     "synth:no-web": "cdk synth -c includeWebAssets=false",
     "diff": "cdk diff",
-    "deploy": "cdk deploy"
+    "deploy": "cdk deploy",
+    "test": "jest"
   },
   "devDependencies": {
+    "@types/jest": "^29.5.14",
     "@types/node": "^20.14.0",
     "aws-cdk": "^2.1122.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.9",
     "ts-node": "^10.9.2",
     "typescript": "~5.5.3"
   },
