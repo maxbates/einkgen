@@ -239,6 +239,9 @@ export class EinkgenStack extends Stack {
         code: bundlePython('requirements-inbound-email.txt', sourceStaged),
         seedAllowlist,
         pollIntervalSeconds,
+        // Wired so the NOW-subject trigger can async-invoke render_now
+        // on the generator instead of waiting for the next cron tick.
+        generator: lambdas.generator,
       });
     }
 

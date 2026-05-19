@@ -39,6 +39,7 @@ def env(monkeypatch):
     monkeypatch.setenv("EINKGEN_REPLY_FROM", "einkgen@submit.example.com")
     monkeypatch.setenv("EINKGEN_PROJECT_URL", "https://example.com/einkgen")
     monkeypatch.setenv("EINKGEN_INBOUND_PREFIX", "inbound/")
+    monkeypatch.setenv("EINKGEN_GENERATOR_FUNCTION_NAME", "einkgen-generator-test")
     yield
 
 
@@ -46,6 +47,13 @@ def env(monkeypatch):
 def ses_mock(monkeypatch):
     client = MagicMock()
     monkeypatch.setattr(inbound_email, "_get_ses_client", lambda: client)
+    return client
+
+
+@pytest.fixture
+def lambda_mock(monkeypatch):
+    client = MagicMock()
+    monkeypatch.setattr(inbound_email, "_get_lambda_client", lambda: client)
     return client
 
 
@@ -256,3 +264,130 @@ def test_empty_email_is_a_noop(s3_bucket, env, reset_state, ses_mock):
     # The inbound object should still be deleted to keep the prefix tidy.
     listing = s3_bucket.list_objects_v2(Bucket=TEST_BUCKET, Prefix="inbound/")
     assert "Contents" not in listing
+
+
+# --------------------------------------------------------------------------
+# NOW subject trigger
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "subject,expected_prompt",
+    [
+        ("NOW watercolor mountains", "watercolor mountains"),
+        ("now watercolor mountains", "watercolor mountains"),  # case-insensitive
+        ("NOW: watercolor mountains", "watercolor mountains"),
+        ("[NOW] watercolor mountains", "watercolor mountains"),
+        ("[ now ] watercolor mountains", "watercolor mountains"),
+    ],
+)
+def test_now_subject_strips_trigger_and_fires_render(
+    s3_bucket, env, reset_state, ses_mock, lambda_mock, subject, expected_prompt
+):
+    """NOW prefix: trigger stripped, queued at top, generator invoked."""
+    _seed_allowlist(s3_bucket, ["me@example.com"])
+    raw = _build_email(subject=subject)
+    event = _drop_email(s3_bucket, raw)
+
+    inbound_email.handler(event)
+
+    items = queue.list()
+    assert len(items) == 1
+    item = items[0]
+    # Trigger was stripped from the captured prompt.
+    assert item.prompt == expected_prompt
+    assert "now" not in item.prompt.lower().split()[0]  # first word isn't "now"
+    # Top-priority placement (priority "0" prefix on the S3 key).
+    assert item._s3_key.startswith("queue/0-")
+
+    # Generator was async-invoked with render_now.
+    lambda_mock.invoke.assert_called_once()
+    kwargs = lambda_mock.invoke.call_args.kwargs
+    assert kwargs["FunctionName"] == "einkgen-generator-test"
+    assert kwargs["InvocationType"] == "Event"
+    import json
+
+    assert json.loads(kwargs["Payload"].decode()) == {"action": "render_now"}
+
+    # Confirmation reply mentions NOW.
+    body = ses_mock.send_email.call_args.kwargs["Message"]["Body"]["Text"]["Data"]
+    assert "NOW" in body
+
+
+def test_now_subject_with_image_attachment_enqueues_top(
+    s3_bucket, env, reset_state, ses_mock, lambda_mock
+):
+    """NOW also works on image submissions; the image kind + restyle stay."""
+    _seed_allowlist(s3_bucket, ["me@example.com"])
+    raw = _build_email(
+        subject="NOW watercolor restyle",
+        image_bytes=b"\xff\xd8\xff-bytes",
+        image_name="cat.jpg",
+    )
+    event = _drop_email(s3_bucket, raw)
+
+    inbound_email.handler(event)
+
+    items = queue.list()
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "image"
+    assert item.prompt == "watercolor restyle"
+    assert item._s3_key.startswith("queue/0-")
+    lambda_mock.invoke.assert_called_once()
+
+
+def test_now_inside_subject_not_at_start_is_not_a_trigger(
+    s3_bucket, env, reset_state, ses_mock, lambda_mock
+):
+    """``Watercolor NOW`` should NOT trip the trigger — only a leading NOW does."""
+    _seed_allowlist(s3_bucket, ["me@example.com"])
+    raw = _build_email(subject="Watercolor NOW please")
+    event = _drop_email(s3_bucket, raw)
+
+    inbound_email.handler(event)
+
+    items = queue.list()
+    assert len(items) == 1
+    # Full subject preserved; queued at bottom (default).
+    assert items[0].prompt == "Watercolor NOW please"
+    assert items[0]._s3_key.startswith("queue/1-")
+    # No render invoke fired.
+    assert lambda_mock.invoke.call_count == 0
+
+
+def test_non_urgent_email_does_not_invoke_generator(
+    s3_bucket, env, reset_state, ses_mock, lambda_mock
+):
+    """Regression: ordinary submissions still don't burn a render invoke."""
+    _seed_allowlist(s3_bucket, ["me@example.com"])
+    raw = _build_email(subject="watercolor mountains")
+    event = _drop_email(s3_bucket, raw)
+
+    inbound_email.handler(event)
+
+    assert lambda_mock.invoke.call_count == 0
+
+
+def test_now_subject_handles_missing_generator_env(
+    s3_bucket, env, reset_state, ses_mock, lambda_mock, monkeypatch
+):
+    """Without the function-name env var, NOW still enqueues at the top.
+
+    The render invoke is skipped (logged ERROR), but the operator's
+    item is still ahead of everything else and the next cron tick will
+    pick it up.
+    """
+    monkeypatch.delenv("EINKGEN_GENERATOR_FUNCTION_NAME", raising=False)
+    _seed_allowlist(s3_bucket, ["me@example.com"])
+    raw = _build_email(subject="NOW please")
+    event = _drop_email(s3_bucket, raw)
+
+    inbound_email.handler(event)
+
+    items = queue.list()
+    assert len(items) == 1
+    assert items[0].prompt == "please"
+    assert items[0]._s3_key.startswith("queue/0-")
+    # No invoke was attempted.
+    assert lambda_mock.invoke.call_count == 0

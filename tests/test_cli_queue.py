@@ -5,12 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from einkgen.cli import main
+from einkgen.cli import queue as cli_queue
 from einkgen.core import queue as queue_core
 from tests.conftest import TEST_BUCKET
+
+
+@pytest.fixture
+def lambda_mock(monkeypatch):
+    """Patch boto3.client('lambda') so --now doesn't hit AWS."""
+    client = MagicMock()
+    monkeypatch.setattr(cli_queue, "boto3", MagicMock(client=lambda _: client))
+    return client
 
 
 def test_ls_empty_prints_marker(s3_bucket, capsys):
@@ -152,3 +162,71 @@ def test_image_missing_path_exits_nonzero(s3_bucket, tmp_path, capsys):
     assert "not a file" in err
     # No queue items written.
     assert queue_core.list() == []
+
+
+# --------------------------------------------------------------------------
+# --now flag
+# --------------------------------------------------------------------------
+
+
+def test_prompt_now_flag_enqueues_top_and_invokes_generator(
+    s3_bucket, lambda_mock, capsys
+):
+    rc = main(["queue", "prompt", "render this now please", "--now"])
+    assert rc == 0
+    capsys.readouterr()
+
+    items = queue_core.list()
+    assert len(items) == 1
+    # --now implies top placement (priority "0" prefix on the S3 key).
+    assert items[0]._s3_key.startswith("queue/0-")
+
+    # Lambda was async-invoked with render_now.
+    lambda_mock.invoke.assert_called_once()
+    kwargs = lambda_mock.invoke.call_args.kwargs
+    assert kwargs["FunctionName"] == "einkgen-generator"
+    assert kwargs["InvocationType"] == "Event"
+    assert json.loads(kwargs["Payload"].decode()) == {"action": "render_now"}
+
+
+def test_image_now_flag_enqueues_top_and_invokes_generator(
+    s3_bucket, lambda_mock, tmp_path, capsys
+):
+    src = tmp_path / "photo.jpg"
+    src.write_bytes(b"\xff\xd8\xfffake")
+
+    rc = main(["queue", "image", str(src), "--now"])
+    assert rc == 0
+    capsys.readouterr()
+
+    items = queue_core.list()
+    assert len(items) == 1
+    assert items[0].kind == "image"
+    assert items[0]._s3_key.startswith("queue/0-")
+
+    lambda_mock.invoke.assert_called_once()
+    payload = json.loads(lambda_mock.invoke.call_args.kwargs["Payload"].decode())
+    assert payload == {"action": "render_now"}
+
+
+def test_prompt_top_flag_does_not_invoke_generator(s3_bucket, lambda_mock, capsys):
+    """--top is placement only; the generator must NOT be invoked."""
+    rc = main(["queue", "prompt", "soon-ish", "--top"])
+    assert rc == 0
+    capsys.readouterr()
+    assert lambda_mock.invoke.call_count == 0
+
+
+def test_now_and_top_are_mutually_exclusive(s3_bucket, lambda_mock, capsys):
+    """argparse must reject combining --top with --now."""
+    with pytest.raises(SystemExit):
+        main(["queue", "prompt", "hi", "--top", "--now"])
+
+
+def test_prompt_now_uses_custom_generator_name_from_env(
+    s3_bucket, lambda_mock, monkeypatch, capsys
+):
+    monkeypatch.setenv("EINKGEN_GENERATOR_FUNCTION_NAME", "einkgen-generator-dev")
+    main(["queue", "prompt", "x", "--now"])
+    capsys.readouterr()
+    assert lambda_mock.invoke.call_args.kwargs["FunctionName"] == "einkgen-generator-dev"

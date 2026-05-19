@@ -64,23 +64,6 @@ call). Revisit only if we drop OpenAI for a local model.
 
 ## Generated queue / /wake
 
-### Submissions via email / CLI shouldn't disappear behind the buffer
-**Priority:** P2
-**Source:** 0.6.0.0 adversarial review (UX regression)
-
-Pre-0.6.0.0, an inbound email or `einkgen queue prompt` submission rendered on
-the next cron tick (≤ 30 min). Now those submissions land on the prompt queue
-and only get buffered into `generated/` after cron drains 10 items ahead of them
-— so the user-visible latency is 10 × 30 min = ~5 h. Admin **Now** / **Run**
-already bypass the buffer; we want the same affordance for email and CLI when
-the submitter is signaling "show this soon".
-
-Fix options: (a) email/CLI both grow an `at="now"` knob that fires `render_now`
-after enqueue (`einkgen queue prompt "<text>" --now`, email subject like
-`Subject: NOW <prompt>`), or (b) cron preferentially drains non-`source="cron"`
-items into the buffer first so user-submitted prompts surface within one cron
-tick.
-
 ### Concurrent `/wake` calls race on `current/manifest.json` version increment
 **Priority:** P3
 **Source:** 0.6.0.0 security review (race condition)
@@ -190,3 +173,30 @@ Fixed in 0.6.1.0: the `/wake` 200 response now includes `image_url`,
 and `action=redraw`. Firmware feeds them straight into `downloadVerifyAndDraw`
 and skips the follow-up GET. `action=queue_empty` and a server rollback both
 degrade cleanly to the legacy `fetchManifest` path.
+
+### ~~Submissions via email / CLI shouldn't disappear behind the buffer~~ (resolved in 0.6.3.0)
+**Priority:** P2 → resolved
+**Source:** 0.6.0.0 adversarial review (UX regression)
+
+Pre-0.6.0.0, an inbound email or `einkgen queue prompt` submission rendered on
+the next cron tick (≤ 30 min). After 0.6.0.0 those submissions landed on the
+prompt queue and only got buffered into `generated/` after cron drained 10
+items ahead of them — user-visible latency was 10 × 30 min = ~5 h.
+
+Fixed in 0.6.3.0 (option (a) from the original fix sketch). Both submission
+paths now grow an explicit "render this now" affordance that enqueues at the
+top of the queue and async-invokes the generator with `render_now`, the same
+as the SPA Admin tab's **Now** button:
+
+- CLI: `einkgen queue prompt "<text>" --now` (and `einkgen queue image <path>
+  --now`). Mutually exclusive with `--top`. Requires `lambda:InvokeFunction`
+  on `einkgen-generator` in the operator's IAM.
+- Email: subject prefix `NOW `, `NOW:`, or `[NOW]` (case-insensitive). The
+  trigger is stripped from the prompt before generation. CDK wires
+  `generator.grantInvoke` on the inbound-email Lambda and sets
+  `EINKGEN_GENERATOR_FUNCTION_NAME` in its env.
+
+Option (b) — preferentially draining non-`source="cron"` items first — was
+rejected because the failure mode is worse: a flurry of email submissions
+would push every cron-topup behind them, and the affordance is implicit
+("did my email render fast?") instead of operator-driven.

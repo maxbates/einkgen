@@ -41,6 +41,19 @@ SUBJECT_PREFIX_RE = re.compile(
     r"^\s*(re|fwd?|aw|sv)\s*:\s*", flags=re.IGNORECASE
 )
 
+# "Render this now" trigger in the subject line. Recognised spellings
+# (case-insensitive):
+#   - leading ``NOW `` (space) or ``NOW:``
+#   - leading ``[NOW]``
+# The trigger is stripped from the prompt before enqueueing — the
+# inbound-email Lambda uses the ``urgent`` flag to enqueue at the top
+# of the queue and async-invoke the generator, the same affordance the
+# SPA Admin tab's **Now** button gives.
+NOW_TRIGGER_RE = re.compile(
+    r"^\s*(?:\[\s*now\s*\]|now\s*[: ])\s*",
+    flags=re.IGNORECASE,
+)
+
 # Signature markers — drop everything from this line on. Conservative list;
 # we'd rather pass a few extra lines through than truncate a legitimate
 # prompt. The "-- " (two dashes + space) form is the RFC 3676 standard.
@@ -61,6 +74,7 @@ class ParsedEmail:
     image_bytes: bytes | None  # decoded body of the first acceptable image
     image_filename: str | None  # attachment filename if present, else None
     reject_reason: str | None = None  # set when sender auth couldn't be verified
+    urgent: bool = False  # subject signalled "render now" (NOW / [NOW] prefix)
 
 
 def parse_message(raw: bytes) -> ParsedEmail:
@@ -77,6 +91,16 @@ def parse_message(raw: bytes) -> ParsedEmail:
 
     subject = (msg.get("Subject") or "").strip()
     subject = SUBJECT_PREFIX_RE.sub("", subject).strip()
+
+    # NOW trigger: detect against the subject before merging with body so
+    # "NOW watercolor" doesn't leak the word "NOW" into the gpt-image-2
+    # prompt. Body-only prompts are not eligible — the sender has to be
+    # explicit about urgency via the subject.
+    urgent = False
+    new_subject = NOW_TRIGGER_RE.sub("", subject, count=1)
+    if new_subject != subject:
+        urgent = True
+        subject = new_subject.strip()
 
     body_text = _first_text_part(msg)
     body_prompt = _first_meaningful_line(body_text) if body_text else ""
@@ -97,6 +121,7 @@ def parse_message(raw: bytes) -> ParsedEmail:
         prompt=prompt,
         image_bytes=image_bytes,
         image_filename=image_filename,
+        urgent=urgent,
     )
 
 
