@@ -37,7 +37,7 @@ signals "render this now". The trigger is stripped from the prompt
 before enqueueing; the item lands at the **top** of the queue and the
 generator is async-invoked with ``render_now`` so it bypasses the 10-deep
 pre-rendered buffer. Same affordance as the SPA Admin tab's **Now**
-button — the email path was added in 0.6.1.0 so phone submissions don't
+button — the email path was added in 0.6.2.0 so phone submissions don't
 disappear behind a ~5h buffer wait.
 
 Environment

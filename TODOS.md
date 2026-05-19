@@ -64,54 +64,6 @@ call). Revisit only if we drop OpenAI for a local model.
 
 ## Generated queue / /wake
 
-### Embed manifest fields in `/wake` response to skip the stale CloudFront fetch
-**Priority:** P1
-**Source:** 0.6.0.0 adversarial review
-
-After a `/wake` advance the device immediately `GET`s `current/manifest.json`, but
-CloudFront caches that path with `defaultTtl: 60s`/`maxTtl: 300s`
-([infra/lib/cloudfront.ts](infra/lib/cloudfront.ts)) and the in-flight
-`CreateInvalidation` typically takes 5–60 s to propagate. The fetch almost always
-returns the pre-advance manifest, the device sees its own `storedHash` and skips
-the redraw, and the panel doesn't update until the next wake cycle (≤ 1 h with
-the firmware's `SLEEP_MAX_SECONDS` cap) when the cache has expired and the legacy
-sha-mismatch path catches up. The system self-heals but the wake-button UX is
-"press → nothing → wait 30 min → image changes".
-
-Fix: extend the `/wake` 200 response to include `image_url`, `image_sha256`,
-`image_bytes`, and `next_check_after` for `action=advance`. Firmware uses these
-directly (skip the second `GET manifest.json`) when the response carries them.
-Falls back to the legacy manifest-fetch path when fields are absent (older
-server) or `action != advance`.
-
-### ~~Submissions via email / CLI shouldn't disappear behind the buffer~~ (shipped 0.6.1.0)
-**Priority:** P2 → resolved
-**Source:** 0.6.0.0 adversarial review (UX regression)
-**Shipped:** 0.6.1.0 (2026-05-18)
-
-Pre-0.6.0.0, an inbound email or `einkgen queue prompt` submission rendered on
-the next cron tick (≤ 30 min). After 0.6.0.0 those submissions landed on the
-prompt queue and only got buffered into `generated/` after cron drained 10
-items ahead of them — user-visible latency was 10 × 30 min = ~5 h.
-
-**Resolution: option (a) from the original fix sketch.** Both submission paths
-now grow an explicit "render this now" affordance that enqueues at the top of
-the queue and async-invokes the generator with `render_now`, the same as the
-SPA Admin tab's **Now** button:
-
-- CLI: `einkgen queue prompt "<text>" --now` (and `einkgen queue image <path>
-  --now`). Mutually exclusive with `--top`. Requires `lambda:InvokeFunction`
-  on `einkgen-generator` in the operator's IAM.
-- Email: subject prefix `NOW `, `NOW:`, or `[NOW]` (case-insensitive). The
-  trigger is stripped from the prompt before generation. CDK wires
-  `generator.grantInvoke` on the inbound-email Lambda and sets
-  `EINKGEN_GENERATOR_FUNCTION_NAME` in its env.
-
-Option (b) — preferentially draining non-`source="cron"` items first — was
-rejected because the failure mode is worse: a flurry of email submissions
-would push every cron-topup behind them, and the affordance is implicit
-("did my email render fast?") instead of operator-driven.
-
 ### Concurrent `/wake` calls race on `current/manifest.json` version increment
 **Priority:** P3
 **Source:** 0.6.0.0 security review (race condition)
@@ -197,4 +149,45 @@ instead.
 
 ## Completed
 
-(none yet — this file was bootstrapped in v0.2.0.0)
+### ~~Embed manifest fields in `/wake` response to skip the stale CloudFront fetch~~ (resolved in 0.6.1.0)
+**Priority:** P1 → resolved
+**Source:** 0.6.0.0 adversarial review
+
+After a `/wake` advance the device immediately `GET`-ed `current/manifest.json`,
+but CloudFront caches that path with `defaultTtl: 60s`/`maxTtl: 300s` and the
+in-flight `CreateInvalidation` typically takes 5–60 s to propagate, so the fetch
+returned the pre-advance manifest and the device skipped the redraw until the
+next wake cycle.
+
+Fixed in 0.6.1.0: the `/wake` 200 response now includes `image_url`,
+`image_sha256`, `image_bytes`, and `next_check_after` for both `action=advance`
+and `action=redraw`. Firmware feeds them straight into `downloadVerifyAndDraw`
+and skips the follow-up GET. `action=queue_empty` and a server rollback both
+degrade cleanly to the legacy `fetchManifest` path.
+
+### ~~Submissions via email / CLI shouldn't disappear behind the buffer~~ (resolved in 0.6.2.0)
+**Priority:** P2 → resolved
+**Source:** 0.6.0.0 adversarial review (UX regression)
+
+Pre-0.6.0.0, an inbound email or `einkgen queue prompt` submission rendered on
+the next cron tick (≤ 30 min). After 0.6.0.0 those submissions landed on the
+prompt queue and only got buffered into `generated/` after cron drained 10
+items ahead of them — user-visible latency was 10 × 30 min = ~5 h.
+
+Fixed in 0.6.2.0 (option (a) from the original fix sketch). Both submission
+paths now grow an explicit "render this now" affordance that enqueues at the
+top of the queue and async-invokes the generator with `render_now`, the same
+as the SPA Admin tab's **Now** button:
+
+- CLI: `einkgen queue prompt "<text>" --now` (and `einkgen queue image <path>
+  --now`). Mutually exclusive with `--top`. Requires `lambda:InvokeFunction`
+  on `einkgen-generator` in the operator's IAM.
+- Email: subject prefix `NOW `, `NOW:`, or `[NOW]` (case-insensitive). The
+  trigger is stripped from the prompt before generation. CDK wires
+  `generator.grantInvoke` on the inbound-email Lambda and sets
+  `EINKGEN_GENERATOR_FUNCTION_NAME` in its env.
+
+Option (b) — preferentially draining non-`source="cron"` items first — was
+rejected because the failure mode is worse: a flurry of email submissions
+would push every cron-topup behind them, and the affordance is implicit
+("did my email render fast?") instead of operator-driven.

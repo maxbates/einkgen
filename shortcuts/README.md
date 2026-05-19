@@ -16,7 +16,7 @@ Both end the same way:
 
 ### Skipping the buffer with a NOW trigger
 
-Since 0.6.1.0, both paths support a "render this now" override that
+Since 0.6.2.0, both paths support a "render this now" override that
 bypasses the ~10-deep pre-rendered buffer (otherwise an email or HTTP
 submission waits behind everything else cron has queued up):
 
