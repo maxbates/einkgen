@@ -268,3 +268,27 @@ def test_legacy_items_without_priority_prefix_sort_after_both_queues(s3_bucket):
     # new_top first (priority "0"), new_bottom second (priority "1"),
     # legacy last (prefix "2026..." > "1-...").
     assert ids == [new_top.id, new_bottom.id, "LEGACY01"]
+
+
+def test_build_staged_key_strips_filename():
+    """Staged keys must not include any byte of the operator filename.
+
+    Pre-fix the public ``queue/staged/*`` CDN behavior could leak a
+    sender's local file path. The key is now ``<sha8><ext>`` with the
+    extension constrained to a short ASCII allowlist.
+    """
+    import hashlib
+
+    data = b"hello world"
+    sha8 = hashlib.sha256(data).hexdigest()[:8]
+
+    assert q.build_staged_key(data, "cat.jpg") == f"queue/staged/{sha8}.jpg"
+    # Different filename, identical extension → identical key (content-addressed).
+    assert q.build_staged_key(data, "../weird name? .JPG") == f"queue/staged/{sha8}.jpg"
+    # Unknown / dangerous extension → no extension at all.
+    assert q.build_staged_key(data, "shell.sh") == f"queue/staged/{sha8}"
+    # No filename → no extension.
+    assert q.build_staged_key(data, None) == f"queue/staged/{sha8}"
+    assert q.build_staged_key(data, "") == f"queue/staged/{sha8}"
+
+

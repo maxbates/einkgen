@@ -41,7 +41,9 @@ public API.
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -52,14 +54,40 @@ from einkgen.core import s3
 
 QUEUE_PREFIX = "queue/"
 STAGED_PREFIX = "queue/staged/"
+
+# Allowlist of image-file extensions kept on the staged key. Staged
+# uploads are always images (the queue rejects non-image kinds), and
+# limiting the suffix to a known set keeps the public CDN URL from ever
+# advertising e.g. ``.sh`` or ``.exe`` even if an operator hands one in.
+_STAGED_ALLOWED_EXTS = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".bmp"}
+)
+
+
+def build_staged_key(data: bytes, filename: str | None = None) -> str:
+    """Return ``queue/staged/<sha8><ext>`` for a freshly-uploaded image.
+
+    Older revisions baked the operator-supplied filename into the key.
+    That leaked through the public CloudFront ``queue/staged/*``
+    behavior — for email submissions the leaked string could be a
+    sender's local file path. The new key keeps only the content hash
+    and a safe extension so the CDN URL reveals nothing about the
+    submitter.
+    """
+    sha8 = hashlib.sha256(data).hexdigest()[:8]
+    ext = ""
+    if filename:
+        _, raw_ext = os.path.splitext(filename)
+        candidate = raw_ext.lower()
+        if candidate in _STAGED_ALLOWED_EXTS:
+            ext = candidate
+    return f"{STAGED_PREFIX}{sha8}{ext}"
+
+
 # Operator-visible breadcrumbs for permanently-failed items live under
 # this prefix. Excluded from queue listing so the public Queue tab never
 # shows dropped items. See ``einkgen.core.failures`` (introduced in
 # [0.4.1.4]).
-FAILED_PREFIX = "queue/failed/"
-# Operator-visible breadcrumbs for permanently-failed items live under this
-# prefix. Excluded from queue listing so the public Queue tab never shows
-# dropped items. See ``einkgen.core.failures``.
 FAILED_PREFIX = "queue/failed/"
 
 # Priority characters. Single ASCII digits so the lex sort of the

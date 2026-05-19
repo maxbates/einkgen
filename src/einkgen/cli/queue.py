@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -160,8 +159,7 @@ def _cmd_image(args: argparse.Namespace) -> int:
         print(f"not a file: {path}", file=sys.stderr)
         return 1
     data = path.read_bytes()
-    sha8 = hashlib.sha256(data).hexdigest()[:8]
-    staged_key = f"{queue_core.STAGED_PREFIX}{sha8}-{path.name}"
+    staged_key = queue_core.build_staged_key(data, path.name)
     s3.put_object(staged_key, data)
 
     at, render_now = _resolve_placement(args)
