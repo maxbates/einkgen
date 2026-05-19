@@ -17,6 +17,10 @@ Routes (all GET):
 - ``/history``   → recent ``history/<id>/manifest.json`` summaries, newest first.
 - ``/status``    → newest ``status/device-<id>.json`` merged with the device id
   and S3 ``LastModified`` timestamp; 404 when no reports exist yet.
+- ``/devices``   → every ``status/device-<id>.json`` merged with the
+  device id and S3 ``LastModified``, newest first. Empty list when no
+  reports exist. Lets the SPA list more than one device without each
+  one having to alias to ``default``.
 
 Response shape is ``{"statusCode": int, "headers": {...}, "body": json}``
 so the Function URL serialises it directly. Real CORS is pinned by the
@@ -53,6 +57,10 @@ MAX_QUEUE_LIMIT = 1000
 # silently truncated.
 DEFAULT_GENERATED_LIMIT = 50
 MAX_GENERATED_LIMIT = 200
+# Cap on the multi-device listing so a runaway producer or a leaked
+# device token can't turn each public-SPA poll into O(devices) GetObjects.
+DEFAULT_DEVICES_LIMIT = 50
+MAX_DEVICES_LIMIT = 200
 
 _BASE_HEADERS = {
     "Content-Type": "application/json",
@@ -205,34 +213,69 @@ def _handle_history(event: dict[str, Any]) -> dict[str, Any]:
     return _response(200, {"items": entries})
 
 
-def _handle_status() -> dict[str, Any]:
+_DEVICE_KEY_PREFIX = "status/device-"
+_DEVICE_KEY_SUFFIX = ".json"
+
+
+def _device_id_from_key(key: str) -> str:
+    return key[len(_DEVICE_KEY_PREFIX) : -len(_DEVICE_KEY_SUFFIX)]
+
+
+def _format_last_modified(value: Any) -> str:
+    if hasattr(value, "strftime"):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(value)
+
+
+def _device_records(limit: int | None = None) -> list[dict[str, Any]]:
+    """Return ``status/device-<id>.json`` records, newest first.
+
+    Each record carries the body fields plus ``device_id`` and a string
+    ``last_modified`` so the SPA can render a stale-vs-fresh badge
+    without re-deriving it.
+
+    ``limit`` caps the number of GetObject calls; callers that don't
+    care (the single-device ``/status`` path) leave it ``None`` to
+    preserve the existing "newest one" semantics.
+    """
     candidates = [
         obj
         for obj in s3.list_objects(STATUS_PREFIX)
-        if obj["Key"].startswith("status/device-")
-        and obj["Key"].endswith(".json")
+        if obj["Key"].startswith(_DEVICE_KEY_PREFIX)
+        and obj["Key"].endswith(_DEVICE_KEY_SUFFIX)
     ]
-    if not candidates:
+    candidates.sort(key=lambda o: o["LastModified"], reverse=True)
+    if limit is not None:
+        candidates = candidates[:limit]
+    records: list[dict[str, Any]] = []
+    for obj in candidates:
+        try:
+            report = json.loads(s3.get_object(obj["Key"]))
+        except Exception:
+            log.error("ERROR unreadable status report: %s", obj["Key"])
+            continue
+        record = dict(report) if isinstance(report, dict) else {}
+        record["device_id"] = _device_id_from_key(obj["Key"])
+        record["last_modified"] = _format_last_modified(obj["LastModified"])
+        records.append(record)
+    return records
+
+
+def _handle_status() -> dict[str, Any]:
+    # /status is the legacy single-device endpoint; only the newest
+    # record is needed, so cap the read at 1 to avoid unbounded
+    # GetObject costs even when many devices have reported.
+    records = _device_records(limit=1)
+    if not records:
         return _response(404, {"error": "no_status_yet"})
+    return _response(200, records[0])
 
-    latest = max(candidates, key=lambda o: o["LastModified"])
-    report = json.loads(s3.get_object(latest["Key"]))
 
-    # Extract `<id>` from `status/device-<id>.json`.
-    device_id = latest["Key"][len("status/device-") : -len(".json")]
-    last_modified = latest["LastModified"]
-    if hasattr(last_modified, "strftime"):
-        # Match the Z-suffix convention used by manifest/device_status.
-        last_modified_str = last_modified.astimezone(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-    else:
-        last_modified_str = str(last_modified)
-
-    body = dict(report)
-    body["device_id"] = device_id
-    body["last_modified"] = last_modified_str
-    return _response(200, body)
+def _handle_devices(event: dict[str, Any]) -> dict[str, Any]:
+    limit = _parse_limit(
+        event, default=DEFAULT_DEVICES_LIMIT, maximum=MAX_DEVICES_LIMIT
+    )
+    return _response(200, {"items": _device_records(limit=limit)})
 
 
 def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
@@ -251,6 +294,8 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
             return _handle_history(event)
         if path == "/status":
             return _handle_status()
+        if path == "/devices":
+            return _handle_devices(event)
         return _response(404, {"error": "not_found"})
     except Exception:
         log.exception("read_api unhandled error")
