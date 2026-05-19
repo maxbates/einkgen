@@ -5,6 +5,60 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.5.0] - 2026-05-19
+
+### Added
+- **CloudWatch alarm on a drained pre-rendered buffer.** The generator
+  emits a literal ``BUFFER_EMPTY_AFTER_REFILL`` log marker at the end
+  of any cron tick that finishes with generated-queue depth = 0 —
+  i.e. cron tried to refill the buffer and couldn't. A new metric
+  filter + alarm (``einkgen-<env>-generated-queue-empty``) pages the
+  operator via the existing alarm SNS topic after two consecutive
+  empty ticks. Closes the "empty-prompt-library deadlock" P3 TODO:
+  if the operator clears the prompt library and ``expand_topic``
+  fails simultaneously, the device used to silently keep showing
+  the same frame forever once the last marker was popped; now an
+  operator gets paged within ~1 h at the default cadence.
+- **``GET /devices`` on the read-api.** Returns every
+  ``status/device-<id>.json`` record, newest-first, with the device
+  id and a string ``last_modified`` so the SPA can render a
+  stale-vs-fresh badge without re-deriving it. ``GET /status`` is
+  unchanged (still returns the newest single device). Typed client
+  added at ``web/src/api.ts::getDevices``. Closes the multi-device
+  P3 TODO; a no-op for the single-device default deploy.
+
+### Changed
+- **``current/manifest.json`` writes are now compare-and-swap.**
+  Both ``publish()`` and ``set_current_from_history()`` route the
+  manifest write through ``_write_current_manifest_cas`` in
+  ``core/publish.py``, which uses S3 ``If-Match`` /
+  ``If-None-Match`` conditional puts with a 6-attempt retry loop.
+  Two concurrent ``/wake`` advances both reading ``version = N``
+  can no longer both write ``N+1``; the loser re-reads and bumps to
+  ``N+2``. Closes the manifest-version monotonicity race documented
+  in TODOS.md / ARCHITECTURE §7.
+- **Staged uploads no longer leak the operator filename through the
+  public CDN.** All three image-staging paths (CLI ``einkgen queue
+  image``, SPA ``/admin/queue/image``, inbound email) now build
+  staged keys via ``core/queue.build_staged_key``, which produces
+  ``queue/staged/<sha8><ext>`` — content hash plus a safe extension
+  from a small image-type allowlist (.jpg, .jpeg, .png, .webp,
+  .gif, .heic, .heif, .bmp). The CDN URL never advertises the
+  uploader's filename. Closes the P4 PII-leak TODO.
+- **CloudFront invalidations use a UUID ``CallerReference``** instead
+  of ``datetime.now().timestamp()``, so two near-simultaneous publishes
+  can't collide on an ``InvalidationBatchAlreadyExists`` error.
+  Invalidation failures are now logged warnings rather than Lambda
+  exceptions (a failed invalidation doesn't roll back a successful
+  manifest write, and CloudFront's natural TTL expiry closes the
+  cache-staleness window). Closes the P4 ``CallerReference`` TODO.
+- **Device-status Lambda no longer advertises CORS.** The endpoint
+  is firmware-only and the HTTP API doesn't configure CORS, so the
+  defensive ``Access-Control-Allow-Origin: *`` header was
+  misleading the code's intent. Dropped from ``_RESPONSE_HEADERS``;
+  no behaviour change for the firmware. Closes the matching
+  PLAN.md §4 open question.
+
 ## [0.6.4.0] - 2026-05-19
 
 ### Added

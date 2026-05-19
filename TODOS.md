@@ -64,45 +64,63 @@ call). Revisit only if we drop OpenAI for a local model.
 
 ## Generated queue / /wake
 
-### Concurrent `/wake` calls race on `current/manifest.json` version increment
+### Cron-down silent failure mode not alarmed
 **Priority:** P3
-**Source:** 0.6.0.0 security review (race condition)
+**Source:** 0.6.5.0 adversarial review
 
-`set_current_from_history` is now called from `/wake` (concurrency = 5) plus
-admin `/admin/show` plus the generator's `publish_item` path. Two concurrent
-calls both read `previous_version = N`, both write `N+1` — classic lost-update
-on the manifest's `version` field. Not a correctness issue for the device (it
-keys off `image_sha256`, not `version`) but the monotonicity property
-documented in ARCHITECTURE §7 doesn't hold.
+The `BUFFER_EMPTY_AFTER_REFILL` alarm shipped in 0.6.5.0 covers "cron
+ran but couldn't refill". It does NOT cover "cron didn't run at all"
+(EventBridge wedged, Lambda permission issue, Lambda timing out before
+the marker emit). `treatMissingData: NOT_BREACHING` deliberately
+silences missing datapoints to avoid false alarms during fresh-deploy
+quiescence, but that same setting also silences a fully-broken cron.
 
-Fix: switch `current/manifest.json` writes to use S3 `If-Match`/`If-None-Match`
-conditional puts and retry on collision, OR funnel all current-manifest writes
-through the generator Lambda (concurrency = 1).
-
-### Empty-prompt-library deadlock leaves buffer drained with no signal
-**Priority:** P3
-**Source:** 0.6.0.0 adversarial review
-
-If the operator clears the prompt library from the Admin tab AND `expand_topic`
-fails (text-LLM down, OpenAI outage) so the raw-topic fallback also can't enqueue
-anything, the cron buffer-refill loop exits without rendering. The buffer drains
-over a few `/wake` calls and stays empty; `/wake` returns `queue_empty` forever
-with no operator-visible alert. Pre-0.6.0.0 the equivalent was "cron didn't
-render", which had the same outcome but was less prominent because there was no
-buffer-depth concept.
-
-Fix: a CloudWatch alarm on generated-queue depth = 0 for >2 cron ticks. Or have
-the SPA Admin tab surface "buffer empty, library may need topics".
+Fix: a second CloudWatch alarm on `AWS/Lambda Invocations` for
+`einkgen-generator` over a rolling 2 h window with threshold `< 1`
+publishes to the same SNS topic. Document under CLAUDE.md "It's broken
+/ debug this" when it lands.
 
 ## Read API
 
-### Multi-device `/devices` endpoint
+### Unauthenticated `/devices` leaks fleet inventory on multi-device deploys
 **Priority:** P3
-**Source:** Phase 2 adversarial review
+**Source:** 0.6.5.0 adversarial review
 
-`/status` returns the single newest device by S3 `LastModified`. Once multi-device
-deployments exist, add a `/devices` listing endpoint so the SPA Device tab can
-choose between them. Today this is a no-op because all devices alias to `default`.
+Today the single-device default deploys are a no-op (all reports
+alias to `default`). The moment a second device ships with a real
+`device_id` baked into `secrets.h` (see the firmware `device_id`
+TODO above), `GET /devices` will return battery, RSSI, `fw_version`,
+and `current_hash` for every device to anyone with the public CDN
+URL. RSSI patterns are a weak geolocation hint; `fw_version` is a
+CVE-targeting hint.
+
+Fix options: (a) gate `/devices` behind the admin cookie (re-uses the
+same auth as `/admin/*`); (b) redact the device_id to a hash on the
+response and drop `current_hash` from the public shape; (c) keep
+`/devices` public but require an opt-in `?include_sensitive=true`
+that the admin client supplies. Cap and DoS bound are already in
+place via `MAX_DEVICES_LIMIT`.
+
+## Image pipeline
+
+### `queue/staged/<sha8>.<ext>` allows collision-overwrite of submitter images
+**Priority:** P3
+**Source:** 0.6.5.0 adversarial review
+
+The 8-char SHA-256 prefix is 32 bits. An attacker on the email
+allowlist (or holding the admin cookie) can grind a colliding image
+in milliseconds and overwrite another submitter's staged image at the
+same CDN-visible key. The queue item still points at the same
+`queue/staged/<sha8>.jpg`, so the rendered frame becomes
+attacker-controlled. Pre-0.6.5.0 the same collision space existed
+(`<sha8>-<filename>`); 0.6.5.0 didn't make it worse, but it didn't
+fix it either.
+
+Fix: widen the prefix to `sha256[:32]` (128 bits → birthday bound
+~1.8 × 10^19) or append a ULID disambiguator (`<sha8>-<ulid>`).
+Either approach is a two-line change in `core.queue.build_staged_key`
+but breaks in-flight `queue/staged/*` keys, so deploy with the
+prompt-queue drained.
 
 ## Infrastructure
 
@@ -137,26 +155,64 @@ Only worth doing if Option A alarms aren't enough — i.e. if the operator
 finds themselves repeatedly waking to drained budget and wishes the
 system had stopped itself. Otherwise paging is sufficient.
 
-### CloudFront invalidation `CallerReference` collisions
-**Priority:** P4
-**Source:** Phase 2 adversarial review
-
-`core/publish.py` uses `datetime.now(...).timestamp()` as the `CallerReference`
-for `cloudfront:CreateInvalidation`. Two near-simultaneous publishes (already
-unlikely with reserved concurrency = 1) would collide. Switch to the item id or
-a UUID; treat any invalidation failure as a non-fatal warning rather than letting
-it surface as a Lambda retry.
-
-### Strip operator filename from staged keys
-**Priority:** P4
-**Source:** Phase 2 adversarial review
-
-`cli/queue.py` writes `queue/staged/<sha8>-<original-filename>.<ext>`. The
-filename is preserved verbatim — operator-controlled, but minor PII leakage
-through the public CDN behavior on `queue/staged/*`. Use `queue/staged/<sha8>.<ext>`
-instead.
-
 ## Completed
+
+### ~~Concurrent `/wake` calls race on `current/manifest.json` version increment~~ (resolved in 0.6.5.0)
+**Priority:** P3 → resolved
+**Source:** 0.6.0.0 security review
+
+`current/manifest.json` writes now go through a compare-and-swap helper
+(`_write_current_manifest_cas` in `core/publish.py`) using S3 `If-Match` /
+`If-None-Match` conditional puts with a bounded retry loop. Two concurrent
+`/wake` advances both reading version=N can no longer both write N+1; the
+loser re-reads and bumps to N+2.
+
+### ~~Empty-prompt-library deadlock leaves buffer drained with no signal~~ (resolved in 0.6.5.0)
+**Priority:** P3 → resolved
+**Source:** 0.6.0.0 adversarial review
+
+The generator now logs a literal `BUFFER_EMPTY_AFTER_REFILL` token at the
+end of any cron tick that finishes with generated-queue depth = 0. A CDK
+metric filter + alarm (`einkgen-<env>-generated-queue-empty`) pages the
+operator via the existing alarm SNS topic after two consecutive empty
+ticks. No SPA banner — the page is enough.
+
+### ~~Multi-device `/devices` endpoint~~ (resolved in 0.6.5.0)
+**Priority:** P3 → resolved
+**Source:** Phase 2 adversarial review
+
+`GET /devices` on the read-api returns every `status/device-<id>.json`
+record newest-first. The typed client lives in `web/src/api.ts` as
+`getDevices()` so a future multi-device deployment can list them
+without a Lambda change. Still a no-op for the single-device default
+deploy (every report aliases to `default`).
+
+### ~~CloudFront invalidation `CallerReference` collisions~~ (resolved in 0.6.5.0)
+**Priority:** P4 → resolved
+**Source:** Phase 2 adversarial review
+
+`core/publish.py::_invalidate_cloudfront` now uses `uuid.uuid4()` for
+`CallerReference` and treats `ClientError` as a logged warning rather than
+letting it propagate as a Lambda retry.
+
+### ~~Strip operator filename from staged keys~~ (resolved in 0.6.5.0)
+**Priority:** P4 → resolved
+**Source:** Phase 2 adversarial review
+
+All three staging callers (`cli/queue.py`, `admin_api.py`,
+`inbound_email.py`) now go through `core/queue.build_staged_key`, which
+produces `queue/staged/<sha8><ext>` with the extension constrained to a
+small image-type allowlist. The CDN URL never exposes the
+operator-supplied filename.
+
+### ~~Device-status CORS header advertises `*` despite firmware-only intent~~ (resolved in 0.6.5.0)
+**Priority:** PLAN §4 open question → resolved
+**Source:** Phase 2 adversarial review
+
+`Access-Control-Allow-Origin` was being set defensively to `*` on every
+device-status response. The endpoint is firmware-only (no browser caller)
+and the HTTP API doesn't configure CORS, so the header was misleading.
+Dropped from `_RESPONSE_HEADERS`; the SPA never called this Lambda.
 
 ### ~~Embed manifest fields in `/wake` response to skip the stale CloudFront fetch~~ (resolved in 0.6.1.0)
 **Priority:** P1 → resolved

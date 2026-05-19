@@ -157,17 +157,15 @@ future work.
   `s3:GetObject` on most paths, `s3:DeleteObject` on `queue/*`) so a
   compromised local profile can't, say, delete history. Decide before
   multi-operator usage.
-- **Deploying the web app.** Today `cdk deploy -c includeWebAssets=true`
-  picks up `web/dist/`. Two open questions: (a) should the web build run
-  inside CDK bundling instead of as a separate `npm run build` step? (b)
-  is the two-deploy workflow (deploy infra → read outputs → build web →
-  redeploy) worth folding into a single `bin/deploy` script?
+- **Deploying the web app.** The two-deploy workflow (deploy infra →
+  read outputs → build web → redeploy) is folded into
+  `infra/scripts/deploy.sh` since the regressions documented in
+  CLAUDE.md Hard rules. Still open: (a) should the web build run
+  inside CDK bundling instead of as a separate `npm run build` step,
+  so a bare `cdk deploy` always gets a correctly-configured bundle?
 - **Concurrency safety on pop.** Reserved concurrency = 1 plus FIFO
   lex-sort is sufficient. If we ever raise concurrency, we'd need
   conditional `DeleteObject` (precondition on ETag) or move to SQS FIFO.
   Noted in `core/queue.py`.
-- **Device-status response CORS.** The Lambda hardcodes
-  `Access-Control-Allow-Origin: *` despite the endpoint being
-  firmware-only and the API Gateway not configuring CORS. Not exploitable
-  (no `Allow-Credentials`, token still required), but the code and the
-  intent disagree. Trivial drop.
+- ~~**Device-status response CORS.**~~ Resolved in 0.6.5.0 — the
+  firmware-only Lambda no longer advertises `Access-Control-Allow-Origin`.
