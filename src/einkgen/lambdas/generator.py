@@ -114,6 +114,14 @@ TARGET_GENERATED_QUEUE_LENGTH = 10
 # renders even if this bound were removed entirely.
 MAX_RENDERS_PER_TICK = TARGET_GENERATED_QUEUE_LENGTH + 5
 
+# Literal log token the CloudWatch metric filter watches for. The CDK
+# alarm in ``infra/lib/observability.ts`` greps for this exact string,
+# so any drift here MUST also update the CDK side (the filter is named
+# ``BufferEmptyFilter``; the literal lives next to it in
+# ``FilterPattern.literal(...)``). Tests assert the rendered log line
+# contains this constant so a Python-side rename is caught at CI time.
+BUFFER_EMPTY_MARKER = "BUFFER_EMPTY_AFTER_REFILL"
+
 
 def _is_cron_event(event: dict[str, Any]) -> bool:
     if event.get("source") == "aws.events":
@@ -188,6 +196,7 @@ def handler(event: dict[str, Any], context: Any = None) -> None:
         # section shows a sensible non-zero count between cron ticks.
         _top_up_generated_queue()
         _top_up_prompt_queue()
+        _emit_buffer_depth_marker()
         return
 
     # Anything else — including stray legacy S3 ObjectCreated events
@@ -255,6 +264,29 @@ def _gather_avoid_prompts() -> list[str]:
         )
 
     return out
+
+
+def _emit_buffer_depth_marker() -> None:
+    """Log a literal token the CloudWatch metric filter watches for.
+
+    Fired at the end of every cron tick, after the buffer refill loop
+    had its chance to top up. ``BUFFER_EMPTY_AFTER_REFILL`` only fires
+    when the buffer is still at 0 — i.e. cron tried to fill but
+    couldn't (empty prompt library + ``expand_topic`` failing, or
+    every render hit a permanent failure). Two consecutive empties
+    page the operator via the alarm SNS topic; the device is on the
+    cusp of having nothing to display next.
+    """
+    from einkgen.core import generated_queue
+
+    depth = generated_queue.count()
+    if depth == 0:
+        log.warning(
+            "%s generator: buffer still empty after refill; "
+            "check the prompt library and expand_topic / image-gen health",
+            BUFFER_EMPTY_MARKER,
+        )
+
 
 
 def _top_up_prompt_queue() -> None:

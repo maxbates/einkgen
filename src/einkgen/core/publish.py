@@ -20,12 +20,16 @@ Two distinct write paths:
 
 from __future__ import annotations
 
+import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
+
+log = logging.getLogger(__name__)
 
 from einkgen.core import s3
 from einkgen.core.manifest import (
@@ -80,40 +84,112 @@ def _poll_interval() -> timedelta:
     return timedelta(seconds=seconds)
 
 
-def _read_previous_version() -> int:
-    """Return the previous manifest's version, or 0 if no manifest exists yet.
+def _read_previous_manifest_meta() -> tuple[int, str | None]:
+    """Return ``(previous_version, etag)`` for the current manifest.
 
-    A NoSuchKey is normal on first publish. Any other S3 error is re-raised so
-    we don't silently restart versions at 1 and overwrite history.
+    Returns ``(0, None)`` if no manifest exists yet (first publish). A
+    malformed body is treated as fresh — same as ``_read_previous_version``
+    used to — so the publish path can recover from a corrupt manifest
+    without operator intervention. Any other S3 error is re-raised; we
+    don't want to silently restart versions at 1 and shadow history.
     """
     try:
-        body = s3.get_object(CURRENT_MANIFEST_KEY)
+        body, etag = s3.get_object_with_etag(CURRENT_MANIFEST_KEY)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code")
         if code in _MISSING_OBJECT_CODES:
-            return 0
+            return 0, None
         raise
     try:
         prev = Manifest.from_json(body)
     except (ValueError, KeyError):
-        # Malformed manifest — treat as fresh rather than crashing the publish.
-        return 0
-    return int(prev.version)
+        return 0, etag
+    return int(prev.version), etag
+
+
+# How many times to retry a current-manifest write before giving up. Two
+# wakes racing within the same RTT to S3 is the realistic worst case; a
+# handful of retries covers that without unbounded spin.
+_MANIFEST_CAS_MAX_ATTEMPTS = 6
+
+
+def _write_current_manifest_cas(
+    build_manifest,
+) -> Manifest:
+    """Compare-and-swap loop around ``current/manifest.json``.
+
+    ``build_manifest(previous_version: int) -> Manifest`` is called once
+    per attempt with the freshly-read previous version so the caller can
+    set ``version = previous + 1``. On collision (another writer beat us
+    between our read and our put) we re-read and rebuild rather than
+    blindly retrying with stale data — that's what keeps the version
+    field monotonic under concurrent ``/wake`` calls (TODOS race fix).
+    """
+    last_exc: ClientError | None = None
+    for _ in range(_MANIFEST_CAS_MAX_ATTEMPTS):
+        previous_version, etag = _read_previous_manifest_meta()
+        manifest = build_manifest(previous_version)
+        manifest_bytes = manifest.to_json().encode("utf-8")
+        try:
+            if etag is None:
+                s3.put_object(
+                    CURRENT_MANIFEST_KEY,
+                    manifest_bytes,
+                    content_type="application/json",
+                    if_none_match="*",
+                )
+            else:
+                s3.put_object(
+                    CURRENT_MANIFEST_KEY,
+                    manifest_bytes,
+                    content_type="application/json",
+                    if_match=etag,
+                )
+            return manifest
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in ("PreconditionFailed", "ConditionalRequestConflict"):
+                last_exc = exc
+                continue
+            raise
+    raise RuntimeError(
+        f"compare-and-swap on {CURRENT_MANIFEST_KEY} failed after "
+        f"{_MANIFEST_CAS_MAX_ATTEMPTS} attempts; last error: {last_exc!r}"
+    )
 
 
 def _invalidate_cloudfront(paths: list[str]) -> None:
-    """Best-effort CloudFront invalidation; no-op if env var is unset."""
+    """Best-effort CloudFront invalidation; no-op if env var is unset.
+
+    ``CallerReference`` must be unique per invalidation per distribution
+    (CloudFront rejects duplicates with ``InvalidationBatchAlreadyExists``).
+    Two near-simultaneous calls — e.g. cron landing the same tick as a
+    ``/wake`` advance — would collide on a timestamp-based reference, so
+    we use a UUID. Any failure is logged and swallowed; the manifest
+    write already succeeded, and the next invalidation (or CloudFront's
+    natural TTL expiry) closes the cache-staleness window.
+    """
     distribution_id = os.environ.get("EINKGEN_CF_DISTRIBUTION_ID")
     if not distribution_id:
         return
-    cf = boto3.client("cloudfront")
-    cf.create_invalidation(
-        DistributionId=distribution_id,
-        InvalidationBatch={
-            "Paths": {"Quantity": len(paths), "Items": paths},
-            "CallerReference": f"einkgen-{datetime.now(timezone.utc).timestamp()}",
-        },
-    )
+    try:
+        boto3.client("cloudfront").create_invalidation(
+            DistributionId=distribution_id,
+            InvalidationBatch={
+                "Paths": {"Quantity": len(paths), "Items": paths},
+                "CallerReference": f"einkgen-{uuid.uuid4()}",
+            },
+        )
+    except Exception:
+        # Catch `Exception`, not just ``ClientError``: boto3 also raises
+        # ``EndpointConnectionError`` / ``ReadTimeoutError`` /
+        # ``NoCredentialsError`` (botocore.exceptions) which are not
+        # ``ClientError`` subclasses. Letting any of those propagate after
+        # the manifest has already been written leaves the Lambda raising
+        # while ``current/`` has advanced — the device would fetch the
+        # stale manifest from CDN until natural TTL expiry. Swallow + log
+        # so the manifest write stays load-bearing.
+        log.exception("cloudfront invalidation failed for %s", paths)
 
 
 def archive_to_history(
@@ -227,26 +303,22 @@ def publish(
     if prompt is not None:
         source_with_prompt["prompt"] = prompt
 
-    previous_version = _read_previous_version()
     next_check = compute_next_check_after(now, tick_interval=_poll_interval())
 
-    manifest = Manifest(
-        version=previous_version + 1,
-        generated_at=iso_utc(now),
-        image_url=f"{_cdn_base()}/current/image.bmp",
-        image_sha256=image_sha256,
-        image_bytes=image_bytes,
-        display=dict(DEFAULT_DISPLAY),
-        next_check_after=iso_utc(next_check),
-        source=source_with_prompt,
-    )
+    def _build(previous_version: int) -> Manifest:
+        return Manifest(
+            version=previous_version + 1,
+            generated_at=iso_utc(now),
+            image_url=f"{_cdn_base()}/current/image.bmp",
+            image_sha256=image_sha256,
+            image_bytes=image_bytes,
+            display=dict(DEFAULT_DISPLAY),
+            next_check_after=iso_utc(next_check),
+            source=source_with_prompt,
+        )
 
+    manifest = _write_current_manifest_cas(_build)
     manifest_bytes = manifest.to_json().encode("utf-8")
-    s3.put_object(
-        CURRENT_MANIFEST_KEY,
-        manifest_bytes,
-        content_type="application/json",
-    )
 
     # Archive. Each item id gets its own folder so re-delivery is idempotent.
     history_prefix = f"history/{item_id}"
@@ -307,28 +379,24 @@ def set_current_from_history(
         raise
     history_manifest = Manifest.from_json(body)
 
-    previous_version = _read_previous_version()
     next_check = compute_next_check_after(now, tick_interval=_poll_interval())
 
     source = dict(history_manifest.source)
     source["replayed_from"] = history_id
 
-    manifest = Manifest(
-        version=previous_version + 1,
-        generated_at=iso_utc(now),
-        image_url=f"{_cdn_base()}/history/{history_id}/processed.bmp",
-        image_sha256=history_manifest.image_sha256,
-        image_bytes=history_manifest.image_bytes,
-        display=dict(DEFAULT_DISPLAY),
-        next_check_after=iso_utc(next_check),
-        source=source,
-    )
-    manifest_bytes = manifest.to_json().encode("utf-8")
-    s3.put_object(
-        CURRENT_MANIFEST_KEY,
-        manifest_bytes,
-        content_type="application/json",
-    )
+    def _build(previous_version: int) -> Manifest:
+        return Manifest(
+            version=previous_version + 1,
+            generated_at=iso_utc(now),
+            image_url=f"{_cdn_base()}/history/{history_id}/processed.bmp",
+            image_sha256=history_manifest.image_sha256,
+            image_bytes=history_manifest.image_bytes,
+            display=dict(DEFAULT_DISPLAY),
+            next_check_after=iso_utc(next_check),
+            source=source,
+        )
+
+    manifest = _write_current_manifest_cas(_build)
     # image_url changed; only the manifest needs CF invalidation. The
     # `history/<id>/processed.bmp` it now points at is already CDN-cached.
     _invalidate_cloudfront([f"/{CURRENT_MANIFEST_KEY}"])

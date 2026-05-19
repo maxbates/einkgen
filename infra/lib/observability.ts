@@ -152,5 +152,56 @@ export class EinkgenObservability extends Construct {
         width: 24,
       }),
     );
+
+    // ---- Empty-generated-queue alarm -----------------------------------
+    // The generator logs ``BUFFER_EMPTY_AFTER_REFILL`` at the end of any
+    // cron tick that finishes with a generated-queue depth of 0. That
+    // means cron tried to refill the buffer and couldn't — typically
+    // because the prompt library was emptied AND ``expand_topic`` is
+    // failing (text-LLM outage, key revoked) so the raw-topic fallback
+    // also can't enqueue anything. Without an alert the device just
+    // keeps drawing the same frame indefinitely after the last
+    // pre-rendered marker is popped.
+    //
+    // Two consecutive empties (at the default 30-min cadence ≈ 1 h)
+    // page the operator via the shared alarm SNS topic.
+    const bufferEmptyMetric = 'GeneratedQueueEmptyTicks';
+    new logs.MetricFilter(this, 'BufferEmptyFilter', {
+      logGroup: props.generator.logGroup,
+      filterPattern: logs.FilterPattern.literal('BUFFER_EMPTY_AFTER_REFILL'),
+      metricNamespace: METRIC_NAMESPACE,
+      metricName: bufferEmptyMetric,
+      metricValue: '1',
+      defaultValue: 0,
+    });
+    const bufferEmptyAlarm = new cloudwatch.Alarm(this, 'GeneratedQueueEmptyAlarm', {
+      alarmName: `einkgen-${props.envName}-generated-queue-empty`,
+      alarmDescription:
+        'einkgen generator finished two consecutive cron ticks with the ' +
+        'generated-queue (pre-rendered buffer) at 0. Once the device pops ' +
+        'the last marker it will redraw the same frame indefinitely. ' +
+        'Check: prompt library has topics; OpenAI text + image keys still ' +
+        'valid; no recurring PermanentItemError in generator logs.',
+      metric: new cloudwatch.Metric({
+        namespace: METRIC_NAMESPACE,
+        metricName: bufferEmptyMetric,
+        statistic: cloudwatch.Stats.SUM,
+        period: Duration.minutes(30),
+        label: 'buffer-empty ticks',
+      }),
+      threshold: 0,
+      evaluationPeriods: 2,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    bufferEmptyAlarm.addAlarmAction(new cwactions.SnsAction(this.alarmTopic));
+
+    this.dashboard.addWidgets(
+      new cloudwatch.AlarmWidget({
+        title: 'generated-queue empty (≥2 consecutive cron ticks)',
+        alarm: bufferEmptyAlarm,
+        width: 24,
+      }),
+    );
   }
 }

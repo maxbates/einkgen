@@ -104,7 +104,10 @@ def test_happy_path_writes_status_object(s3_bucket, secret):
 
     assert resp["statusCode"] == 200
     assert resp["headers"]["Content-Type"] == "application/json"
-    assert resp["headers"]["Access-Control-Allow-Origin"] == "*"
+    # device-status is firmware-only, so we no longer advertise a CORS
+    # Access-Control-Allow-Origin header — the SPA never calls this
+    # Lambda. Asserting absence keeps the doc/code-intent honest.
+    assert "Access-Control-Allow-Origin" not in resp["headers"]
     assert json.loads(resp["body"]) == {"ok": True, "device_id": "kitchen"}
 
     record = _get_status_object(s3_bucket, "kitchen")

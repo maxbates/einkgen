@@ -70,7 +70,6 @@ Environment
 from __future__ import annotations
 
 import base64
-import hashlib
 import hmac
 import json
 import logging
@@ -109,7 +108,6 @@ MAX_PROMPT_CHARS = 4000               # plenty for any sane restyle hint
 MAX_LIBRARY_ENTRIES = 200             # ample headroom over the seed 10
 
 # Same charset cap the CLI uses when staging a local image.
-SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 # History ids are ULIDs (26-char Crockford base32). We accept anything that
 # matches the ULID-shaped alphabet to avoid a tight format coupling, but
@@ -445,12 +443,6 @@ def _handle_queue_prompt(event: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _safe_filename(name: str) -> str:
-    base = os.path.basename(name) or "image"
-    sanitized = SAFE_FILENAME_RE.sub("_", base)
-    return sanitized[:80] or "image"
-
-
 def _handle_queue_image(event: dict[str, Any]) -> dict[str, Any]:
     if _require_session(event) is None:
         return _response(401, {"error": "unauthorized"})
@@ -474,7 +466,7 @@ def _handle_queue_image(event: dict[str, Any]) -> dict[str, Any]:
     if not data:
         return _response(400, {"error": "bad_request", "detail": "empty image"})
     filename_raw = body.get("filename")
-    filename = _safe_filename(filename_raw if isinstance(filename_raw, str) else "image")
+    filename = filename_raw if isinstance(filename_raw, str) else None
     prompt_raw = body.get("prompt")
     prompt: str | None = None
     if isinstance(prompt_raw, str) and prompt_raw.strip():
@@ -486,8 +478,7 @@ def _handle_queue_image(event: dict[str, Any]) -> dict[str, Any]:
     at, at_err = _parse_at(body)
     if at_err is not None:
         return at_err
-    sha8 = hashlib.sha256(data).hexdigest()[:8]
-    staged_key = f"{queue.STAGED_PREFIX}{sha8}-{filename}"
+    staged_key = queue.build_staged_key(data, filename)
     s3mod.put_object(staged_key, data)
     item = queue.enqueue(
         "image",

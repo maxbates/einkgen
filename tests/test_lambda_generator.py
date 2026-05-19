@@ -208,6 +208,64 @@ def test_cron_expand_failure_falls_back_to_raw_topic(monkeypatch, s3_bucket):
         assert not it.prompt.startswith("EXPANDED::")
 
 
+def test_cron_logs_empty_buffer_marker_when_refill_fails(
+    monkeypatch, s3_bucket, caplog
+):
+    """The CloudWatch alarm watches for ``BUFFER_EMPTY_AFTER_REFILL``.
+
+    If both expand_topic and the fallback enqueue path fail (or — as
+    here — every buffer render is a no-op), the cron tick ends with
+    the generated queue at 0. Logging the marker is the metric-filter
+    contract; drift kills the alarm.
+    """
+    # Buffer render is a no-op so the buffer stays empty regardless of
+    # how many prompts arrive on the prompt queue.
+    def fake_buffer(item):
+        # Drain the head so the loop's exit condition (prompt queue
+        # empty after MAX_RENDERS_PER_TICK) triggers, but don't add a
+        # marker. Buffer ends at 0.
+        return
+
+    def fake_publish(item):
+        return
+
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.pipeline.buffer_item", fake_buffer
+    )
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.pipeline.publish_item", fake_publish
+    )
+
+    def explode(_topic):
+        raise RuntimeError("text llm down")
+
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.generate.expand_topic", explode
+    )
+
+    caplog.set_level("WARNING", logger="einkgen.lambdas.generator")
+    generator.handler(CRON_EVENT, None)
+
+    assert g.empty()
+    assert any(
+        "BUFFER_EMPTY_AFTER_REFILL" in rec.getMessage()
+        for rec in caplog.records
+    ), "expected BUFFER_EMPTY_AFTER_REFILL marker for the CloudWatch metric filter"
+
+
+def test_cron_does_not_log_empty_buffer_marker_when_full(monkeypatch, s3_bucket, caplog):
+    _patch_pipeline_and_expand(monkeypatch)
+
+    caplog.set_level("WARNING", logger="einkgen.lambdas.generator")
+    generator.handler(CRON_EVENT, None)
+
+    assert g.count() == generator.TARGET_GENERATED_QUEUE_LENGTH
+    assert not any(
+        "BUFFER_EMPTY_AFTER_REFILL" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # render_one (the /wake replenish action)
 # ---------------------------------------------------------------------------

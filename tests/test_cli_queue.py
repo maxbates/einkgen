@@ -107,9 +107,11 @@ def test_image_uploads_staged_and_enqueues(s3_bucket, tmp_path, capsys):
     items = queue_core.list()
     assert len(items) == 1
     assert items[0].kind == "image"
-    assert items[0].image_s3_key.startswith("queue/staged/")
     expected_sha8 = hashlib.sha256(src.read_bytes()).hexdigest()[:8]
-    assert items[0].image_s3_key == f"queue/staged/{expected_sha8}-cat.jpg"
+    # The staged key no longer carries the operator's filename — it
+    # leaked through the public CDN. The extension is kept so the CDN
+    # content-type sniffer still gets a hint.
+    assert items[0].image_s3_key == f"queue/staged/{expected_sha8}.jpg"
     assert out == items[0].id
 
     # The staged object actually landed in S3 with the file's bytes.

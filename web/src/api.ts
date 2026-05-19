@@ -158,6 +158,18 @@ export async function getStatus(signal?: AbortSignal): Promise<StatusResult> {
   return { kind: "ok", status };
 }
 
+export interface DevicesResponse {
+  items: DeviceStatus[];
+}
+
+// Multi-device listing. Today single-device deployments alias every
+// report to ``default`` so this returns at most one entry; the API is
+// here so a future multi-device deploy doesn't need a Lambda change to
+// surface them.
+export async function getDevices(signal?: AbortSignal): Promise<DevicesResponse> {
+  return fetchJson<DevicesResponse>("/devices", signal);
+}
+
 // ---------------------------------------------------------------------------
 // Admin API — operator writes. Same-origin path under /admin/*, fronted by
 // CloudFront. credentials: 'include' so the session cookie travels on every

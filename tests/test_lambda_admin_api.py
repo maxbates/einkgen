@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from unittest.mock import MagicMock
 
@@ -379,7 +380,7 @@ def test_enqueue_image_happy_path(secrets, s3_bucket):
     assert staged == image_bytes
 
 
-def test_enqueue_image_filename_is_sanitized(secrets, s3_bucket):
+def test_enqueue_image_drops_operator_filename(secrets, s3_bucket):
     login = _login()
     token = _session_cookie_value(login)
     resp = admin_api.handler(
@@ -396,9 +397,11 @@ def test_enqueue_image_filename_is_sanitized(secrets, s3_bucket):
     assert resp["statusCode"] == 200
     items = queue.list()
     assert items[0].image_s3_key is not None
-    # The dangerous path component is stripped; the staged key never contains '..'
-    assert ".." not in items[0].image_s3_key
-    assert " " not in items[0].image_s3_key
+    # Staged keys must not leak any byte of the operator-supplied filename
+    # through the public CDN behavior on ``queue/staged/*``. The key is
+    # ``queue/staged/<sha8><ext>`` — content hash plus a safe extension.
+    sha8 = hashlib.sha256(b"data").hexdigest()[:8]
+    assert items[0].image_s3_key == f"queue/staged/{sha8}.png"
 
 
 def test_enqueue_image_at_top(secrets, s3_bucket):

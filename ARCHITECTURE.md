@@ -426,8 +426,10 @@ A mostly-read-only dashboard. The public tabs have no buttons or forms — anyth
 - **Frontend.** React + Vite SPA, no UI library, vanilla CSS. Built to static assets, hosted from S3 + CloudFront under the `web/` prefix.
 - **Read backend.** A single `einkgen-read-api` Lambda fronted by an API Gateway HTTP API (CORS pinned to the CloudFront origin + localhost), serving:
   - `GET /queue`   → lists `queue/*.json` from S3.
+  - `GET /generated` → lists `generated/*.json` markers (the pre-rendered buffer).
   - `GET /history` → lists recent `history/<id>/manifest.json` entries.
-  - `GET /status`  → latest `status/device-<id>.json`.
+  - `GET /status`  → newest `status/device-<id>.json` (single device, kept for back-compat with the SPA's Device tab).
+  - `GET /devices` → every `status/device-<id>.json` newest-first, each merged with the device id and a string `last_modified`. Capped at `MAX_DEVICES_LIMIT = 200` so a runaway producer can't turn each public-SPA poll into O(devices) GetObjects. Empty list (200) when no reports exist.
   The Lambda has IAM read-only access to the bucket. No writes, no API key for the API, no path that calls OpenAI.
 - **Write backend.** A separate `einkgen-admin-api` Lambda fronted by its own HTTP API and **routed through the same CloudFront distribution** at `/admin/*` (so the session cookie is same-origin and SameSite=Lax just works). Routes:
   - `POST /admin/login`        — body `{"password": ...}`; on success returns 204 + a `Set-Cookie` HMAC-signed session token.
@@ -535,6 +537,8 @@ output stays varied, even before the expansion step runs:
 
 `next_check_after = (time of next device-poll tick) + 5 min buffer`. The buffer covers the seconds-to-a-minute it takes to call the model and publish, so a device that exactly hits the hint won't arrive before the next image has landed. Firmware caps actual sleep at **1 hour by default** (`SLEEP_MAX_SECONDS` in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino)), so even if the server says "no need to check for 4 hours" the device still polls every hour. That cap is what bounds worst-case latency between an enqueue and the panel actually updating.
 
+`version` is monotonically increasing and is the audit trail for who advanced the panel and when. Since 0.6.5.0 all `current/manifest.json` writes — `publish()`, `set_current_from_history()` (the `/wake` advance + `/admin/show`) — route through `_write_current_manifest_cas` in `core/publish.py`, which uses S3 `If-Match` / `If-None-Match` conditional PUTs with a 6-attempt retry loop. Two concurrent `/wake` advances both reading `version = N` can no longer both write `N+1`; the loser re-reads and bumps to `N+2`. Before 0.6.5.0 the read-modify-write was racy, but the visible blast radius was small (one history pop ignored, the next press got it right).
+
 The device-poll tick and the **EventBridge auto-gen cron** are driven by the same value — `einkgenPollIntervalSeconds` in [infra/cdk.json](infra/cdk.json) (default `1800` = 30 min). One knob, one redeploy, no drift. Values ≤ 3600 are honoured by the firmware directly (its `SLEEP_MAX_SECONDS` is a cap on long sleeps, not a target); values > 3600 also need `SLEEP_MAX_SECONDS` raised in [firmware/inkplate10/inkplate10.ino](firmware/inkplate10/inkplate10.ino) before re-flash. See [QUICKSTART §3.12](QUICKSTART.md#312-change-the-render--poll-cadence-later) for the trade-off table.
 
 ---
@@ -596,7 +600,7 @@ Four Lambdas (five with inbound email), one bucket, one CloudFront distribution,
   - **`lambda.invoke`** from the admin Lambda with `{"action": "render_now"}` (admin **Now** button) or `{"action": "render_item", "item_id": "..."}` (per-row **Run** button) — archives to `history/` AND sets as current, bypassing the generated buffer.
 
   No S3 ObjectCreated trigger — see §4. Reserved concurrency = **1** (serial drain across all triggers, including the new `render_one`). Async retries = **0** on both the function and the EventBridge target (caps OpenAI cost-amplification from transient failures). Reads `OPENAI_API_KEY` from Secrets Manager. ARM64 Graviton2, 1024 MB. Pillow is bundled into the function zip (no third-party Lambda layer).
-- **Lambda `einkgen-read-api`** — public API Gateway HTTP API with CORS pinned to the CloudFront origin (plus `http://localhost:5173` for dev). Read-only IAM on the bucket. Routes: `GET /queue`, `GET /generated`, `GET /history`, `GET /status`. The web app's only public backend.
+- **Lambda `einkgen-read-api`** — public API Gateway HTTP API with CORS pinned to the CloudFront origin (plus `http://localhost:5173` for dev). Read-only IAM on the bucket. Routes: `GET /queue`, `GET /generated`, `GET /history`, `GET /status` (newest single device), `GET /devices` (every device, newest-first, capped at 200). The web app's only public backend.
 - **Lambda `einkgen-device-status`** — API Gateway HTTP API with **no CORS** (firmware-only). Two routes, both with `X-Device-Token` shared-secret auth:
   - `POST /` writes `status/device-<id>.json` (battery / RSSI heartbeat).
   - `POST /wake` advances the display: reads `current/manifest.json`, compares the sha against the device's reported `current_sha256`, pops the head of `generated/` and points current at it via `set_current_from_history`, fires `render_one` async at the generator to refill the buffer. Sha-debounced (mismatch = "device hasn't redrawn yet, no pop").
@@ -606,7 +610,7 @@ Four Lambdas (five with inbound email), one bucket, one CloudFront distribution,
 - **Lambda `einkgen-inbound-email`** *(opt-in, gated by the `einkgenInboundDomain` CDK context flag)*. S3 ObjectCreated on `inbound/*` triggers it; SES's receipt rule for the configured domain writes raw RFC 5322 messages there. Parses MIME, checks SES `Authentication-Results` for SPF/DKIM pass aligned with the From: domain, validates the sender against `config/email_allowlist.txt`, stages any image attachment under `queue/staged/`, calls `queue.enqueue(source="email")`, and sends a confirmation or rejection reply via SES. Scoped IAM: read+delete `inbound/*`, read `config/email_allowlist.txt`, write `queue/*`, `ses:SendEmail` constrained to the configured reply-From address. Reserved concurrency = 5.
 - **Secrets Manager** — `einkgen/openai_api_key`, `einkgen/device_status_token`, `einkgen/admin_password`, `einkgen/admin_cookie_signing_key` (auto-generated by CDK on first deploy). Lambdas get scoped read.
 - **EventBridge rule** `einkgen-generator-cron` — `rate(...)` driven by `einkgenPollIntervalSeconds` in [infra/cdk.json](infra/cdk.json) (default `rate(30 minutes)`). The same value also flows to the Lambda env var `EINKGEN_POLL_INTERVAL_SECONDS` so the device polls in step.
-- **CloudWatch Logs** — 14-day retention per Lambda. One `MetricFilter` per Lambda emits an `ErrorLogCount-{name}` metric on the literal token `ERROR`. A CloudWatch dashboard (`einkgen-<env>`) plots invocations, errors, and duration p50/p99.
+- **CloudWatch Logs** — 14-day retention per Lambda. One `MetricFilter` per Lambda emits an `ErrorLogCount-{name}` metric on the literal token `ERROR`. A second metric filter on the generator (`einkgen-<env>-buffer-empty-after-refill`) counts the literal token `BUFFER_EMPTY_AFTER_REFILL` — emitted by the generator at the end of any cron tick that finishes with generated-queue depth = 0. The alarm `einkgen-<env>-generated-queue-empty` pages via the existing `einkgenAlarmEmail` SNS topic after two consecutive empty ticks (catches the empty-prompt-library deadlock + chronic `expand_topic` failures). A CloudWatch dashboard (`einkgen-<env>`) plots invocations, errors, and duration p50/p99.
 
 Everything is in a single CDK stack under [infra/](infra/).
 

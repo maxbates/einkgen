@@ -269,6 +269,42 @@ def test_status_picks_newest_by_last_modified(s3_bucket):
     assert body["battery_pct"] == 88
 
 
+def test_devices_returns_empty_list_when_no_reports(s3_bucket):
+    resp = read_api.handler(_event("GET", "/devices"))
+    assert resp["statusCode"] == 200
+    assert _body(resp) == {"items": []}
+
+
+def test_devices_lists_all_reports_newest_first(s3_bucket):
+    # moto's S3 LastModified is at 1-second resolution, so we need
+    # >=1s between puts to get a deterministic newest-first ordering.
+    _put_status(
+        s3_bucket,
+        "01OLD",
+        {"battery_v": 3.5, "battery_pct": 40, "last_seen": "2026-05-13T10:00:00Z"},
+    )
+    time.sleep(1.1)
+    _put_status(
+        s3_bucket,
+        "01NEW",
+        {"battery_v": 3.9, "battery_pct": 88, "last_seen": "2026-05-13T14:00:00Z"},
+    )
+    time.sleep(1.1)
+    _put_status(
+        s3_bucket,
+        "kitchen",
+        {"battery_v": 4.1, "battery_pct": 95, "last_seen": "2026-05-13T16:00:00Z"},
+    )
+
+    resp = read_api.handler(_event("GET", "/devices"))
+    assert resp["statusCode"] == 200
+    body = _body(resp)
+    ids = [item["device_id"] for item in body["items"]]
+    assert ids == ["kitchen", "01NEW", "01OLD"]
+    for item in body["items"]:
+        assert "last_modified" in item and item["last_modified"]
+
+
 def test_post_returns_405(s3_bucket):
     resp = read_api.handler(_event("POST", "/queue"))
     assert resp["statusCode"] == 405

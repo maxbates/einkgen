@@ -57,7 +57,6 @@ Environment
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -204,18 +203,9 @@ def _enqueue(parsed: email_parse.ParsedEmail, *, sender: str):
 
 
 def _stage_image(data: bytes, filename: str) -> str:
-    sha8 = hashlib.sha256(data).hexdigest()[:8]
-    safe_name = _safe_filename(filename)
-    staged_key = f"{queue.STAGED_PREFIX}{sha8}-{safe_name}"
+    staged_key = queue.build_staged_key(data, filename)
     s3mod.put_object(staged_key, data)
     return staged_key
-
-
-def _safe_filename(name: str) -> str:
-    # Strip any path components and keep a safe charset for S3 keys.
-    base = os.path.basename(name) or "image"
-    out = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in base)
-    return out[:80]  # keep keys tidy
 
 
 def _extract_auth_headers(raw: bytes) -> list[str]:
