@@ -142,8 +142,68 @@ def test_expand_topic_calls_text_model_and_returns_stripped_content():
     assert messages[0]["role"] == "system"
     assert messages[0]["content"] == EXPAND_TOPIC_SYSTEM_PROMPT
     assert messages[1]["role"] == "user"
-    # The user message is the trimmed topic, not the full prompt.
-    assert messages[1]["content"] == "urban still life"
+    # Without angles/avoid the user message is just the TOPIC line — no
+    # empty ANGLES / AVOID sections leaked into the prompt.
+    assert messages[1]["content"] == "TOPIC: urban still life"
+
+
+def test_expand_topic_injects_angles_into_user_message():
+    """ANGLES (steering hints) appear in the per-call user message."""
+    client = _fake_text_client("A rusty bicycle.")
+    expand_topic(
+        "urban still life",
+        client=client,
+        angles=["Hokkaido", "predawn blue hour"],
+    )
+    user_content = client.chat.completions.create.call_args.kwargs["messages"][1][
+        "content"
+    ]
+    assert "TOPIC: urban still life" in user_content
+    assert "ANGLES" in user_content
+    assert "Hokkaido" in user_content
+    assert "predawn blue hour" in user_content
+    # System prompt isn't mutated per-call.
+    sys_content = client.chat.completions.create.call_args.kwargs["messages"][0][
+        "content"
+    ]
+    assert sys_content == EXPAND_TOPIC_SYSTEM_PROMPT
+
+
+def test_expand_topic_injects_avoid_list_into_user_message():
+    """AVOID list appears as bulleted lines so the LLM can scan them."""
+    client = _fake_text_client("A new scene.")
+    expand_topic(
+        "world landmark",
+        client=client,
+        avoid=[
+            "Machu Picchu in golden hour, bird's-eye composition.",
+            "Petra carved facade at noon, head-on.",
+        ],
+    )
+    user_content = client.chat.completions.create.call_args.kwargs["messages"][1][
+        "content"
+    ]
+    assert "AVOID" in user_content
+    # Each avoid entry is a bullet line — easy to scan, easy to grow.
+    assert "- Machu Picchu in golden hour, bird's-eye composition." in user_content
+    assert "- Petra carved facade at noon, head-on." in user_content
+
+
+def test_expand_topic_omits_empty_steering_sections():
+    """Passing all-empty angles/avoid still produces a clean TOPIC-only message."""
+    client = _fake_text_client("anything.")
+    expand_topic(
+        "minimal",
+        client=client,
+        angles=["", "  "],
+        avoid=["", None],  # type: ignore[list-item]
+    )
+    user_content = client.chat.completions.create.call_args.kwargs["messages"][1][
+        "content"
+    ]
+    assert user_content == "TOPIC: minimal"
+    assert "ANGLES" not in user_content
+    assert "AVOID" not in user_content
 
 
 def test_expand_topic_rejects_empty_topic():

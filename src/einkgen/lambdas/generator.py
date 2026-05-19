@@ -58,9 +58,25 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from einkgen.core import failures, generate, pipeline, prompt_library, queue
+from einkgen.core import (
+    angles as angles_mod,
+    failures,
+    generate,
+    history,
+    pipeline,
+    prompt_library,
+    queue,
+)
 from einkgen.core.pipeline import PermanentItemError
 from einkgen.core.queue import QueueItem
+
+# How many recent expansions to feed back as the "avoid" steering list
+# on each ``expand_topic`` call. Combined with the pending prompt queue
+# and the generated buffer this works out to ~45 prompts — big enough
+# to dodge short-term repeats, small enough not to dominate the LLM
+# context. Bumping much higher hits diminishing returns: the LLM's
+# attention to each entry drops as the list grows.
+RECENT_PROMPT_AVOID_LIMIT = 30
 
 log = logging.getLogger(__name__)
 
@@ -182,13 +198,81 @@ def handler(event: dict[str, Any], context: Any = None) -> None:
     log.info("generator: ignoring unrecognised event shape: %s", event)
 
 
+def _gather_avoid_prompts() -> list[str]:
+    """Collect prompts to steer the next ``expand_topic`` call away from.
+
+    Pulls from three sources, in priority order — recent shown frames
+    (history), prompts already pending render (queue), and frames
+    rendered into the buffer but not yet shown (generated). Dedupes
+    case-insensitively while preserving order so the LLM sees the
+    freshest avoid candidates first if it's only going to attend to the
+    first handful.
+
+    Each source is best-effort: an S3 blip on any of them logs + skips
+    rather than crashing the cron tick. The avoid list is a soft
+    steering signal, not a correctness constraint.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(text: str) -> None:
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(cleaned)
+
+    try:
+        for prompt in history.recent_prompts(RECENT_PROMPT_AVOID_LIMIT):
+            _add(prompt)
+    except Exception:
+        log.exception(
+            "ERROR generator: history.recent_prompts failed; continuing without it"
+        )
+
+    try:
+        for item in queue.list():
+            if isinstance(item.prompt, str):
+                _add(item.prompt)
+    except Exception:
+        log.exception(
+            "ERROR generator: queue.list failed; continuing without pending prompts"
+        )
+
+    try:
+        from einkgen.core import generated_queue
+
+        for marker in generated_queue.list():
+            prompt = (marker.source or {}).get("prompt")
+            if isinstance(prompt, str):
+                _add(prompt)
+    except Exception:
+        log.exception(
+            "ERROR generator: generated_queue.list failed; continuing without buffered prompts"
+        )
+
+    return out
+
+
 def _top_up_prompt_queue() -> None:
     """Ensure the prompt queue holds at least ``TARGET_PROMPT_QUEUE_LENGTH`` items.
 
     Each missing slot is filled by picking a topic from the prompt
     library and asking the text LLM to expand it into a concrete image
-    prompt. Failures fall back to enqueueing the raw topic so the queue
-    still fills — better a less-detailed prompt than a stalled queue.
+    prompt. The expansion is steered for diversity in two ways:
+
+    - ``angles_mod.sample_angles()`` picks two random axes (region /
+      era / light / scale / mood) and one phrase from each, so the LLM
+      is pushed into a different corner of concept space each call.
+    - ``_gather_avoid_prompts()`` pulls recent expansions (history +
+      pending queue + generated buffer) and feeds them back as an
+      AVOID list so the LLM doesn't paraphrase what's already on deck.
+
+    Failures fall back to enqueueing the raw topic so the queue still
+    fills — better a less-detailed prompt than a stalled queue.
     """
     current = queue.count()
     if current >= TARGET_PROMPT_QUEUE_LENGTH:
@@ -199,16 +283,26 @@ def _top_up_prompt_queue() -> None:
         "generator: topping up prompt queue from %d to %d (+%d)",
         current, current + needed, needed,
     )
+    avoid = _gather_avoid_prompts()
     for _ in range(needed):
         topic = prompt_library.random_prompt()
+        chosen_angles = angles_mod.sample_angles()
         try:
-            expanded = generate.expand_topic(topic)
+            expanded = generate.expand_topic(
+                topic, angles=chosen_angles, avoid=avoid,
+            )
         except Exception:
             log.exception(
                 "ERROR generator: expand_topic failed, enqueueing raw topic: %r",
                 topic,
             )
             expanded = topic
+        # Append the new expansion to the in-tick avoid list so the next
+        # iteration in this loop also dodges it — without this, two
+        # back-to-back picks of the same topic in one tick can both
+        # produce near-identical expansions.
+        if expanded and expanded.strip() and expanded != topic:
+            avoid = [expanded.strip(), *avoid]
         try:
             queue.enqueue("prompt", prompt=expanded, source="cron")
         except Exception:

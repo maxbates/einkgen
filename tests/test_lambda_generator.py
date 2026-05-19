@@ -75,7 +75,10 @@ def _patch_pipeline_and_expand(monkeypatch, *, expansions=None):
     # Deterministic expansion so tests can assert the queued prompt.
     queue_iter = iter(expansions or [])
 
-    def fake_expand(topic):
+    def fake_expand(topic, **_kw):
+        # **_kw absorbs the steering kwargs (`angles=`, `avoid=`) the
+        # real ``expand_topic`` now accepts. Tests don't care about
+        # them except where they're explicitly under test.
         expand_calls.append(topic)
         try:
             return next(queue_iter)
@@ -186,7 +189,7 @@ def test_cron_expand_failure_falls_back_to_raw_topic(monkeypatch, s3_bucket):
     # buffer count via the fake.
     buffer_calls, _, _ = _patch_pipeline_and_expand(monkeypatch)
 
-    def explode(_topic):
+    def explode(_topic, **_kw):
         raise RuntimeError("openai down")
 
     monkeypatch.setattr("einkgen.lambdas.generator.generate.expand_topic", explode)
@@ -356,6 +359,90 @@ def test_unknown_event_is_ignored(monkeypatch, s3_bucket):
     assert q.count() == 1
 
 
+def test_cron_passes_steering_to_expand_topic(monkeypatch, s3_bucket):
+    """expand_topic should receive ``angles`` + an avoid list each call.
+
+    Avoid list seed:
+    - history (one frame with a known prompt)
+    - pending queue (one item already enqueued)
+    - generated buffer (one marker with a prompt)
+    Across the loop, the first expansion should also appear in the
+    avoid list for the second call (in-tick accumulation), since
+    rendering two near-identical prompts back-to-back is exactly the
+    failure mode this steering is meant to prevent.
+    """
+    import json
+
+    from einkgen.core import s3 as s3mod
+
+    # Capture every expand_topic call's kwargs so we can assert on them.
+    captured: list[dict] = []
+
+    def fake_expand(topic, **kwargs):
+        captured.append({"topic": topic, **kwargs})
+        # Return distinct strings so the in-tick accumulator has
+        # something to add for the second call.
+        return f"EXPANSION-{len(captured)}::{topic}"
+
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.generate.expand_topic", fake_expand
+    )
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.pipeline.buffer_item", lambda _i: None
+    )
+    monkeypatch.setattr(
+        "einkgen.lambdas.generator.pipeline.publish_item", lambda _i: None
+    )
+
+    # Seed the three avoid sources.
+    s3mod.put_object(
+        "history/01HFA000000000000000000001/manifest.json",
+        json.dumps({
+            "version": 1,
+            "generated_at": "2026-01-01T00:00:00Z",
+            "image_url": "https://example/x.bmp",
+            "image_sha256": "a" * 64,
+            "image_bytes": 1,
+            "display": {},
+            "next_check_after": "2026-01-01T00:00:00Z",
+            "source": {"kind": "generated", "prompt": "from-history"},
+        }).encode("utf-8"),
+        content_type="application/json",
+    )
+    q.enqueue("prompt", prompt="from-queue")
+    g.enqueue(
+        "01HFBUFFER000000000000000",
+        image_sha256="b" * 64, image_bytes=1,
+        source={"kind": "generated", "prompt": "from-buffer"},
+    )
+
+    # Only the top-up path is under test — invoke it directly so this
+    # stays a unit test of steering, not of cron's bigger refill loop.
+    # Force at least two expansions so the in-tick accumulator is hit.
+    monkeypatch.setattr(generator, "TARGET_PROMPT_QUEUE_LENGTH", 3)
+    monkeypatch.setattr(generator, "MAX_PROMPT_TOP_UP_PER_TICK", 3)
+    generator._top_up_prompt_queue()
+
+    # We seeded 1 pending → need 2 more to hit floor=3.
+    assert len(captured) == 2
+
+    # Both calls got an ``angles`` list — sampled from the angles bag.
+    for call in captured:
+        assert isinstance(call.get("angles"), list)
+        assert len(call["angles"]) >= 1
+
+    # Both calls got an avoid list containing all three seeded sources.
+    first_avoid = captured[0]["avoid"]
+    assert "from-history" in first_avoid
+    assert "from-queue" in first_avoid
+    assert "from-buffer" in first_avoid
+
+    # The second call also sees the first expansion in its avoid list —
+    # in-tick accumulation prevents back-to-back near-duplicates.
+    second_avoid = captured[1]["avoid"]
+    assert any("EXPANSION-1::" in entry for entry in second_avoid)
+
+
 def test_pipeline_failure_leaves_item_on_queue(monkeypatch, s3_bucket):
     def explode(_item):
         raise RuntimeError("publish blew up")
@@ -365,7 +452,7 @@ def test_pipeline_failure_leaves_item_on_queue(monkeypatch, s3_bucket):
     )
     monkeypatch.setattr(
         "einkgen.lambdas.generator.generate.expand_topic",
-        lambda topic: f"EXP::{topic}",
+        lambda topic, **_kw: f"EXP::{topic}",
     )
 
     q.enqueue("prompt", prompt="please render")
@@ -416,7 +503,7 @@ def test_permanent_error_on_cron_drops_head(monkeypatch, s3_bucket):
 
     monkeypatch.setattr(
         "einkgen.lambdas.generator.generate.expand_topic",
-        lambda topic: f"EXPANDED::{topic}",
+        lambda topic, **_kw: f"EXPANDED::{topic}",
     )
 
     def fake_buffer(item: QueueItem) -> None:
