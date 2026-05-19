@@ -166,12 +166,41 @@ export class EinkgenStack extends Stack {
       },
     );
 
+    // ---- Daily render-cap alarm wiring --------------------------------
+    // `einkgenDailyRenderCap` is the threshold for the CloudWatch alarm
+    // on generator invocations over a rolling 24 h window. Default 100
+    // (~$4/day at gpt-image-2 medium). `einkgenAlarmEmail`, if set,
+    // subscribes that address to the alarm SNS topic.
+    const DEFAULT_DAILY_RENDER_CAP = 100;
+    const dailyRenderCapCtx = this.node.tryGetContext('einkgenDailyRenderCap');
+    let dailyRenderCap = DEFAULT_DAILY_RENDER_CAP;
+    if (
+      dailyRenderCapCtx !== undefined &&
+      dailyRenderCapCtx !== null &&
+      `${dailyRenderCapCtx}`.trim()
+    ) {
+      const parsed = Number(`${dailyRenderCapCtx}`.trim());
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error(
+          `einkgenDailyRenderCap must be a positive integer (got ${dailyRenderCapCtx})`,
+        );
+      }
+      dailyRenderCap = parsed;
+    }
+    const alarmEmailCtx = this.node.tryGetContext('einkgenAlarmEmail');
+    const alarmEmail =
+      typeof alarmEmailCtx === 'string' && alarmEmailCtx.trim()
+        ? alarmEmailCtx.trim()
+        : undefined;
+
     new EinkgenObservability(this, 'Observability', {
       envName: props.envName,
       generator: lambdas.generator,
       readApi: lambdas.readApi,
       deviceStatus: lambdas.deviceStatus,
       adminApi: lambdas.adminApi,
+      dailyRenderCap,
+      ...(alarmEmail ? { alarmEmail } : {}),
     });
 
     // ---- Inbound-email submissions (opt-in) -----------------------------

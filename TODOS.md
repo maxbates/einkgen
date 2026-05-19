@@ -115,18 +115,27 @@ tiers (Claude structured + Claude adversarial subagent). Run `npm install -g
 @openai/codex` to enable the Codex structured review and Codex adversarial
 challenge on future releases.
 
-### Daily OpenAI cost cap
-**Priority:** P2 *(was P3 — bumped in 0.6.0.0 because `POST /wake` is a new
-device-token-authenticated public spend trigger; a leaked token can drive
-sustained renders bounded only by generator concurrency = 1 + the sha-debounce
-which only holds within a single device's wake cycle)*
+### Daily OpenAI cost circuit-breaker (Option B)
+**Priority:** P3 *(was P2; Option A — CloudWatch alarm + SNS topic on the
+generator's 24 h invocation count — shipped in [0.6.2.0])*
 **Source:** PLAN §3 + phase 2 adversarial review + 0.6.0.0 security review
 
-No daily $ cap on OpenAI spend. `retryAttempts: 0` on the generator Lambda + the
-EventBridge target caps retry-amplification. Cost-runaway from a high-volume
-legitimate queue or a leaked device token is bounded only by reserved concurrency
-= 1 + the cron interval. Add a CloudWatch alarm on the generator's invocation
-count + OpenAI usage when convenient.
+Option A (observability) is live: a CloudWatch alarm on
+`AWS/Lambda Invocations` for `einkgen-generator` over a 24 h window
+publishes to an SNS topic. Threshold = `einkgenDailyRenderCap` (default
+100/day ≈ ~$4/day at `gpt-image-2` medium). Subscribe an inbox via
+`einkgenAlarmEmail` — see QUICKSTART §3.13. When it fires the operator
+gets paged and manually disables the cron rule.
+
+Option B (auto-stop): a small Lambda subscribed to the same SNS topic
+that calls `events:DisableRule` on `einkgen-generator-cron` when the
+alarm transitions to ALARM. Operator manually re-enables once they've
+investigated. Document the unblock procedure under CLAUDE.md "It's
+broken / debug this" when this lands.
+
+Only worth doing if Option A alarms aren't enough — i.e. if the operator
+finds themselves repeatedly waking to drained budget and wishes the
+system had stopped itself. Otherwise paging is sufficient.
 
 ### CloudFront invalidation `CallerReference` collisions
 **Priority:** P4
@@ -165,7 +174,7 @@ and `action=redraw`. Firmware feeds them straight into `downloadVerifyAndDraw`
 and skips the follow-up GET. `action=queue_empty` and a server rollback both
 degrade cleanly to the legacy `fetchManifest` path.
 
-### ~~Submissions via email / CLI shouldn't disappear behind the buffer~~ (resolved in 0.6.2.0)
+### ~~Submissions via email / CLI shouldn't disappear behind the buffer~~ (resolved in 0.6.3.0)
 **Priority:** P2 → resolved
 **Source:** 0.6.0.0 adversarial review (UX regression)
 
@@ -174,7 +183,7 @@ the next cron tick (≤ 30 min). After 0.6.0.0 those submissions landed on the
 prompt queue and only got buffered into `generated/` after cron drained 10
 items ahead of them — user-visible latency was 10 × 30 min = ~5 h.
 
-Fixed in 0.6.2.0 (option (a) from the original fix sketch). Both submission
+Fixed in 0.6.3.0 (option (a) from the original fix sketch). Both submission
 paths now grow an explicit "render this now" affordance that enqueues at the
 top of the queue and async-invokes the generator with `render_now`, the same
 as the SPA Admin tab's **Now** button:
