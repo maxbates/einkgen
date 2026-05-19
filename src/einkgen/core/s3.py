@@ -48,18 +48,37 @@ def get_object(key: str) -> bytes:
     return resp["Body"].read()
 
 
+def get_object_with_etag(key: str) -> tuple[bytes, str]:
+    """Fetch the body and the ETag (for optimistic-concurrency writes)."""
+    resp = get_client().get_object(Bucket=_bucket(), Key=key)
+    return resp["Body"].read(), resp["ETag"]
+
+
 def put_object(
     key: str,
     body: bytes,
     content_type: str = "application/octet-stream",
+    *,
+    if_match: str | None = None,
+    if_none_match: str | None = None,
 ) -> None:
-    """Upload bytes to S3 with an explicit Content-Type."""
-    get_client().put_object(
-        Bucket=_bucket(),
-        Key=key,
-        Body=body,
-        ContentType=content_type,
-    )
+    """Upload bytes to S3 with an explicit Content-Type.
+
+    ``if_match`` and ``if_none_match`` (S3 conditional-write headers) let
+    callers do compare-and-swap on a key. A failed precondition surfaces
+    as ``botocore.ClientError`` with code ``PreconditionFailed``.
+    """
+    kwargs: dict[str, Any] = {
+        "Bucket": _bucket(),
+        "Key": key,
+        "Body": body,
+        "ContentType": content_type,
+    }
+    if if_match is not None:
+        kwargs["IfMatch"] = if_match
+    if if_none_match is not None:
+        kwargs["IfNoneMatch"] = if_none_match
+    get_client().put_object(**kwargs)
 
 
 def delete_object(key: str) -> None:

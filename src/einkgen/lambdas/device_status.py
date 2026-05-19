@@ -146,12 +146,12 @@ DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 # so a token-holder can't dump arbitrary bytes through ``current_sha256``.
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Constant headers on every response. CORS is set defensively here so the
-# Lambda is usable in isolation; the real CORS pin lives on the HTTP API
-# itself (no CORS configured — device-status is firmware-only).
+# Constant headers on every response. No `Access-Control-Allow-Origin` —
+# this endpoint is firmware-only (the SPA never calls it), the HTTP API
+# doesn't configure CORS, and advertising `*` here only confuses readers
+# about who the intended caller is.
 _RESPONSE_HEADERS = {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
 }
 
 # Module-scope token cache with a TTL. Lambda reuses warm execution

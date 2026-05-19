@@ -268,6 +268,52 @@ def test_set_current_from_history_missing_raises(s3_bucket):
         publish.set_current_from_history("01DOESNOTEXIST")
 
 
+def test_manifest_cas_retries_on_precondition_failure(s3_bucket, monkeypatch):
+    """Two racing writers must end with monotonically increasing versions.
+
+    Simulates the ``/wake`` race documented in TODOS: one writer reads
+    ``previous_version = N``, a second writer slips in and writes
+    ``N+1``, then the first writer's conditional put 412s. The CAS
+    loop should re-read and retry with ``N+2`` rather than silently
+    overwriting ``N+1``.
+    """
+    from botocore.exceptions import ClientError
+
+    publish.publish(
+        PROCESSED,
+        source={"kind": "generated"},
+        item_id="01SEED",
+        now=datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc),
+    )
+
+    real_put = publish.s3.put_object
+
+    call_count = {"n": 0}
+
+    def flaky_put(key, body, content_type="application/octet-stream", **kwargs):
+        # First write to current/manifest.json fails its precondition;
+        # the CAS loop re-reads and retries successfully.
+        if key == publish.CURRENT_MANIFEST_KEY and call_count["n"] == 0:
+            call_count["n"] += 1
+            raise ClientError(
+                {"Error": {"Code": "PreconditionFailed", "Message": "ETag mismatch"}},
+                "PutObject",
+            )
+        return real_put(key, body, content_type=content_type, **kwargs)
+
+    monkeypatch.setattr(publish.s3, "put_object", flaky_put)
+
+    out = publish.publish(
+        PROCESSED + b"X",
+        source={"kind": "generated"},
+        item_id="01SECOND",
+        now=datetime(2026, 5, 13, 15, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert out.version == 2
+    assert call_count["n"] == 1
+
+
 def test_set_current_from_history_invalidates_cf(s3_bucket, monkeypatch):
     # Seed history without CF wired up — the publish() shouldn't invalidate.
     publish.publish(
