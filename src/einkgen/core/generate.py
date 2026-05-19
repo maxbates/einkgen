@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import os
+from collections.abc import Sequence
 from typing import Any
 
 from einkgen.core import prompt_library as _prompt_library
@@ -59,16 +60,52 @@ TEXT_MODEL = os.environ.get("EINKGEN_TEXT_MODEL", "gpt-5-mini")
 
 EXPAND_TOPIC_SYSTEM_PROMPT = (
     "You design concrete image prompts for an e-paper display. The user "
-    "gives you a topic. Reply with a single concrete image prompt "
-    "(1–3 sentences, no preamble, no quotes, no markdown) that describes "
-    "one specific scene or composition fitting that topic. Be concrete: "
-    "name a clear focal subject, a specific composition, and any "
-    "supporting detail. The image will be dithered to 8 grays on a "
-    "1200×825 panel, so favor strong contrast, bold shapes, and a "
-    "paper-white background with the subject in strong darks. Do not "
-    "include the words 'e-paper', 'e-ink', 'dither', or 'grayscale' — "
-    "those are handled separately. Output ONLY the prompt text."
+    "gives you a topic, optionally with ANGLES (steering hints) and an "
+    "AVOID list (recent expansions you must not repeat or paraphrase). "
+    "Reply with a single concrete image prompt (1–3 sentences, no "
+    "preamble, no quotes, no markdown) that describes one specific "
+    "scene or composition fitting the topic. Be concrete: name a clear "
+    "focal subject, a specific composition, and any supporting detail. "
+    "If ANGLES are provided, weave them into the scene where they "
+    "enhance the topic; you may quietly ignore an angle that genuinely "
+    "fights the topic's intent. If an AVOID list is provided, pick a "
+    "subject and composition that is materially different from every "
+    "entry — different focal subject, different setting, different "
+    "framing. The image will be dithered to 8 grays on a 1200×825 "
+    "panel, so favor strong contrast, bold shapes, and a paper-white "
+    "background with the subject in strong darks. Do not include the "
+    "words 'e-paper', 'e-ink', 'dither', or 'grayscale' — those are "
+    "handled separately. Output ONLY the prompt text."
 )
+
+
+def _build_expand_user_message(
+    topic: str,
+    *,
+    angles: Sequence[str],
+    avoid: Sequence[str],
+) -> str:
+    """Stitch topic + angles + avoid-list into the per-call user message.
+
+    Kept separate from ``expand_topic`` so tests can assert the exact
+    wire format without mocking OpenAI. The format is intentionally
+    plain-English with capitalised section headers — gpt-5-mini follows
+    them reliably without needing JSON or fenced blocks.
+    """
+    lines = [f"TOPIC: {topic.strip()}"]
+    if angles:
+        joined = ", ".join(a.strip() for a in angles if a and a.strip())
+        if joined:
+            lines.append(f"ANGLES (weave these in where they fit): {joined}")
+    if avoid:
+        cleaned = [a.strip() for a in avoid if a and a.strip()]
+        if cleaned:
+            lines.append(
+                "AVOID (do not repeat or paraphrase any of these recent "
+                "expansions; pick something materially different):"
+            )
+            lines.extend(f"- {a}" for a in cleaned)
+    return "\n".join(lines)
 
 
 def _resolve_api_key() -> str | None:
@@ -182,7 +219,13 @@ def random_prompt() -> str:
     return _prompt_library.random_prompt()
 
 
-def expand_topic(topic: str, *, client: Any = None) -> str:
+def expand_topic(
+    topic: str,
+    *,
+    client: Any = None,
+    angles: Sequence[str] = (),
+    avoid: Sequence[str] = (),
+) -> str:
     """Turn a short topic into a concrete image-generation prompt.
 
     The prompt library is a list of *topics* (one line each). The cron
@@ -190,6 +233,12 @@ def expand_topic(topic: str, *, client: Any = None) -> str:
     holds a specific scene description, not just the topic. We rely on
     text-generation variance for diversity instead of asking the image
     model to interpret a high-level brief 100 times.
+
+    ``angles`` and ``avoid`` are the anti-mode-collapse steering
+    signals — see ``core.angles`` and ``core.history.recent_prompts``.
+    Both are optional; when empty the function behaves as a bare
+    "concretise this topic" call. Callers that don't care about
+    diversity (one-off tests, restyle paths) can omit them.
 
     Returns the expanded prompt with surrounding whitespace stripped.
     Raises whatever the OpenAI SDK raises on failure — callers decide
@@ -199,11 +248,14 @@ def expand_topic(topic: str, *, client: Any = None) -> str:
         raise ValueError("topic must be a non-empty string")
     if client is None:
         client = _default_client()
+    user_message = _build_expand_user_message(
+        topic, angles=angles, avoid=avoid,
+    )
     response = client.chat.completions.create(
         model=TEXT_MODEL,
         messages=[
             {"role": "system", "content": EXPAND_TOPIC_SYSTEM_PROMPT},
-            {"role": "user", "content": topic.strip()},
+            {"role": "user", "content": user_message},
         ],
     )
     choice = response.choices[0]

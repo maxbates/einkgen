@@ -5,6 +5,46 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.4.0] - 2026-05-19
+
+### Added
+- **Steered prompt-expansion — kills "every landmark is Machu Picchu"
+  mode collapse on the cron's text-LLM topic expansion.** The cron's
+  ``expand_topic`` calls now carry two new per-call signals that push
+  the LLM into a different corner of concept space on every tick:
+
+  * **Random angles.** A new ``core.angles`` module ships ~200
+    generic phrases across five axes (region, era, light, scale,
+    mood). ``angles.sample_angles()`` picks two axes at random and
+    one phrase from each per call (~80k pairwise combinations), and
+    ``generator._top_up_prompt_queue`` injects them as an ``ANGLES``
+    section in the user message. The LLM weaves them in where they
+    enhance the topic and may quietly skip an angle that fights it
+    (e.g. "pixel art" + "macro close-up" can ignore the scale angle).
+  * **Avoid-list of recent expansions.** A new ``core.history``
+    helper reads the last 30 ``history/<id>/manifest.json`` prompts.
+    ``generator._gather_avoid_prompts`` combines them with the
+    pending prompt queue + generated buffer (deduped
+    case-insensitively, freshest first) and the LLM is told not to
+    repeat or paraphrase any entry. As each new expansion lands in
+    the same cron tick it's also appended to the in-tick avoid list,
+    so two back-to-back picks of the same topic can't paraphrase
+    each other.
+
+  Behaviour change is cron-only — admin **Now** / **Run** and inbound
+  email already submit literal prompts and never call ``expand_topic``.
+  No new IAM (history reads + queue reads use the same bucket the
+  generator already touches), no new env vars, no schema changes. Cost
+  per cron tick is essentially unchanged: ``expand_topic`` is
+  ``gpt-5-mini`` and the per-call user message grows by ~2-15KB of
+  steering text.
+
+  Operator follow-up: ``scripts/sample_expansions.py`` is a one-off
+  tool for eyeballing variety after future tweaks to the angle bag or
+  the system prompt — runs N expansions against the real text model
+  with the same steering the cron uses, prints each expansion alongside
+  its injected angles.
+
 ## [0.6.3.0] - 2026-05-19
 
 ### Added
