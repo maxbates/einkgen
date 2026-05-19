@@ -94,6 +94,25 @@ static const int BATT_LOW_THRESHOLD_PCT = 10;
 // INKPLATE_3BIT is defined in the Inkplate library.
 Inkplate display(INKPLATE_3BIT);
 
+// Manifest fields embedded in the /wake response (since v0.6.1.0).
+// `hasManifest` is true only when the server returned all four image
+// fields — i.e. action=advance or action=redraw on a fresh server.
+// queue_empty, HTTP errors, and older servers all leave hasManifest
+// false and the caller falls back to fetchManifest.
+//
+// Declared above any function that uses it because the Arduino IDE
+// auto-generates function prototypes and inserts them near the top of
+// the .ino, BEFORE the user-code definitions. A struct used in a
+// prototype parameter list has to be visible at that injection point.
+struct WakeResult {
+    bool   hasManifest;
+    String action;           // "advance" | "redraw" | "queue_empty" | ""
+    String imageUrl;
+    String imageHash;        // image_sha256
+    int    imageBytes;
+    String nextCheckAfter;   // ISO 8601 UTC
+};
+
 // ----- Helpers ---------------------------------------------------------------
 
 static void deepSleepFor(uint64_t seconds)
@@ -413,20 +432,6 @@ static String wakeUrl()
     u += "/wake";
     return u;
 }
-
-// Manifest fields embedded in the /wake response (since v0.6.1.0).
-// `hasManifest` is true only when the server returned all four image
-// fields — i.e. action=advance or action=redraw on a fresh server.
-// queue_empty, HTTP errors, and older servers all leave hasManifest
-// false and the caller falls back to fetchManifest.
-struct WakeResult {
-    bool   hasManifest;
-    String action;           // "advance" | "redraw" | "queue_empty" | ""
-    String imageUrl;
-    String imageHash;        // image_sha256
-    int    imageBytes;
-    String nextCheckAfter;   // ISO 8601 UTC
-};
 
 // Best-effort wake POST. Tells the server "the panel is currently
 // showing <sha>". On HTTP 200 the response carries `action` and

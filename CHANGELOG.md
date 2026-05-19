@@ -5,6 +5,23 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.5.1] - 2026-05-19
+
+### Fixed
+- **Inkplate firmware compile error: ``'WakeResult' has not been
+  declared``.** The Arduino IDE preprocessor auto-generates function
+  prototypes from ``.ino`` files and inserts them near the top of the
+  translation unit, BEFORE the user-code definitions. ``WakeResult``
+  was declared just above ``postWake()`` (line ~422), but the synthetic
+  prototype for ``postWake(const char *, WakeResult &)`` was injected
+  near the file header, where the struct was not yet visible — so the
+  build failed with ``error: 'WakeResult' has not been declared``.
+  Moved the struct definition above the first function body (right
+  after the ``Inkplate display(INKPLATE_3BIT)`` global) and removed
+  the now-duplicate definition. Pure relocation; zero behavior change.
+  Unblocks fresh ``arduino-cli compile`` runs on the inkplate10
+  sketch.
+
 ## [0.6.5.0] - 2026-05-19
 
 ### Added
