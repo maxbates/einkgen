@@ -5,6 +5,42 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.6.0] - 2026-05-20
+
+### Changed
+- **Cron cadence dropped from 30 min → 1 hour.** ``einkgenPollIntervalSeconds``
+  in [infra/cdk.json](infra/cdk.json) is now ``3600`` (was ``1800``). Same
+  knob drives both the EventBridge cron rate and the manifest's
+  ``next_check_after`` hint, so the device's next-check interval doubles
+  in lockstep. Estimated OpenAI image-gen spend drops from ~$55/mo to
+  ~$30/mo at this cadence; battery on a 3 Ah cell roughly doubles from
+  ~3–4 months to ~6–9 months. No firmware re-flash required — ``3600``
+  is at the firmware's sub-hour-honoring ceiling.
+
+### Added
+- **CloudWatch alarm on OpenAI billing cap / insufficient quota.** New
+  metric filter on the generator log group matches either
+  ``billing_hard_limit_reached`` (image-gen ``gpt-image-2`` 400) or
+  ``insufficient_quota`` (chat completions ``gpt-5-mini`` 429). Either
+  shape means the OpenAI account is out of credit — the generator
+  silently chews through queue items as "permanent failures" and the
+  device gets stuck on whatever frame is in ``current/manifest.json``,
+  with no operator signal until someone notices the panel hasn't moved.
+  New alarm ``einkgen-<env>-openai-credit-exhausted`` pages via the
+  shared SNS topic on the first failing cron tick and then stays
+  silent across subsequent failing ticks (1-hour period absorbs the
+  30-min cron cadence; the alarm has no OK action so recovery is
+  silent). Net result: **one email per outage**, not one per tick.
+- **Alarm email subscription wired by default.** ``einkgenAlarmEmail``
+  is now set in [infra/cdk.json](infra/cdk.json) so the existing SNS
+  topic — previously a "create-only, attach-subscriber-by-hand"
+  resource — gets a confirmed subscriber on first deploy. SNS email
+  subscriptions require one-time recipient confirmation; first deploy
+  triggers an "AWS Notification - Subscription Confirmation" email
+  that has to be clicked once. After confirmation, all three alarms
+  (daily-render-cap, generated-queue-empty, openai-credit-exhausted)
+  reach the operator's inbox.
+
 ## [0.6.5.1] - 2026-05-19
 
 ### Fixed
