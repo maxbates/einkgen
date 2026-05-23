@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [0.6.7.0] - 2026-05-23
+
+### Changed
+- **Prompts simplified for across-the-room viewing.** The display is
+  read by a baby from 6–8 ft away, but the cron's expanded prompts
+  were producing dense, multi-subject scenes whose detail dissolved at
+  distance. Three coordinated tweaks push the pipeline toward simpler
+  compositions:
+  - ``BASE_PROMPT`` (prepended to every image-gen call) now tells the
+    model to compose for a baby viewing the panel from 6–8 ft: one or
+    two clear subjects, large in the frame, with generous empty
+    paper-white space; no clutter, no busy backgrounds, no fine
+    pattern.
+  - ``EXPAND_TOPIC_SYSTEM_PROMPT`` (the cron's text-LLM step) now
+    enforces ONE focal subject (or at most two closely related ones),
+    asks angles to FLAVOR the subject rather than add objects, and
+    explicitly avoids generic baby imagery (balloons, teddy bears,
+    rainbows, smiling cartoons).
+  - ``prompt_library.DEFAULTS`` (seed library) rewritten to lean
+    single-subject. The composition rules now live in the system
+    prompt, so the topics no longer carry per-entry composition hints
+    that pulled in the opposite direction. Existing deployments keep
+    their operator-edited ``s3://<bucket>/config/prompt_library.txt``
+    — run ``einkgen prompts reset`` (or use the SPA Admin tab's
+    "Reset to defaults" button) to adopt the new seed list.
+
 ## [0.6.6.0] - 2026-05-20
 
 ### Changed
@@ -57,7 +83,6 @@ This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
   the now-duplicate definition. Pure relocation; zero behavior change.
   Unblocks fresh ``arduino-cli compile`` runs on the inkplate10
   sketch.
-
 ## [0.6.5.0] - 2026-05-19
 
 ### Added

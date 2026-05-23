@@ -39,17 +39,21 @@ PROMPT_LIBRARY_CACHE_TTL_SECONDS = 60
 
 # Same 10 entries previously hardcoded in generate.PROMPT_LIBRARY. They live
 # here now so missing-file fallback and "reset to defaults" share one source.
+# Topics intentionally name a SINGLE subject category — the expand_topic
+# system prompt enforces the "1–2 subjects, lots of empty space, read at
+# 6–8 ft" composition rules, so the topics here don't need to re-specify
+# them. Keep entries unusual (no generic baby imagery) but simple.
 DEFAULTS: tuple[str, ...] = (
-    "Geometric composition — overlapping circles, squares, triangles; bold flat shapes; high contrast.",
-    "Botanical illustration — pen-and-ink style; a single plant or flower; scientific-diagram aesthetic.",
-    "Pixel art scene — 32×32 or 64×64 motif scaled up; chunky, low-detail.",
-    "Architectural line drawing — building, bridge, or interior; technical-drawing feel.",
-    "Topographic / contour pattern — abstract elevation lines or isobars.",
-    "Vintage scientific diagram — anatomy, astronomy, or mechanical schematic.",
-    "Baby-friendly collage — simple recognisable objects (animal, fruit, toy) arranged playfully.",
-    "Abstract generative pattern — flow fields, Voronoi, fractal noise.",
-    "Portrait study — single face, woodcut or charcoal feel.",
-    "Model's choice — open-ended: anything striking that reads well in 8 grays.",
+    "One bold geometric shape — a single circle, square, or triangle — as the only subject.",
+    "Pen-and-ink botanical study — one plant, flower, or seed pod, isolated.",
+    "A chunky pixel-art creature or object — one character, no scene around it.",
+    "Architectural line drawing — one building, bridge, or doorway, isolated.",
+    "A single hill, island, or coastline rendered as concentric topographic contours.",
+    "Vintage scientific-diagram style — one animal, organ, or instrument, isolated.",
+    "A single animal in strong silhouette, large in the frame, nothing else around it.",
+    "An everyday object made strange — one item, magnified and isolated, woodcut feel.",
+    "Portrait study — a single face, woodcut or charcoal feel; head fills the frame.",
+    "Model's choice — one striking, unusual subject and nothing else.",
 )
 
 _HEADER = (
