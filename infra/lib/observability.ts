@@ -203,5 +203,72 @@ export class EinkgenObservability extends Construct {
         width: 24,
       }),
     );
+
+    // ---- OpenAI credit-exhausted alarm ---------------------------------
+    // Matches the two distinct OpenAI error shapes that mean "the account
+    // is out of credit / over its billing cap":
+    //   - image-gen (`gpt-image-2`) → HTTP 400 with code
+    //     `billing_hard_limit_reached`. Surfaces in our logs as
+    //     ``dropping queue item ... — permanent failure: ... 'code':
+    //     'billing_hard_limit_reached'``.
+    //   - chat completions (`expand_topic` via gpt-5-mini) → HTTP 429
+    //     with code `insufficient_quota`.
+    //
+    // When the cap is hit the generator silently chews through queue
+    // items as "permanent failures" and the device gets stuck on
+    // whatever frame is currently in `current/manifest.json`.
+    //
+    // "Only once per outage" semantics: the alarm transitions OK→ALARM
+    // on the first failing cron tick and emails via SNS. As long as
+    // subsequent ticks (every 30 min by default) keep logging the same
+    // error, the alarm stays in ALARM and does NOT re-page. Once the
+    // operator lifts the OpenAI cap and a full 1-hour period passes
+    // with zero matching log lines, the alarm returns to OK — silently,
+    // since we deliberately do not register an OK action. Next outage
+    // = next single email.
+    const openaiExhaustedMetric = 'OpenAiCreditExhaustedHits';
+    new logs.MetricFilter(this, 'OpenAiCreditExhaustedFilter', {
+      logGroup: props.generator.logGroup,
+      filterPattern: logs.FilterPattern.anyTerm(
+        'billing_hard_limit_reached',
+        'insufficient_quota',
+      ),
+      metricNamespace: METRIC_NAMESPACE,
+      metricName: openaiExhaustedMetric,
+      metricValue: '1',
+      defaultValue: 0,
+    });
+    const openaiExhaustedAlarm = new cloudwatch.Alarm(this, 'OpenAiCreditExhaustedAlarm', {
+      alarmName: `einkgen-${props.envName}-openai-credit-exhausted`,
+      alarmDescription:
+        'einkgen generator logged an OpenAI billing-cap / insufficient-quota ' +
+        'error. The pipeline cannot render new frames until the cap is lifted ' +
+        '(OpenAI dashboard → Settings → Limits) or the account is topped up. ' +
+        'Until then queue items are being dropped as permanent failures and ' +
+        'the device is showing a stale frame. This alarm fires once per ' +
+        'outage; it auto-resolves after 1h of clean cron ticks.',
+      metric: new cloudwatch.Metric({
+        namespace: METRIC_NAMESPACE,
+        metricName: openaiExhaustedMetric,
+        statistic: cloudwatch.Stats.SUM,
+        // 1-hour window absorbs the 30-min cron cadence so the alarm
+        // stays ALARM across consecutive failing ticks without flapping.
+        period: Duration.hours(1),
+        label: 'OpenAI credit-exhausted log hits',
+      }),
+      threshold: 0,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    openaiExhaustedAlarm.addAlarmAction(new cwactions.SnsAction(this.alarmTopic));
+
+    this.dashboard.addWidgets(
+      new cloudwatch.AlarmWidget({
+        title: 'OpenAI credit exhausted (billing cap / insufficient quota)',
+        alarm: openaiExhaustedAlarm,
+        width: 24,
+      }),
+    );
   }
 }
