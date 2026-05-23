@@ -7,6 +7,25 @@ This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
 ## [0.6.6.0] - 2026-05-20
 
+### Fixed
+- **OpenAI billing-cap / quota errors no longer destroy queue items.**
+  ``core/pipeline._call_openai`` used to translate every
+  ``openai.BadRequestError`` (HTTP 400) into ``PermanentItemError``,
+  which made the generator finalize-and-drop the queue item. That's
+  correct for item-specific failures like ``moderation_blocked``, but
+  wrong for account-level failures like ``billing_hard_limit_reached``
+  (also HTTP 400) — a single cap-hit cron tick silently destroyed every
+  pending prompt at the head of the queue, including user-submitted
+  ones. The classifier now consults a narrow allowlist of item-specific
+  codes (``moderation_blocked``, ``content_policy_violation``, image-
+  format codes); anything else propagates as a transient error so the
+  item survives in the queue for the next cron tick to retry after the
+  operator lifts the cap. Concretely: the production outage on
+  2026-05-20 dropped 5 cron-generated prompts before the new
+  ``openai-credit-exhausted`` alarm could surface it; under the new
+  classification those items would have stayed in the queue and
+  rendered cleanly once the cap was lifted.
+
 ### Changed
 - **Cron cadence dropped from 30 min → 1 hour.** ``einkgenPollIntervalSeconds``
   in [infra/cdk.json](infra/cdk.json) is now ``3600`` (was ``1800``). Same
@@ -16,6 +35,10 @@ This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
   ~$30/mo at this cadence; battery on a 3 Ah cell roughly doubles from
   ~3–4 months to ~6–9 months. No firmware re-flash required — ``3600``
   is at the firmware's sub-hour-honoring ceiling.
+- **CLAUDE.md cron-cadence prose updated to match.** Three references
+  to the old 30-min / 2-h cadence (the "Change how many items" row,
+  the "Render faster / slower" row, and the Hard rules OpenAI-cost
+  paragraph) now match the live 1-h rate.
 
 ### Added
 - **CloudWatch alarm on OpenAI billing cap / insufficient quota.** New

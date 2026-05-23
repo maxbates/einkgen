@@ -44,14 +44,57 @@ class PermanentItemError(Exception):
     """
 
 
-def _call_openai(fn, *args, **kwargs):
-    """Invoke an OpenAI call, translating non-retryable 400s.
+# OpenAI 400 codes that mean "this *specific* prompt/image will never
+# succeed" — i.e. retrying the same input is hopeless. Everything else
+# (billing cap, quota, auth, account state) is account-level state the
+# operator can fix, and the item should survive so it gets retried on
+# the next cron tick. Keep this set narrow on purpose: when in doubt,
+# err transient — preserving a queue item is cheap, destroying a
+# user-submitted prompt is not.
+_PERMANENT_OPENAI_CODES = frozenset(
+    {
+        "moderation_blocked",
+        "content_policy_violation",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_image_url",
+        "unsupported_image_format",
+    }
+)
 
-    ``openai.BadRequestError`` covers user-input errors the API will reject
-    on every retry (moderation, invalid prompt, unsupported size). We
-    catch it lazily so this module stays importable when ``openai`` isn't
-    installed (e.g. tests that stub the generate module out via
-    ``sys.modules``).
+
+def _is_permanent_openai_error(exc: BaseException) -> bool:
+    """True iff the BadRequestError carries an item-specific code.
+
+    Checks both the structured ``code`` attribute (preferred) and falls
+    back to substring matching on ``str(exc)`` for SDK versions / error
+    shapes where the attribute isn't populated. Both are best-effort —
+    when in doubt we return False (transient) so the item survives.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code in _PERMANENT_OPENAI_CODES:
+        return True
+    message = str(exc)
+    return any(c in message for c in _PERMANENT_OPENAI_CODES)
+
+
+def _call_openai(fn, *args, **kwargs):
+    """Invoke an OpenAI call, translating only *item-specific* 400s.
+
+    ``openai.BadRequestError`` is HTTP 400 — used for BOTH item-specific
+    failures (moderation, invalid image format) AND account-level
+    failures (``billing_hard_limit_reached``). The two need opposite
+    handling: item-specific = drop the item (PermanentItemError);
+    account-level = leave the item in the queue and let the next cron
+    tick retry once the operator lifts the cap / adds credit.
+
+    Reclassifying account-level errors as transient is essential —
+    otherwise a single cap-hit cron tick silently destroys whatever
+    user-submitted prompts happen to be at the head of the queue
+    (this bit us in production; see CHANGELOG 0.6.6.0).
+
+    Lazy import so this module stays importable when ``openai`` isn't
+    installed (tests stub the ``generate`` module via ``sys.modules``).
     """
     try:
         return fn(*args, **kwargs)
@@ -60,7 +103,7 @@ def _call_openai(fn, *args, **kwargs):
             from openai import BadRequestError
         except ImportError:
             raise exc
-        if isinstance(exc, BadRequestError):
+        if isinstance(exc, BadRequestError) and _is_permanent_openai_error(exc):
             raise PermanentItemError(str(exc)) from exc
         raise
 

@@ -283,6 +283,61 @@ def test_openai_bad_request_becomes_permanent_item_error(monkeypatch):
         pipeline.process_item(item)
 
 
+def test_openai_billing_cap_is_transient(monkeypatch):
+    """Account-level OpenAI 400s (billing cap) must NOT be Permanent.
+
+    ``billing_hard_limit_reached`` and ``insufficient_quota`` are
+    account-state failures the operator fixes in the OpenAI dashboard —
+    once they do, the same prompt will succeed. Classifying them as
+    Permanent (as the original blanket-``BadRequestError`` handler did)
+    destroys user-submitted prompts at the head of the queue during a
+    cap-hit window. They must propagate so the item survives for the
+    next cron tick.
+    """
+    from openai import BadRequestError
+
+    _install_fake_modules(monkeypatch)
+
+    billing_error = BadRequestError.__new__(BadRequestError)
+    Exception.__init__(
+        billing_error,
+        "Error code: 400 - {'error': {'message': 'Billing hard limit "
+        "has been reached.', 'type': 'billing_limit_user_error', "
+        "'code': 'billing_hard_limit_reached'}}",
+    )
+
+    def raises_billing(prompt):
+        raise billing_error
+
+    monkeypatch.setitem(
+        sys.modules,
+        "einkgen.core.generate",
+        types.SimpleNamespace(
+            generate=raises_billing,
+            generate_from_image=lambda *a, **k: b"",
+            random_prompt=lambda: "unused",
+            BASE_PROMPT="",
+            PROMPT_LIBRARY=[],
+            MODEL="gpt-image-2",
+        ),
+    )
+
+    item = QueueItem(
+        id="01HFTEST0009",
+        enqueued_at="2026-05-13T14:00:00Z",
+        source="admin",
+        kind="prompt",
+        prompt="prompt submitted just as the billing cap was hit",
+    )
+
+    # Must surface as the raw BadRequestError (NOT PermanentItemError) so
+    # the cron tick crashes and the item stays in the queue. The next
+    # tick retries — by which time the operator has hopefully lifted
+    # the cap.
+    with pytest.raises(BadRequestError):
+        pipeline.process_item(item)
+
+
 def test_non_bad_request_errors_propagate(monkeypatch):
     """Generic exceptions stay raw so Lambda retries them as transient."""
     _install_fake_modules(monkeypatch)
