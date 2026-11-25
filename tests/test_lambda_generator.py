@@ -648,3 +648,35 @@ def test_auto_art_rotation_survives_queue_to_history_and_buffer(monkeypatch, s3_
     assert len({art["lane"] for art in all_art}) == 8
     assert set(art["lane"] for art in all_art) <= set(art_rotation.LANES)
     assert q.peek_head().prompt == "My steampunk landscape"
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_persisted_topic_library_keeps_automatic_rotation(monkeypatch, s3_bucket, custom):
+    from einkgen.core import art_rotation, prompt_library
+
+    edited_topics = ["Steampunk rose garden", "Botanical landscape"]
+    if custom:
+        prompt_library.write(edited_topics)
+    else:
+        prompt_library.reset_to_defaults()
+
+    # Exercise multiple cron-size top-ups against the persisted S3 list.
+    target = len(art_rotation.LANES) + int(custom)
+    monkeypatch.setattr(generator, "TARGET_PROMPT_QUEUE_LENGTH", target)
+    monkeypatch.setattr(generator, "MAX_PROMPT_TOP_UP_PER_TICK", 3)
+    monkeypatch.setattr(generator.generate, "expand_topic", lambda topic, **_: topic)
+    for _ in range((target + 2) // 3):
+        generator._top_up_prompt_queue()
+
+    items = q.list()
+    assert len(items) == target
+    assert {item.auto_art["lane"] for item in items} == (
+        set(art_rotation.LANES) | ({art_rotation.CUSTOM_LANE} if custom else set())
+    )
+    for item in items:
+        assert any(item.prompt.startswith(topic + " rendered as ") for topic in edited_topics) == (
+            item.auto_art["lane"] == art_rotation.CUSTOM_LANE
+        )
+    assert prompt_library.load(force=True) == (
+        tuple(edited_topics) if custom else prompt_library.DEFAULTS
+    )

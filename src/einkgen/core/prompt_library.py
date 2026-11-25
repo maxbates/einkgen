@@ -1,11 +1,10 @@
 """S3-backed topic library for the cron's queue top-up.
 
-Each cron tick, the generator picks ``TARGET_QUEUE_LENGTH - count()``
-topics at random from this library, runs each through
-``generate.expand_topic`` (text LLM) to turn the topic into a concrete
-image prompt, and enqueues the expansions. The library itself is
-*topics*, not finished prompts — the expansion step is what adds
-specificity per pick. See ARCHITECTURE §4 / §6.
+Automatic queue top-ups rotate through built-in subject categories and
+art media. A saved custom library adds one category; missing, empty or
+reset libraries use just the built-in rotation. Explicit random requests
+still pick directly from this library. Entries are topics, not finished
+image prompts.
 
 The library lives at ``s3://<bucket>/config/prompt_library.txt`` as a
 plain text file:
@@ -20,8 +19,8 @@ nothing sensitive here. The Lambda keeps the loaded list in module
 scope to amortise the GetObject across warm invocations.
 
 If the S3 object is missing, ``load()`` falls back to ``DEFAULTS`` (the
-original 10 entries from ARCHITECTURE §6) so a fresh deploy never picks
-from an empty bank.
+original 10 entries from ARCHITECTURE §6) for explicit random requests
+and for listing or editing the library.
 """
 
 from __future__ import annotations
@@ -57,9 +56,8 @@ DEFAULTS: tuple[str, ...] = (
 )
 
 _HEADER = (
-    "# einkgen topic library — the cron picks one of these at random per\n"
-    "# top-up slot, then runs it through generate.expand_topic() (text LLM)\n"
-    "# to turn the topic into a concrete image prompt before enqueueing.\n"
+    "# einkgen topic library — custom entries rotate as one subject category\n"
+    "# for automatic art. Explicit random requests pick directly from this list.\n"
     "# One topic per line. Lines starting with # are ignored. Managed by\n"
     "# `einkgen prompts {ls,edit,reset}` and the SPA admin tab, but free\n"
     "# to edit by hand.\n"
