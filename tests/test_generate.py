@@ -66,9 +66,10 @@ def test_generate_prepends_base_prompt_and_calls_with_correct_size():
     client.images.generate.assert_called_once()
     call_kwargs = client.images.generate.call_args.kwargs
     assert call_kwargs["size"] == IMAGE_SIZE == "1200x832"
-    assert call_kwargs["model"] == "gpt-image-2"
+    assert call_kwargs["model"] == "gpt-image-2.6-sunburst"
     assert call_kwargs["quality"] == "medium"
     assert call_kwargs["n"] == 1
+    assert call_kwargs["output_format"] == "png"
     assert call_kwargs["prompt"].startswith(BASE_PROMPT)
     assert call_kwargs["prompt"].endswith("a foggy cliff at dawn")
 
@@ -104,10 +105,11 @@ def test_generate_from_image_calls_edit_endpoint_with_prepended_base_prompt():
     assert out == fake_png
     client.images.edit.assert_called_once()
     kwargs = client.images.edit.call_args.kwargs
-    assert kwargs["model"] == "gpt-image-2"
+    assert kwargs["model"] == "gpt-image-2.6-sunburst"
     assert kwargs["quality"] == "medium"
     assert kwargs["size"] == IMAGE_SIZE
     assert kwargs["n"] == 1
+    assert kwargs["output_format"] == "png"
     assert kwargs["prompt"].startswith(BASE_PROMPT)
     assert kwargs["prompt"].endswith("as a charcoal sketch")
     # Image arg should be a BytesIO carrying the original bytes + filename hint.
@@ -137,7 +139,7 @@ def test_expand_topic_calls_text_model_and_returns_stripped_content():
 
     client.chat.completions.create.assert_called_once()
     kwargs = client.chat.completions.create.call_args.kwargs
-    assert kwargs["model"] == TEXT_MODEL
+    assert kwargs["model"] == TEXT_MODEL == "gpt-6.2-sol"
     messages = kwargs["messages"]
     assert messages[0]["role"] == "system"
     assert messages[0]["content"] == EXPAND_TOPIC_SYSTEM_PROMPT

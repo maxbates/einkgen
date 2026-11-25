@@ -5,6 +5,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses a 4-digit version scheme (MAJOR.MINOR.PATCH.MICRO).
 
+## [Unreleased]
+
+### Changed
+- Inkplate 10 uses a local three-hour deep-sleep timer, including when
+  offline. The physical WAKE button still polls immediately; server
+  timestamps and an NTP round-trip are no longer needed.
+- Automatic prompt top-ups rotate subject families and art media across
+  pending and rendered frames. Plants and landscapes share one slot,
+  steampunk is no longer a default, and custom topics get a separate
+  slot. Manually submitted prompts and the existing queue stay intact.
+- Default to GPT-6.2 Sol for expansions and GPT-Image-2.6 Sunburst for
+  both image generation and restyling, preserving the panel-native crop.
+
 ## [0.6.7.0] - 2026-05-23
 
 ### Changed

@@ -1,7 +1,7 @@
-"""OpenAI `gpt-image-2` adapter and the BASE_PROMPT preamble.
+"""OpenAI image adapter and the BASE_PROMPT preamble.
 
 The pipeline always requests 1200x832 from the model — the smallest size
-`gpt-image-2` accepts (both dims must be multiples of 16) that still covers
+the image model accepts (both dims must be multiples of 16) that still covers
 the panel's 1200x825 in both dimensions — so the downstream `convert()` step
 center-crops 7 px off the height with zero resampling. Aspect 1.4423 vs panel
 1.4545 is 0.84% off; the model effectively composes for the panel. This used
@@ -48,7 +48,7 @@ BASE_PROMPT = (
 # einkgen.core.prompt_library.
 PROMPT_LIBRARY: list[str] = list(_prompt_library.DEFAULTS)
 
-MODEL = "gpt-image-2"
+MODEL = os.environ.get("EINKGEN_IMAGE_MODEL", "gpt-image-2.6-sunburst")
 IMAGE_SIZE = "1200x832"
 QUALITY = "medium"
 
@@ -58,8 +58,8 @@ QUALITY = "medium"
 # more varied than image-generation, so expanding before the image step
 # yields more diverse frames from the same topic list. Cheap enough that
 # topping the queue up to 5+ items per tick is a rounding error next to
-# one gpt-image-2 call.
-TEXT_MODEL = os.environ.get("EINKGEN_TEXT_MODEL", "gpt-5-mini")
+# one image generation call.
+TEXT_MODEL = os.environ.get("EINKGEN_TEXT_MODEL", "gpt-6.2-sol")
 
 EXPAND_TOPIC_SYSTEM_PROMPT = (
     "You design concrete image prompts for an e-paper display that a "
@@ -79,7 +79,12 @@ EXPAND_TOPIC_SYSTEM_PROMPT = (
     "— let them color the scene rather than add extra objects. You may "
     "quietly ignore an angle that genuinely fights the topic. If an "
     "AVOID list is provided, pick a subject materially different from "
-    "every entry. The image will be dithered to 8 grays on a 1200×825 "
+    "every entry. Preserve the assigned subject and art medium; do not "
+    "convert an indoor, abstract, or object brief into scenery, add plants "
+    "as decoration, or turn ordinary machinery into steampunk. Specificity "
+    "should come from pose, shape, framing, and the treatment of light, "
+    "not from adding props. If the SUBJECT explicitly calls for plants, "
+    "steampunk, or landscape, honor that subject. The image will be dithered to 8 grays on a 1200×825 "
     "panel, so favor strong contrast, bold shapes, and a paper-white "
     "background with the subject in strong darks. Do not include the "
     "words 'e-paper', 'e-ink', 'dither', or 'grayscale' — those are "
@@ -97,7 +102,7 @@ def _build_expand_user_message(
 
     Kept separate from ``expand_topic`` so tests can assert the exact
     wire format without mocking OpenAI. The format is intentionally
-    plain-English with capitalised section headers — gpt-5-mini follows
+    plain-English with capitalised section headers — the model follows
     them reliably without needing JSON or fenced blocks.
     """
     lines = [f"TOPIC: {topic.strip()}"]
@@ -149,7 +154,7 @@ def _default_client() -> Any:
 
 
 def generate(prompt: str, *, client: Any = None) -> bytes:
-    """Generate a PNG via OpenAI gpt-image-2 and return raw PNG bytes.
+    """Generate a PNG via OpenAI and return raw PNG bytes.
 
     BASE_PROMPT is prepended to `prompt` inside this function — callers should
     pass only the subject text. `client` is a dependency-injection hook for
@@ -164,6 +169,7 @@ def generate(prompt: str, *, client: Any = None) -> bytes:
         size=IMAGE_SIZE,
         quality=QUALITY,
         n=1,
+        output_format="png",
     )
     return _decode_first(response)
 
@@ -175,7 +181,7 @@ def generate_from_image(
     image_filename: str = "input.png",
     client: Any = None,
 ) -> bytes:
-    """Restyle an input image per `prompt` via gpt-image-2's edit endpoint.
+    """Restyle an input image per `prompt` via OpenAI's image edit endpoint.
 
     Used when an email arrives with both an attachment and a body/subject —
     the attachment is the reference, the prompt steers the regeneration. The
@@ -199,6 +205,7 @@ def generate_from_image(
         size=IMAGE_SIZE,
         quality=QUALITY,
         n=1,
+        output_format="png",
     )
     return _decode_first(response)
 
@@ -206,7 +213,7 @@ def generate_from_image(
 def _decode_first(response: Any) -> bytes:
     """Extract base64 PNG bytes from an OpenAI images response."""
     datum = response.data[0]
-    # `gpt-image-2` returns base64 in `b64_json` by default. Some wrappers/mocks
+    # GPT image models return base64 in `b64_json` by default. Some wrappers/mocks
     # expose `url` instead; we don't fetch URLs here — callers/tests should
     # provide b64_json.
     b64 = getattr(datum, "b64_json", None)

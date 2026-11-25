@@ -7,8 +7,8 @@
 //      If the device has caught up, /wake pops the generated-queue head
 //      and re-points current at it. If the device hasn't drawn the
 //      latest yet, /wake is a no-op and returns redraw. Both advance
-//      and redraw responses carry the new manifest fields (image_url,
-//      image_sha256, image_bytes, next_check_after) so we can feed them
+//      and redraw responses carry the new image fields (image_url,
+//      image_sha256, image_bytes) so we can feed them
 //      straight into the image GET without a follow-up manifest fetch —
 //      CloudFront caches current/manifest.json for 60–300 s and would
 //      otherwise return the pre-advance manifest. /wake is best-effort:
@@ -20,8 +20,7 @@
 //      low-battery threshold since last draw, redraw: drawBitmapFromBuffer()
 //      + (optionally) drawBatteryOverlay() + display() + persist.
 //   5. POST {battery, rssi, current_hash, fw_version} to the status route.
-//   6. Deep-sleep until min(next_check_after, now + 1h), floor 60 s — or
-//      until the WAKE button is pressed, whichever comes first.
+//   6. Deep-sleep for 3 hours, or until the WAKE button is pressed.
 //
 // loop() is empty — every wake is a fresh setup() run.
 
@@ -32,9 +31,6 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
-#include <time.h>
-#include <sys/time.h>
-#include <stdlib.h>
 #include "esp_heap_caps.h"
 #include "esp_sleep.h"
 
@@ -44,23 +40,11 @@
 
 static const uint32_t WIFI_TIMEOUT_MS       = 20000;
 static const uint32_t HTTP_TIMEOUT_MS       = 20000;
-static const uint32_t NTP_TIMEOUT_MS        = 10000;
 
-// Device-poll cadence. Each wake costs ~0.3 mAh (Wi-Fi join + HTTPS GET +
-// status POST); 1 h matches the server's default ``next_check_after`` and
-// gives roughly a year of battery on a 3000 mAh cell. To poll faster
-// (shorter latency, shorter battery life) lower SLEEP_MAX_SECONDS *and*
-// pass ``-c einkgenPollIntervalSeconds=<n>`` to ``cdk deploy`` so the
-// manifest's hint matches; otherwise the firmware silently clamps to
-// SLEEP_MAX_SECONDS. SLEEP_MIN_SECONDS is a defensive floor against a
-// server bug emitting an instant-wake hint.
-//   3 minutes:  SLEEP_MAX_SECONDS = 180  / einkgenPollIntervalSeconds=180
-//   15 minutes: SLEEP_MAX_SECONDS = 900  / einkgenPollIntervalSeconds=900
-//   1 hour:     SLEEP_MAX_SECONDS = 3600 / einkgenPollIntervalSeconds unset
-//   3 hours:    SLEEP_MAX_SECONDS = 10800/ einkgenPollIntervalSeconds=10800
-static const uint64_t SLEEP_MIN_SECONDS     = 60;
-static const uint64_t SLEEP_MAX_SECONDS     = 3600;
-static const uint64_t SLEEP_FALLBACK_SECONDS = 3600;
+// Local device-poll cadence. The server may send next_check_after for
+// older clients; it never controls this device's timer. Waiting three hours
+// also on failures bounds retry traffic and battery draw during outages.
+static const uint64_t POLL_INTERVAL_SECONDS = 3ULL * 60 * 60;
 
 // WAKE button on Inkplate 10 is wired to GPIO 36 (SENSOR_VP, RTC-domain,
 // input-only). Active-low: pressed = 0 V, released = 3.3 V via the on-board
@@ -95,7 +79,7 @@ static const int BATT_LOW_THRESHOLD_PCT = 10;
 Inkplate display(INKPLATE_3BIT);
 
 // Manifest fields embedded in the /wake response (since v0.6.1.0).
-// `hasManifest` is true only when the server returned all four image
+// `hasManifest` is true only when the server returned all three image
 // fields — i.e. action=advance or action=redraw on a fresh server.
 // queue_empty, HTTP errors, and older servers all leave hasManifest
 // false and the caller falls back to fetchManifest.
@@ -110,19 +94,16 @@ struct WakeResult {
     String imageUrl;
     String imageHash;        // image_sha256
     int    imageBytes;
-    String nextCheckAfter;   // ISO 8601 UTC
 };
 
 // ----- Helpers ---------------------------------------------------------------
 
-static void deepSleepFor(uint64_t seconds)
+static void sleepUntilNextPoll()
 {
-    if (seconds < SLEEP_MIN_SECONDS) seconds = SLEEP_MIN_SECONDS;
-    if (seconds > SLEEP_MAX_SECONDS) seconds = SLEEP_MAX_SECONDS;
     Serial.printf("[sleep] deep-sleeping for %llu seconds (or until WAKE pressed)\n",
-                  (unsigned long long)seconds);
+                  (unsigned long long)POLL_INTERVAL_SECONDS);
     Serial.flush();
-    esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+    esp_sleep_enable_timer_wakeup(POLL_INTERVAL_SECONDS * 1000000ULL);
     esp_sleep_enable_ext0_wakeup(WAKE_BUTTON_GPIO, 0);  // 0 = low = pressed
     esp_deep_sleep_start();
 }
@@ -155,25 +136,6 @@ static bool joinWiFi()
     return true;
 }
 
-// Best-effort NTP sync. Returns true if system time looks valid afterwards.
-static bool syncTime()
-{
-    Serial.println("[ntp] syncing time");
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    uint32_t start = millis();
-    time_t now = 0;
-    while (millis() - start < NTP_TIMEOUT_MS) {
-        time(&now);
-        if (now > 1700000000) {  // sanity floor: ~2023-11
-            Serial.printf("[ntp] synced, epoch=%lld\n", (long long)now);
-            return true;
-        }
-        delay(200);
-    }
-    Serial.println("[ntp] timeout");
-    return false;
-}
-
 // Fetch manifest JSON into `out`. Returns true on HTTP 200.
 static bool fetchManifest(String &out)
 {
@@ -201,34 +163,6 @@ static bool fetchManifest(String &out)
     http.end();
     Serial.printf("[manifest] OK, %u bytes\n", (unsigned)out.length());
     return true;
-}
-
-// Parse ISO 8601 UTC timestamp like "2026-05-13T16:05:00Z" into epoch seconds.
-// Returns 0 on failure.
-static time_t parseIso8601Utc(const char *s)
-{
-    if (!s) return 0;
-    int y, mo, d, h, mi, se;
-    // Tolerate the trailing 'Z' (or omit it). Fractional seconds not supported.
-    if (sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) {
-        return 0;
-    }
-    struct tm tm = {};
-    tm.tm_year  = y - 1900;
-    tm.tm_mon   = mo - 1;
-    tm.tm_mday  = d;
-    tm.tm_hour  = h;
-    tm.tm_min   = mi;
-    tm.tm_sec   = se;
-    tm.tm_isdst = 0;
-    // timegm() is non-portable; use the POSIX recipe: set TZ=UTC, mktime, restore.
-    char *oldTz = getenv("TZ");
-    setenv("TZ", "UTC0", 1);
-    tzset();
-    time_t t = mktime(&tm);
-    if (oldTz) setenv("TZ", oldTz, 1); else unsetenv("TZ");
-    tzset();
-    return t;
 }
 
 // Download the manifest's image_url into a PSRAM-backed buffer, verify its
@@ -448,7 +382,6 @@ static bool postWake(const char *current_hash, WakeResult &out)
     out.imageUrl       = "";
     out.imageHash      = "";
     out.imageBytes     = 0;
-    out.nextCheckAfter = "";
 
     String url = wakeUrl();
     Serial.printf("[wake] POST %s\n", url.c_str());
@@ -494,13 +427,11 @@ static bool postWake(const char *current_hash, WakeResult &out)
     const char *imageUrl    = doc["image_url"]        | "";
     const char *imageHash   = doc["image_sha256"]     | "";
     int         imageBytes  = doc["image_bytes"]      | 0;
-    const char *nextCheck   = doc["next_check_after"] | "";
     out.action = action;
     if (imageUrl[0] && imageHash[0] && imageBytes > 0) {
         out.imageUrl       = imageUrl;
         out.imageHash      = imageHash;
         out.imageBytes     = imageBytes;
-        out.nextCheckAfter = nextCheck;
         out.hasManifest    = true;
     }
     return true;
@@ -558,19 +489,16 @@ void setup()
     display.setRotation(0);  // native landscape, 1200x825
 
     if (!joinWiFi()) {
-        Serial.println("[wifi] joining failed, falling back to 1h sleep");
-        deepSleepFor(SLEEP_FALLBACK_SECONDS);
+        Serial.println("[wifi] joining failed, sleeping until the next poll");
+        sleepUntilNextPoll();
         return;  // unreachable
     }
-
-    // NTP first so we can interpret next_check_after.
-    bool haveTime = syncTime();
 
     // Hit /wake BEFORE fetching the manifest. The server uses the sha
     // we report to decide whether to pop the next pre-rendered image
     // (advance) or just leave the manifest as-is. On HTTP 200 with
     // action=advance/redraw, the response embeds image_url +
-    // image_sha256 + image_bytes + next_check_after so we can skip the
+    // image_sha256 + image_bytes so we can skip the
     // follow-up GET current/manifest.json (which would hit CloudFront's
     // 60–300 s cache and reliably return the pre-advance manifest after
     // an advance). A failed /wake or a queue_empty response drops us
@@ -589,21 +517,19 @@ void setup()
     // follow-up fetchManifest call (legacy fallback).
     String imageUrl;
     String imageHash;
-    String nextCheckAfter;
 
     if (wake.hasManifest && wake.action != "queue_empty") {
         Serial.printf("[wake] using embedded manifest from action=%s\n",
                       wake.action.c_str());
         imageUrl       = wake.imageUrl;
         imageHash      = wake.imageHash;
-        nextCheckAfter = wake.nextCheckAfter;
     } else {
         Serial.printf("[wake] no embedded manifest (action=%s) — falling back to GET\n",
                       wake.action.c_str());
         String body;
         if (!fetchManifest(body)) {
             nvs.end();
-            deepSleepFor(SLEEP_FALLBACK_SECONDS);
+            sleepUntilNextPoll();
             return;
         }
         JsonDocument doc;
@@ -611,23 +537,21 @@ void setup()
         if (err) {
             Serial.printf("[manifest] parse error: %s\n", err.c_str());
             nvs.end();
-            deepSleepFor(SLEEP_FALLBACK_SECONDS);
+            sleepUntilNextPoll();
             return;
         }
         imageUrl       = (const char *)(doc["image_url"]        | "");
         imageHash      = (const char *)(doc["image_sha256"]     | "");
-        nextCheckAfter = (const char *)(doc["next_check_after"] | "");
     }
 
     if (imageUrl.length() == 0 || imageHash.length() == 0) {
         Serial.println("[manifest] missing image_url or image_sha256");
         nvs.end();
-        deepSleepFor(SLEEP_FALLBACK_SECONDS);
+        sleepUntilNextPoll();
         return;
     }
     Serial.printf("[manifest] image_url=%s\n", imageUrl.c_str());
     Serial.printf("[manifest] image_sha256=%s\n", imageHash.c_str());
-    Serial.printf("[manifest] next_check_after=%s\n", nextCheckAfter.c_str());
 
     // Read battery before deciding whether to redraw, so we can also trigger
     // a refresh when charge crosses the low-battery threshold (the overlay
@@ -672,28 +596,8 @@ void setup()
     Serial.printf("[status] battery=%.2fV (%d%%) rssi=%d\n", battV, battPct, rssi);
     postStatus(battV, battPct, rssi, currentHash.c_str());
 
-    // Compute sleep duration from next_check_after.
-    uint64_t sleepSeconds = SLEEP_FALLBACK_SECONDS;
-    if (haveTime && nextCheckAfter.length() > 0) {
-        time_t target = parseIso8601Utc(nextCheckAfter.c_str());
-        time_t now    = 0;
-        time(&now);
-        if (target > 0 && now > 0) {
-            long diff = (long)(target - now);
-            Serial.printf("[sleep] next_check_after epoch=%lld now=%lld diff=%lds\n",
-                          (long long)target, (long long)now, diff);
-            if (diff < (long)SLEEP_MIN_SECONDS) diff = (long)SLEEP_MIN_SECONDS;
-            if (diff > (long)SLEEP_MAX_SECONDS) diff = (long)SLEEP_MAX_SECONDS;
-            sleepSeconds = (uint64_t)diff;
-        } else {
-            Serial.println("[sleep] could not parse next_check_after, using fallback");
-        }
-    } else {
-        Serial.println("[sleep] no NTP time or no next_check_after, using fallback");
-    }
-
     WiFi.disconnect(true, true);
-    deepSleepFor(sleepSeconds);
+    sleepUntilNextPoll();
 }
 
 void loop()

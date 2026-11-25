@@ -615,3 +615,36 @@ def test_permanent_error_writes_failure_breadcrumb(monkeypatch, s3_bucket):
     assert rec.source == "admin"
     assert "moderation_blocked" in rec.reason
     assert q.empty()
+
+
+def test_auto_art_rotation_survives_queue_to_history_and_buffer(monkeypatch, s3_bucket):
+    """A new invocation reads metadata, including renders and legacy/manual items."""
+    import json
+
+    from ulid import ULID
+
+    from einkgen.core import art_rotation, s3
+
+    monkeypatch.setattr(generator, "TARGET_PROMPT_QUEUE_LENGTH", 5)
+    monkeypatch.setattr(generator.generate, "expand_topic", lambda t, **_: t)
+    q.enqueue("prompt", prompt="My steampunk landscape", source="admin", at="top")
+    generator._top_up_prompt_queue()
+    first = q.list()
+    assert first[0].prompt == "My steampunk landscape"
+    assert first[0].auto_art is None
+    first_art = [item.auto_art for item in first if item.auto_art]
+    assert len(first_art) == 4
+
+    for item in first[1:]:
+        rendered_id = str(ULID())
+        source = {"prompt": item.prompt, "auto_art": item.auto_art}
+        # The same render is visible via both the history and buffer.
+        s3.put_object(f"history/{rendered_id}/manifest.json", json.dumps({"source": source}).encode())
+        g.enqueue(rendered_id, image_sha256="b" * 64, image_bytes=1, source=source)
+        q.finalize(item)
+
+    generator._top_up_prompt_queue()
+    all_art = first_art + [item.auto_art for item in q.list() if item.auto_art]
+    assert len({art["lane"] for art in all_art}) == 8
+    assert set(art["lane"] for art in all_art) <= set(art_rotation.LANES)
+    assert q.peek_head().prompt == "My steampunk landscape"

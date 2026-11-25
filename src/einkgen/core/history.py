@@ -2,9 +2,8 @@
 
 The CLI (`einkgen history`) and the read-api Lambda both already do
 their own listing; this module exists for *internal* callers that need
-recent prompts back as plain strings — currently the cron's
-``expand_topic`` avoid-list, which feeds back the last N expansions so
-the LLM doesn't keep landing on the same handful of interpretations.
+recent prompt text and optional subject/medium metadata to keep the
+automatic art rotation from repeating recent frames.
 
 Kept slim and side-effect-free: no caching, no formatting, no SPA
 shape. Callers compose.
@@ -22,8 +21,8 @@ log = logging.getLogger(__name__)
 HISTORY_PREFIX = "history/"
 
 
-def recent_prompts(limit: int = 30) -> list[str]:
-    """Return the ``source.prompt`` of the ``limit`` newest history items.
+def recent_prompt_sources(limit: int = 30) -> list[dict]:
+    """Return sources from the newest history manifests with prompts.
 
     Newest first. Items without a prompt (e.g. raw-image submissions
     archived without a textual prompt field) are skipped silently.
@@ -44,17 +43,24 @@ def recent_prompts(limit: int = 30) -> list[str]:
     ]
     manifest_keys.sort(reverse=True)
 
-    prompts: list[str] = []
+    sources: list[dict] = []
     for key in manifest_keys:
-        if len(prompts) >= limit:
+        if len(sources) >= limit:
             break
         try:
             data = json.loads(s3.get_object(key))
         except Exception:
             log.warning("recent_prompts: skipping unreadable manifest %s", key)
             continue
-        source = data.get("source") or {}
+        source = data.get("source") if isinstance(data, dict) else None
+        if not isinstance(source, dict):
+            continue
         prompt = source.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
-            prompts.append(prompt.strip())
-    return prompts
+            sources.append(source)
+    return sources
+
+
+def recent_prompts(limit: int = 30) -> list[str]:
+    """Return prompt text from recent history, newest first."""
+    return [source["prompt"].strip() for source in recent_prompt_sources(limit)]

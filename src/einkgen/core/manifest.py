@@ -74,11 +74,9 @@ def compute_next_check_after(
     Tick boundaries are anchored at the Unix epoch, so for the default
     1-hour interval they fall at 00:00, 01:00, 02:00 UTC, ...
 
-    The default is the firmware's nominal device-poll cadence. Operators
-    can override per-deploy via the ``EINKGEN_POLL_INTERVAL_SECONDS``
-    env var (read by ``publish.publish``) — the firmware's
-    ``SLEEP_MAX_SECONDS`` must be raised in lockstep if the override
-    exceeds 1 hour, or it will silently clamp.
+    The legacy manifest hint stays compatible with older firmware and
+    is configurable via ``EINKGEN_POLL_INTERVAL_SECONDS``. Current
+    Inkplate firmware uses a local timer instead.
 
     If `now` lies exactly on a tick (or within an epsilon of one), we
     return the *next* tick — never "right now". This keeps the device

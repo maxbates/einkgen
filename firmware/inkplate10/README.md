@@ -1,11 +1,18 @@
 # Inkplate 10 firmware
 
-The sketch that runs on the device. On every wake it joins Wi-Fi, fetches
-`manifest.json`, redraws the panel if the image hash changed (or if the
+The sketch that runs on the device. On every wake it joins Wi-Fi, polls
+`/wake` (falling back to `manifest.json`), redraws if the image hash changed (or if the
 battery has crossed the low-battery threshold, so the overlay can appear or
 disappear), reports status to the device-status Lambda, then deep-sleeps
-until the next check — or until you press the **WAKE** button to force a
-refresh.
+for three hours, or until you press the **WAKE** button to check sooner.
+
+The firmware uses a fixed local timer (`POLL_INTERVAL_SECONDS`), even after
+Wi-Fi or server failures. It does not interpret the legacy `next_check_after`
+field or synchronize with NTP just to schedule a poll. This reduces scheduled
+polls from 24 to about 8 per day compared with an hourly timer; the tradeoff
+is that a new frame or network recovery can wait up to roughly three hours
+without a button press. Publishing and backend generation schedules do not
+change.
 
 When reported charge drops below `BATT_LOW_THRESHOLD_PCT` (default 10%) a
 small iPhone-status-bar-style battery badge with the percentage is composited
@@ -17,8 +24,8 @@ close. The image pipeline is unchanged, the overlay only exists on the panel.
 
 The WAKE button on the back of the Inkplate is wired as an EXT0 deep-sleep
 wake source. Pressing it while the device is asleep ends the sleep early
-and triggers a fresh `setup()` run, which always polls the manifest and
-redraws if the hash changed. Use it when you've just enqueued a prompt and
+and triggers a fresh `setup()` run, which follows the same network and redraw
+checks as a timer wake. A fresh three-hour timer starts when it sleeps again. Use it when you've just enqueued a prompt and
 don't want to wait out the rest of the current sleep window.
 
 Serial output prints the wake cause on every boot (`wake-button` / `timer`
@@ -75,12 +82,10 @@ Arduino IDE 2.x.
 [boot] wake cause: timer
 [wifi] connecting to SSID "..."
 [wifi] connected, IP=..., RSSI=-58
-[ntp] synced, epoch=...
 [manifest] GET https://cdn.example.com/current/manifest.json
 [manifest] OK, 412 bytes
 [manifest] image_url=...
 [manifest] image_sha256=...
-[manifest] next_check_after=2026-05-13T16:05:00Z
 [hash] stored="" new="9f1c..." changed=1
 [batt] 90% low=0 wasLow=0 changed=0
 [draw] downloading and verifying image
@@ -88,8 +93,7 @@ Arduino IDE 2.x.
 [status] battery=4.11V (90%) rssi=-58
 [status] POST https://...lambda-url.../
 [status] OK HTTP 200
-[sleep] next_check_after epoch=... now=... diff=...s
-[sleep] deep-sleeping for 3600 seconds
+[sleep] deep-sleeping for 10800 seconds (or until WAKE pressed)
 ```
 
 ## Secrets hygiene

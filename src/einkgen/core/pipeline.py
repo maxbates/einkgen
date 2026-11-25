@@ -127,6 +127,9 @@ def _render(item: QueueItem) -> tuple[bytes, bytes, dict[str, Any], bool]:
     if item.prompt is not None:
         source["prompt"] = item.prompt
 
+    if item.auto_art is not None:
+        source["auto_art"] = item.auto_art
+
     return processed_bmp, original_png, source, image_was_generated
 
 

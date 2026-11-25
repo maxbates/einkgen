@@ -1,9 +1,13 @@
 # Manual test plan — Inkplate 10 firmware
 
-No hardware-in-the-loop CI: this is a paper checklist for one human, one
-Inkplate, one serial monitor. Run after every firmware change. Each test
-ends with the device in deep sleep; press the **WAKE** button (or pull RST)
-to re-run.
+Run `python3 firmware/inkplate10/tests/test_polling.py` from the repo root
+for an automated host check of `setup()` against stubbed hardware and network
+interfaces. This does not replace Arduino's board build or the checks below.
+
+No hardware-in-the-loop CI: run this checklist with an Inkplate and serial
+monitor after flashing an authorized test device. Use a test endpoint when
+changing manifests or credentials. Press **WAKE** while the device is
+asleep (or use reset to rerun a boot that does not test manual wake).
 
 Before starting:
 
@@ -20,7 +24,6 @@ Before starting:
 **Expected logs (in order):**
 - `[boot] einkgen firmware …`
 - `[wifi] connected …`
-- `[ntp] synced …`
 - `[manifest] OK …`
 - `[hash] stored="" new="…" changed=1`
 - `[draw] downloading and verifying image`
@@ -73,8 +76,8 @@ Wake the device.
 **Expected logs.**
 - `[wifi] connecting …`
 - `[wifi] timeout` (after ~20 s)
-- `[wifi] joining failed, falling back to 1h sleep`
-- `[sleep] deep-sleeping for 3600 seconds`
+- `[wifi] joining failed, sleeping until the next poll`
+- `[sleep] deep-sleeping for 10800 seconds`
 
 **Expected on panel.** Unchanged (no redraw attempted).
 
@@ -89,31 +92,33 @@ Restore real password before continuing.
 
 **Expected logs.**
 - `[manifest] HTTP 404`
-- `[sleep] deep-sleeping for 3600 seconds`
+- `[sleep] deep-sleeping for 10800 seconds`
 
 Restore real URL before continuing.
 
 ---
 
-## 6. `next_check_after` 4 hours away
+## 6. Server hints do not affect the timer
 
-**Setup.** Server-side, publish a manifest whose `next_check_after` is
-**4 hours** from now (UTC ISO 8601). Wake the device.
+**Setup.** Test both an embedded `/wake` response and the fallback manifest
+with `next_check_after` far in the future, seconds away, expired, absent, or
+malformed. Keep all required image fields valid.
 
-**Expected logs.**
-- `[sleep] next_check_after epoch=… now=… diff=14…s`
-- `[sleep] deep-sleeping for 3600 seconds` (capped to 1 h)
+**Expected logs.** The usual draw/status path and
+`[sleep] deep-sleeping for 10800 seconds (or until WAKE pressed)` in each case.
+No NTP synchronization for this timer.
 
 ---
 
-## 7. `next_check_after` 30 seconds away
+## 7. Early manual wake versus automatic timer
 
-**Setup.** Publish a manifest whose `next_check_after` is **30 s** from now.
-Wake the device.
+**Setup.** Wait until Serial shows the sleep message. Press the **WAKE**
+button well before three hours and release it.
 
-**Expected logs.**
-- `[sleep] next_check_after epoch=… now=… diff=3…s` (small / negative)
-- `[sleep] deep-sleeping for 60 seconds` (floored to 1 min)
+**Expected.** Serial immediately shows `[boot] wake cause: wake-button`,
+then Wi-Fi, a fresh `/wake` poll (or a manifest GET on fallback), and the
+usual draw/status checks. Sleep restarts at 10800 seconds. Leave the device
+alone for another interval; its next boot should log `wake cause: timer`.
 
 ---
 
@@ -160,9 +165,7 @@ Restore real token before continuing.
   ESP32 didn't actually deep-sleep.
 - **Hash persistence across hard reset.** Pull power for 10 s, replug.
   NVS should survive: log shows `stored="<previous>"` not `stored=""`.
-- **Long-soak run.** Leave the device on a charged battery overnight.
-  With the default 1 h device-poll cadence and the 2 h auto-gen cron,
-  expect ~12 status entries in `status/` by morning (one per wake), of
-  which ~6 record a hash change (one per cron tick). If you've raised
-  `SLEEP_MAX_SECONDS` / `einkgenPollIntervalSeconds`, scale both counts
-  proportionally.
+- **Long-soak run.** Leave the device on a charged battery for 12 hours.
+  Expect roughly four unattended polls (plus a boot at the start, if
+  counted). Extra button presses reset the timer; outages may prevent a
+  status report. Count Serial boot causes as well as successful reports.

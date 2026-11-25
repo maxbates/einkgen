@@ -111,12 +111,15 @@ class QueueItem:
     kind: str
     prompt: str | None = None
     image_s3_key: str | None = None
+    auto_art: dict[str, str] | None = None
     # Internal: the full S3 key, set when retrieved (not serialised).
     _s3_key: str | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
         data.pop("_s3_key", None)
+        if self.auto_art is None:
+            data.pop("auto_art", None)
         return data
 
 
@@ -158,6 +161,7 @@ def enqueue(
     image_s3_key: str | None = None,
     source: str = "cli",
     at: str = "bottom",
+    auto_art: dict[str, str] | None = None,
 ) -> QueueItem:
     """Write a new queue item to S3 and return it.
 
@@ -179,6 +183,7 @@ def enqueue(
         kind=kind,
         prompt=prompt,
         image_s3_key=image_s3_key,
+        auto_art=auto_art,
     )
     key = f"{QUEUE_PREFIX}{priority}-{_key_timestamp(enqueued_at)}-{item_id}.json"
     item._s3_key = key
@@ -225,6 +230,7 @@ def _read_item(key: str) -> QueueItem:
         kind=payload["kind"],
         prompt=payload.get("prompt"),
         image_s3_key=payload.get("image_s3_key"),
+        auto_art=payload.get("auto_art"),
     )
     item._s3_key = key
     return item

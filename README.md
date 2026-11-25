@@ -7,9 +7,8 @@ where the device pulls the latest frame on its own schedule.
 **Live example:** <https://einkgen.link/> — three read-only public tabs
 (Queue, History, Device) plus a password-gated Admin tab for submitting
 prompts or photos from a phone or laptop. The Queue tab shows both the
-pending prompts and the pre-rendered **Up next** buffer. New frames land
-every 30 minutes from the cron tick, or on demand when the Inkplate's
-WAKE button is pressed.
+pending prompts and the pre-rendered **Up next** buffer. The server keeps a buffer ready. The device
+advances on its timer or on demand when its WAKE button is pressed.
 
 ```
    CLI ──┐       ┌──────────────┐ cron / render_one ┌──────────────────┐ buffer_item
@@ -78,3 +77,23 @@ v0.6.5.0 — live at <https://einkgen.link/>. See [CHANGELOG.md](CHANGELOG.md)
 for what landed when. The pipeline runs every 30 minutes by default and
 the wake-button advance path is in place. The physical Inkplate is
 verified end-to-end against the device-status API.
+
+## Automatic art and wake cadence
+
+The automatic queue rotates subject families (animals, people, objects,
+geometry, motion, architecture, science, surrealism, and occasional
+nature) separately from art media. It keeps recently used families out
+of the next eight automatic choices and avoids repeating the last four
+media. Plants and landscapes share the nature slot; steampunk is not a
+default theme. An edited topic library remains an additional rotating
+slot. Explicit submissions and uploads keep their original queue
+behavior. Already queued prompts and already rendered frames are not
+discarded by an upgrade.
+
+Default models are GPT-6.2 Sol for prompt expansion and GPT-Image-2.6
+Sunburst for both new images and restyles. Set `EINKGEN_TEXT_MODEL` or
+`EINKGEN_IMAGE_MODEL` in the relevant runtime to choose another compatible
+model. The input and output still target the Inkplate's 8-level grayscale
+panel. See the [firmware guide](firmware/inkplate10/README.md) for the
+device timer and WAKE button; the server's buffer refill schedule is
+independent of how often the device powers up.

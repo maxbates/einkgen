@@ -7,7 +7,7 @@ Triggers
 
     1. ``_top_up_prompt_queue()`` — if the prompt queue holds fewer
        than ``TARGET_PROMPT_QUEUE_LENGTH`` pending items, pick that
-       many topics from the operator-editable prompt library, run each
+       many balanced subject/medium briefs, run each
        through ``generate.expand_topic()`` (text LLM) to turn the topic
        into a concrete image prompt, and enqueue the expansions at the
        bottom. Keeps the generated-queue refill step well-fed without
@@ -58,8 +58,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ulid import ULID
+
 from einkgen.core import (
-    angles as angles_mod,
+    art_rotation,
     failures,
     generate,
     history,
@@ -81,7 +83,7 @@ RECENT_PROMPT_AVOID_LIMIT = 30
 log = logging.getLogger(__name__)
 
 # Floor for the prompt queue. The cron tops up to this depth each tick
-# via text-LLM expansion of random library topics. The buffer-refill
+# via text-LLM expansion of balanced art briefs. The buffer-refill
 # loop also tops up inline whenever it runs dry, so this can stay
 # small even though a deep cold-start refill drains 10 items.
 TARGET_PROMPT_QUEUE_LENGTH = 5
@@ -207,63 +209,52 @@ def handler(event: dict[str, Any], context: Any = None) -> None:
     log.info("generator: ignoring unrecognised event shape: %s", event)
 
 
-def _gather_avoid_prompts() -> list[str]:
-    """Collect prompts to steer the next ``expand_topic`` call away from.
+def _recent_art() -> tuple[list[str], list[str], list[str]]:
+    """Read the diversity window from pending and rendered work, across cold starts.
 
-    Pulls from three sources, in priority order — recent shown frames
-    (history), prompts already pending render (queue), and frames
-    rendered into the buffer but not yet shown (generated). Dedupes
-    case-insensitively while preserving order so the LLM sees the
-    freshest avoid candidates first if it's only going to attend to the
-    first handful.
-
-    Each source is best-effort: an S3 blip on any of them logs + skips
-    rather than crashing the cron tick. The avoid list is a soft
-    steering signal, not a correctness constraint.
+    History includes buffered images, so don't count its copies of buffer
+    records twice. Legacy items still contribute text to the avoid list.
     """
+    prompts: list[str] = []
     seen: set[str] = set()
-    out: list[str] = []
+    allocations: dict[str, tuple[str, str]] = {}
 
-    def _add(text: str) -> None:
-        cleaned = text.strip()
-        if not cleaned:
+    def add(prompt: Any, art: Any = None) -> None:
+        if isinstance(prompt, str):
+            clean = prompt.strip()
+            if clean and clean.casefold() not in seen and len(prompts) < RECENT_PROMPT_AVOID_LIMIT:
+                prompts.append(clean)
+                seen.add(clean.casefold())
+        if not isinstance(art, dict):
             return
-        key = cleaned.lower()
-        if key in seen:
+        lane, medium, token = art.get("lane"), art.get("medium"), art.get("id")
+        if not all(isinstance(value, str) and value for value in (lane, medium, token)):
             return
-        seen.add(key)
-        out.append(cleaned)
+        allocations[token] = (lane, medium)
 
     try:
-        for prompt in history.recent_prompts(RECENT_PROMPT_AVOID_LIMIT):
-            _add(prompt)
+        for item in sorted(queue.list(), key=lambda item: item.id, reverse=True):
+            add(item.prompt, item.auto_art)
     except Exception:
-        log.exception(
-            "ERROR generator: history.recent_prompts failed; continuing without it"
-        )
-
-    try:
-        for item in queue.list():
-            if isinstance(item.prompt, str):
-                _add(item.prompt)
-    except Exception:
-        log.exception(
-            "ERROR generator: queue.list failed; continuing without pending prompts"
-        )
+        log.exception("ERROR generator: could not read pending art")
 
     try:
         from einkgen.core import generated_queue
 
-        for marker in generated_queue.list():
-            prompt = (marker.source or {}).get("prompt")
-            if isinstance(prompt, str):
-                _add(prompt)
+        for marker in reversed(generated_queue.list()):
+            source = marker.source or {}
+            add(source.get("prompt"), source.get("auto_art"))
     except Exception:
-        log.exception(
-            "ERROR generator: generated_queue.list failed; continuing without buffered prompts"
-        )
+        log.exception("ERROR generator: could not read buffered art")
 
-    return out
+    try:
+        for source in history.recent_prompt_sources(RECENT_PROMPT_AVOID_LIMIT):
+            add(source.get("prompt"), source.get("auto_art"))
+    except Exception:
+        log.exception("ERROR generator: could not read recent art history")
+
+    recent = [allocations[token] for token in sorted(allocations, reverse=True)]
+    return prompts, [lane for lane, _ in recent], [medium for _, medium in recent]
 
 
 def _emit_buffer_depth_marker() -> None:
@@ -292,19 +283,9 @@ def _emit_buffer_depth_marker() -> None:
 def _top_up_prompt_queue() -> None:
     """Ensure the prompt queue holds at least ``TARGET_PROMPT_QUEUE_LENGTH`` items.
 
-    Each missing slot is filled by picking a topic from the prompt
-    library and asking the text LLM to expand it into a concrete image
-    prompt. The expansion is steered for diversity in two ways:
-
-    - ``angles_mod.sample_angles()`` picks two random axes (region /
-      era / light / scale / mood) and one phrase from each, so the LLM
-      is pushed into a different corner of concept space each call.
-    - ``_gather_avoid_prompts()`` pulls recent expansions (history +
-      pending queue + generated buffer) and feeds them back as an
-      AVOID list so the LLM doesn't paraphrase what's already on deck.
-
-    Failures fall back to enqueueing the raw topic so the queue still
-    fills — better a less-detailed prompt than a stalled queue.
+    Rotate both subject and medium against pending and recently rendered art.
+    An edited topic library remains available as one lane rather than
+    dominating the mix. Manual queue submissions are untouched.
     """
     current = queue.count()
     if current >= TARGET_PROMPT_QUEUE_LENGTH:
@@ -315,32 +296,33 @@ def _top_up_prompt_queue() -> None:
         "generator: topping up prompt queue from %d to %d (+%d)",
         current, current + needed, needed,
     )
-    avoid = _gather_avoid_prompts()
+    avoid, recent_lanes, recent_media = _recent_art()
+    stored_topics = prompt_library.load()
+    # A persisted reset looks like the built-in defaults, not an override.
+    custom_topics = stored_topics if stored_topics != prompt_library.DEFAULTS else ()
     for _ in range(needed):
-        topic = prompt_library.random_prompt()
-        chosen_angles = angles_mod.sample_angles()
+        lane, topic, medium = art_rotation.next_brief(
+            recent_lanes=recent_lanes,
+            recent_media=recent_media,
+            custom_topics=custom_topics,
+        )
+        brief = f"{topic.rstrip('.')} rendered as {medium}."
         try:
-            expanded = generate.expand_topic(
-                topic, angles=chosen_angles, avoid=avoid,
+            expanded = generate.expand_topic(brief, angles=[medium], avoid=avoid)
+        except Exception:
+            log.exception("ERROR generator: expand_topic failed, enqueueing art brief: %r", brief)
+            expanded = brief
+        try:
+            queue.enqueue(
+                "prompt", prompt=expanded, source="cron",
+                auto_art={"lane": lane, "medium": medium, "id": str(ULID())},
             )
         except Exception:
-            log.exception(
-                "ERROR generator: expand_topic failed, enqueueing raw topic: %r",
-                topic,
-            )
-            expanded = topic
-        # Append the new expansion to the in-tick avoid list so the next
-        # iteration in this loop also dodges it — without this, two
-        # back-to-back picks of the same topic in one tick can both
-        # produce near-identical expansions.
-        if expanded and expanded.strip() and expanded != topic:
-            avoid = [expanded.strip(), *avoid]
-        try:
-            queue.enqueue("prompt", prompt=expanded, source="cron")
-        except Exception:
-            # An enqueue failure (S3 throttle, IAM blip) shouldn't halt
-            # the render step below. Log and move on.
             log.exception("ERROR generator: enqueue during top-up failed")
+            continue
+        recent_lanes.insert(0, lane)
+        recent_media.insert(0, medium)
+        avoid = [expanded, *avoid[:RECENT_PROMPT_AVOID_LIMIT - 1]]
 
 
 def _top_up_generated_queue() -> None:
